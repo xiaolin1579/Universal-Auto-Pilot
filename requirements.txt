@@ -1,0 +1,20 @@
+# สื่อสารกับ API และ Webhook
+requests
+
+# จัดการข้อมูล HTML และ XML
+beautifulsoup4
+lxml
+
+# ระบบ Browser Engine (Playwright)
+playwright
+
+# รีโมทคอนโทรลผ่าน Telegram & Discord
+pyTelegramBotAPI
+discord.py
+psutil
+
+# อื่นๆ
+urllib3
+pytz
+ddddocr
+chardet

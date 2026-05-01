@@ -1,0 +1,121 @@
+{
+	"SITE":
+	[
+		{
+			"name": "BEARBIT",
+			"username": "YOUR_BEARBIT_USERNAME",
+			"password": "YOUR_BEARBIT_PASSWORD",
+			"base_url": "https://bearbit.org",
+			"enable": true,
+			"target_urls": 
+			[
+				{
+					"name": "โซนพิเศษ",
+					"url": "https://bearbit.org/viewbrsb.php",
+					"enable": true
+				},
+				{
+					"name": "โซนปกติ (No 18+)",
+					"url": "https://bearbit.org/viewno18sbx.php",
+					"enable": true
+				}
+			]
+		},
+		{
+			"name": "TORRENTDD",
+			"username": "YOUR_TORRENTDD_USERNAME",
+			"password": "YOUR_TORRENTDD_PASSWORD",
+			"base_url": "https://torrentdd.com",
+			"enable": true,
+			"target_urls": 
+			[
+				{
+					"name": "โซนพิเศษ",
+					"url": "https://torrentdd.com/browse18.php",
+					"enable": true
+				},
+				{
+					"name": "โซนปกติ (No 18+)",
+					"url": "https://torrentdd.com/browse.php",
+					"enable": true
+				}
+			]
+		}
+	],	
+	"NODES": 
+	[
+		{
+			"name": "Seedbox_Qbittorrent",
+			"type": "qbit",
+            "disk_type": "HDD", //ขึ้นอยู่กับแพ็คเกจ seedbox (SSD,HDD,NVME,HYBRID[HDD+SSD/NVME])
+			"url": "http://1.2.3.4:8080", //ใช้ url ที่เข้าถึง qbit ได้
+			"qb_user": "admin",
+			"qb_pass": "adminadmin",
+			"quota_gb": 100,
+			"nginx": false,
+			"enable": true,
+			"clean_settings": 
+			{
+				"enable": false,
+				"min_ratio": 0.5,
+				"min_time": 120,
+				"max_time": 720
+			}
+		},
+		{
+			"name": "Seedbox_rTorrent",
+			"type": "rtorrent",
+            "disk_type": "HDD", //ขึ้นอยู่กับแพ็คเกจ seedbox (SSD,HDD,NVME,HYBRID[HDD+SSD/NVME])
+			"url": "https://your-seedbox.com/rpc", //ใช้ url เต็มของ plugins httprpc [https://your-seedbox.com/rutorrent/plugins/httprpc/action.php]
+			"rt_user": "myuser",
+			"rt_pass": "mypassword",
+			"quota_gb": 0,
+			"nginx": true,
+			"enable": true,
+			"clean_settings": 
+			{
+				"enable": false,
+				"min_ratio": 0.5,
+				"min_time": 120,
+				"max_time": 720
+			}
+		}
+	],
+	"TELEGRAM_CONFIG": 
+	{
+		"notify_enable": false,
+		"main_bot_token": "123456789:ABCDefghIJKLmnop-MAIN",
+		"chat_id": "987654321",
+		"remote_enable": false,
+		"remote_bot_token": "987654321:XYZAbcdeFGHIjklm-REMOTE" //บอทควบคุมหลัก แนะนำให้แยกกับบอทแจ้งเตือน
+	},
+	"LINE_CONFIG": 
+	{
+		"enable": false,
+		"access_token": "YOUR_LINE_NOTIFY_TOKEN_HERE"
+	},
+	"DISCORD_CONFIG": 
+	{
+        "notify_enable": true,
+        "remote_enable": true,
+        "remote_bot_token": "", //บอทตัวเดียวใช้ได้ทั้ง แจ้งเตือน และ รีโมท [ดูได้แค่สถานะการทำงานและรายงานสถิติ]
+		"admin_id": "123456789012345678"
+	},
+	"SETTING": 
+	{
+		"MIN_SIZE_GB": 1.0,
+		"MAX_SIZE_GB": 800.0,
+		"FREELOAD_ENABLE": true,
+		"MIN_FREE_PERCENT": 100,
+		"MAX_NEW_PER_ZONE": 5,
+		"MIN_WAIT_MINUTES": 5,
+		"MAX_WAIT_MINUTES": 15
+	},
+	"GLOBAL_CLEAN": 
+	{
+		"enable": true,
+		"min_ratio": 1.0,
+		"min_time": 360,
+		"max_time": 1440
+	}
+}
