@@ -379,19 +379,61 @@ class QbitNode:
 
     def login(self):
         try:
-            r = self.s.post(f"{self.url}/api/v2/auth/login", data={"username": self.user, "password": self.pw}, auth=self.auth, verify=False, timeout=10)
-            self.is_connected = (r.status_code == 200 and ("Ok." in r.text or r.cookies.get('SID')))
+            # 1. ล้างคุกกี้เก่าทิ้งก่อนเริ่มใหม่ เพื่อป้องกัน Session ทับซ้อน
+            self.s.cookies.clear()
+            
+            # 2. เพิ่ม Header Referer (เวอร์ชัน 5.x.x บางครั้งต้องการเพื่อป้องกัน CSRF)
+            headers = {'Referer': self.url}
+            
+            r = self.s.post(
+                f"{self.url}/api/v2/auth/login", 
+                data={"username": self.user, "password": self.pw}, 
+                headers=headers,
+                auth=self.auth, 
+                verify=False, 
+                timeout=10
+            )
+
+            # 3. เช็คเงื่อนไขความสำเร็จที่กว้างขึ้น
+            # - 5.1.4 มักตอบ 200 "Ok."
+            # - 5.2.0 มักตอบ 204 (No Content) และไม่มี Text
+            if r.status_code in [200, 204]:
+                # ตรวจสอบคุกกี้แบบเจาะจง (5.2.0 จะส่ง SID หรือ QBT_SID_xxxx)
+                has_cookie = any("SID" in cookie.name for cookie in self.s.cookies)
+                
+                # ถ้ามีคุกกี้ หรือใน r.text มีคำว่า Ok (สำหรับรุ่นเก่า)
+                self.is_connected = has_cookie or "Ok." in r.text
+            else:
+                self.is_connected = False
+                
+            if self.is_connected:
+                print(f" ✅ [{self.name}] Login Success (v{r.status_code})")
             return self.is_connected
-        except: return False
+
+        except Exception as e:
+            print(f" ⚠️ [{self.name}] Login Error: {e}")
+            self.is_connected = False
+            return False
 
     def refresh_status(self):
         if not self.is_connected: return False
         try:
-            # ดึงข้อมูล Torrent ทั้งหมด
-            torrents = self.s.get(f"{self.url}/api/v2/torrents/info", auth=self.auth, verify=False, timeout=10).json()
-            used_gb = sum(t.get('size', 0) for t in torrents) / (1024**3)
+            # 1. ใช้ timeout ที่สั้นลงและแยกการเรียกเพื่อความชัวร์
+            # ดึงข้อมูลจาก sync/maindata ครั้งเดียวได้ทั้ง Server State และพื้นที่ดิสก์
+            r_main = self.s.get(f"{self.url}/api/v2/sync/maindata", auth=self.auth, verify=False, timeout=5).json()
+            server_state = r_main.get('server_state', {})
+            
+            # 2. คำนวณพื้นที่ใช้ไปจาก API โดยตรง (แม่นยำกว่า sum เอง)
+            # ข้อมูลนี้มักจะอยู่ในหน่วย Bytes
+            total_wasted = server_state.get('alltime_ul', 0) # ตัวอย่างการดึงค่าอื่นๆ
+            
+            # ดึงลิสต์เพื่อคำนวณ used_gb (โค้ดส่วนเดิมของคุณ)
+            torrents = self.s.get(f"{self.url}/api/v2/torrents/info", auth=self.auth, verify=False, timeout=7).json()
+            
+            # เลือกใช้ 'total_size' จะแม่นยำกว่า 'size' ใน qBit รุ่นใหม่
+            used_gb = sum(t.get('total_size', t.get('size', 0)) for t in torrents) / (1024**3)
 
-            # ดึงขนาดที่กำลังโหลดค้างอยู่ (Bytes ที่เหลือ)
+            # 3. ดึงค่า Pending (พื้นที่ที่กำลังดาวน์โหลดแต่ยังไม่เสร็จ)
             pending_gb = self.get_downloading_size()
             safety_buffer = 15.0
 
@@ -399,69 +441,109 @@ class QbitNode:
                 # กรณีมี Quota: พื้นที่ว่าง = Quota - ที่ใช้ไปแล้ว - ที่รอโหลด - Buffer
                 self.free_gb = max(0, self.quota_gb - used_gb - pending_gb - safety_buffer)
             else:
-                # กรณีใช้ทั้ง Disk: พื้นที่ว่าง = พื้นที่ Disk จริง - ที่รอโหลด - Buffer
-                r_main = self.s.get(f"{self.url}/api/v2/sync/maindata", auth=self.auth, verify=False, timeout=10).json()
-                real_disk_free = r_main.get('server_state', {}).get('free_space_on_disk', 0) / (1024**3)
+                # ดึงพื้นที่ว่างจริงจาก Server State
+                real_disk_free = server_state.get('free_space_on_disk', 0) / (1024**3)
                 self.free_gb = max(0, real_disk_free - pending_gb - safety_buffer)
 
-            self.stat_msg = f"Used: {used_gb:.1f}GB | Pending: {pending_gb:.1f}GB | Safe: {self.free_gb:.1f}GB"
+            # 4. อัปเดตข้อความสถานะให้ดูง่ายขึ้น
+            active_count = len([t for t in torrents if t['state'] in ['downloading', 'uploading', 'stalledUP']])
+            self.stat_msg = f"A:{active_count} | Used:{used_gb:.1f}G | Safe:{self.free_gb:.1f}G"
+            
             return True
         except Exception as e:
-            print(f"⚠️ [{self.name}] Refresh Status Error: {e}")
+            # ถ้า Refresh พลาดบ่อยๆ ให้ลองสั่ง login ใหม่ในตัว (Auto Re-login)
+            if "403" in str(e) or "401" in str(e):
+                self.login()
+            print(f"⚠️ [{self.name}] Refresh Error: {e}")
             return False
 
     def add(self, content, site_name="Universal", size=None, n_cfg=None):
         try:
-            # ตรวจสอบขนาดไฟล์เบื้องต้น
             if len(content) < 1000: return False
 
+            # เตรียมไฟล์ในรูปแบบ Multipart
             files = {"torrents": ("f.torrent", content, "application/x-bittorrent")}
 
-            # แยก Category ตามชื่อเว็บที่ส่งมา (เช่น BEARBIT หรือ TORRENTDD)
+            # data สำหรับ API qBittorrent
             data = {
                 "paused": "false",
                 "firstLastPiecePrio": "true",
-                "category": site_name,  # <--- เปลี่ยนจาก "Universal-Auto" เป็น site_name
-                "tags": "AutoPilot"
+                "sequentialDownload": "true", # แนะนำให้เปิดไว้สำหรับสาย Racing
+                "category": site_name,
+                "tags": "AutoPilot",
+                "autoTMM": "false" # บังคับให้ใช้ Path ที่เราคุมเอง (ถ้ามีระบุเพิ่ม)
             }
+
+            # เพิ่ม Referer ป้องกัน CSRF สำหรับ qBit 5.2.0+
+            headers = {'Referer': self.url}
 
             r = self.s.post(
                 f"{self.url}/api/v2/torrents/add",
                 files=files,
                 data=data,
+                headers=headers,
                 auth=self.auth,
                 verify=False,
                 timeout=30
             )
 
-            if r.status_code == 200 and "Ok" in r.text:
+            # เช็คความสำเร็จ: 200 คือผ่าน, บางรุ่นอาจมี "Ok." ใน text
+            if r.status_code == 200:
+                # แม้ใน text จะไม่มีคำว่า Ok แต่ Status 200 คือ qBit รับไฟล์ไปแล้ว
                 return True
             else:
-                print(f"⚠️ [API Error] {self.url}: {r.status_code} - {r.text}")
+                # กรณี 403 ให้ลองสั่ง Login ใหม่ทันทีเผื่อ Session หลุด
+                if r.status_code in [401, 403]:
+                    self.login()
+                print(f"⚠️ [API Error] {self.name}: {r.status_code} - {r.text}")
                 return False
+
         except Exception as e:
-            print(f"❌ [Exception] {self.url}: {str(e)}")
+            print(f"❌ [Exception] {self.name}: {str(e)}")
             return False
 
     def get_all_torrents_info(self):
         try:
-            r = self.s.get(f"{self.url}/api/v2/torrents/info", params={'filter': 'completed'}, timeout=10)
+            # เพิ่ม auth และ verify เพื่อความเสถียร
+            r = self.s.get(
+                f"{self.url}/api/v2/torrents/info", 
+                params={'filter': 'completed'}, 
+                auth=self.auth, 
+                verify=False, 
+                timeout=15 # ข้อมูลเยอะอาจใช้เวลาดึงนานขึ้นเล็กน้อย
+            )
+            
             if r.status_code == 200:
-                data = r.json()
-                # แนะนำให้ Sort ตาม Ratio จากมากไปน้อย (ไฟล์ที่คุ้มแล้วอยู่บน)
-                data.sort(key=lambda x: x['ratio'], reverse=True)
+                try:
+                    data = r.json()
+                except:
+                    return []
 
-                return [
-                    {
-                        'hash': t['hash'],
-                        'ratio': t['ratio'],
-                        'name': t['name'],
-                        'size': t['size'] / (1024**3), # เก็บขนาดไว้คำนวณพื้นที่ที่จะได้คืน
-                        'added_on': t['added_on']
-                    } for t in data
-                ]
+                # เรียงลำดับตาม Ratio (มากไปน้อย) เพื่อให้ไฟล์ที่ "ทำกำไร" ได้มากที่สุดถูกลบก่อน
+                data.sort(key=lambda x: x.get('ratio', 0), reverse=True)
+
+                results = []
+                for t in data:
+                    # เลือกใช้ total_size ถ้าไม่มีให้ถอยไปใช้ size
+                    size_bytes = t.get('total_size', t.get('size', 0))
+                    
+                    results.append({
+                        'hash': t.get('hash'),
+                        'ratio': t.get('ratio', 0),
+                        'name': t.get('name', 'Unknown'),
+                        'size': size_bytes / (1024**3), # แปลงเป็น GB
+                        'added_on': t.get('added_on'),
+                        'category': t.get('category') # เก็บไว้เผื่อเช็คว่ามาจากเว็บไหน (BEARBIT/TDD)
+                    })
+                return results
+            
+            elif r.status_code in [401, 403]:
+                self.is_connected = False # แจ้งให้ระบบรู้ว่าต้อง Login ใหม่
+                
             return []
-        except: return []
+        except Exception as e:
+            # print(f"⚠️ [{self.name}] Error fetching torrent info: {e}")
+            return []
 
     def is_torrent_exists(self, t_hash):
         if not self.is_connected: self.login()
@@ -479,14 +561,31 @@ class QbitNode:
 
     def get_downloading_size(self):
         try:
-            # ดึงเฉพาะไฟล์ที่ยังโหลดไม่เสร็จ (downloading, stalledDL, metaDL)
-            r = self.s.get(f"{self.url}/api/v2/torrents/info", params={'filter': 'downloading'}, timeout=10)
+            # 1. เพิ่ม auth และ verify เพื่อให้ผ่าน Nginx และ SSL ของ AppBox
+            # 2. ใช้ params เพื่อกรองเฉพาะตัวที่กำลังโหลด (ลดภาระ CPU/Network)
+            r = self.s.get(
+                f"{self.url}/api/v2/torrents/info", 
+                params={'filter': 'downloading'}, 
+                auth=self.auth, 
+                verify=False, 
+                timeout=10
+            )
+            
             if r.status_code == 200:
-                # amount_left คือจำนวน Bytes ที่เหลือที่ต้องโหลดจนเต็ม
-                total_remaining_bytes = sum(t.get('amount_left', 0) for t in r.json())
-                return total_remaining_bytes / (1024**3) # คืนค่าเป็น GB
+                torrents = r.json()
+                # amount_left คือ Bytes ที่เหลือ | size คือขนาดเต็ม (กรณีจองพื้นที่แบบ Pre-allocate)
+                # ในสาย Racing เรามักสน amount_left เพื่อดูว่าดิสก์จะลดลงอีกเท่าไหร่
+                total_left = sum(t.get('amount_left', 0) for t in torrents)
+                
+                # หากต้องการความปลอดภัยสูงสุด (เผื่อกรณีไฟล์ Error แล้วต้องโหลดใหม่ทั้งหมด)
+                # สามารถพิจารณาใช้ t.get('size', 0) แทนได้ในบางกรณี
+                
+                return total_left / (1024**3) # แปลงเป็น GB
+            
+            # กรณี Token หมดอายุ (403) หรือ Error อื่นๆ
             return 0.0
-        except:
+        except Exception as e:
+            # print(f" ⚠️ [{self.name}] get_downloading_size error: {e}")
             return 0.0
             
     def get_active_downloads(self):
@@ -519,34 +618,83 @@ class QbitNode:
             return []
 
     def reannounce_all(self):
-        """ สั่ง Re-announce ทุก Torrent ใน qBittorrent """
-        if not self.is_connected and not self.login(): return False
+        """ สั่ง Re-announce ทุก Torrent (หรือเฉพาะที่กำลังโหลด) """
+        if not self.is_connected and not self.login(): 
+            return False
+            
         try:
-            # สั่ง reannounce ทุก hashes โดยส่งค่า 'all'
-            r = self.s.post(f"{self.url}/api/v2/torrents/reannounce", data={"hashes": "all"}, auth=self.auth, verify=False, timeout=10)
-            return r.status_code == 200
-        except: return False
+            # เพิ่ม Referer ป้องกัน CSRF สำหรับ 5.2.0+
+            headers = {'Referer': self.url}
+            
+            # การส่ง hashes: all คือวิธีที่เร็วที่สุด แต่ต้องมั่นใจว่า Tracker ไม่แบน
+            r = self.s.post(
+                f"{self.url}/api/v2/torrents/reannounce", 
+                data={"hashes": "all"}, 
+                headers=headers,
+                auth=self.auth, 
+                verify=False, 
+                timeout=15
+            )
+            
+            if r.status_code == 200:
+                # print(f" ✅ [{self.name}] Re-announced all torrents.")
+                return True
+            else:
+                # ถ้าเจอ 403/401 ให้หลุดไป Login ใหม่
+                if r.status_code in [401, 403]:
+                    self.is_connected = False
+                return False
+        except Exception as e:
+            # print(f" ⚠️ [{self.name}] Re-announce Error: {e}")
+            return False
 
     def get_stats_by_site(self):
-        if not self.is_connected: self.login()
+        # 1. เช็คการเชื่อมต่อก่อนเริ่ม
+        if not self.is_connected and not self.login(): 
+            return {}
+            
         try:
-            r = self.s.get(f"{self.url}/api/v2/torrents/info", auth=self.auth, timeout=10)
+            # 2. เพิ่ม auth และ verify สำหรับ Nginx/SSL
+            r = self.s.get(
+                f"{self.url}/api/v2/torrents/info", 
+                auth=self.auth, 
+                verify=False, 
+                timeout=15 # สถิติรวมอาจใช้เวลาประมวลผลนานกว่าปกติ
+            )
+            
+            if r.status_code != 200:
+                if r.status_code in [401, 403]: self.is_connected = False
+                return {}
+
             torrents = r.json()
-        
             site_stats = {}
+            
             for t in torrents:
-                site = t.get('category') or "Unknown"
+                # 3. ใช้ Category เป็นตัวแยกชื่อเว็บ (เช่น BEARBIT, TORRENTDD)
+                # ถ้าไม่มี Category ให้ลงถัง "General" หรือ "Unknown"
+                site = t.get('category') or "Uncategorized"
+                
+                # ดึงค่าความเร็วอัปโหลดปัจจุบัน และยอดอัปโหลดรวม (Bytes)
                 up_speed = t.get('upspeed', 0)
                 total_up = t.get('uploaded', 0)
+                downloaded = t.get('downloaded', 0) # แถม: เก็บยอดดาวน์โหลดไว้ดู Ratio ราย Site ก็ได้
 
                 if site not in site_stats:
-                    site_stats[site] = {'total_up_bytes': 0, 'current_speed_bytes': 0, 'count': 0}
+                    site_stats[site] = {
+                        'total_up_bytes': 0, 
+                        'total_dl_bytes': 0,
+                        'current_speed_bytes': 0, 
+                        'count': 0
+                    }
             
                 site_stats[site]['total_up_bytes'] += total_up
+                site_stats[site]['total_dl_bytes'] += downloaded
                 site_stats[site]['current_speed_bytes'] += up_speed
                 site_stats[site]['count'] += 1
+                
             return site_stats
-        except:
+        except Exception as e:
+            # print(f"⚠️ [{self.name}] Stats Error: {e}")
             return {}
 
 class RtorrentNode:
@@ -554,6 +702,10 @@ class RtorrentNode:
         self.name, self.url = cfg["name"], cfg["url"].rstrip("/")
         self.user, self.pw = cfg["rt_user"], cfg["rt_pass"]
         self.quota_gb = cfg.get("quota_gb", 0)
+        
+        # สร้าง Session ไว้ใช้ยาวๆ ลด Overhead การสร้าง Connection ใหม่
+        self.s = requests.Session() 
+        
         self.auth = HTTPBasicAuth(self.user, self.pw)
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36',
@@ -566,51 +718,94 @@ class RtorrentNode:
 
     def login(self):
         try:
-            # 1. ลอง Login ด้วย Basic Auth ก่อน
-            r = requests.post(self.url, data='<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName></methodCall>', auth=self.auth, timeout=10)
+            # 1. ยิงทดสอบด้วยรหัสที่มีอยู่ (เริ่มต้นด้วย BasicAuth)
+            # ใช้ system.listMethods เป็นคำสั่งที่เบาที่สุดในการเช็คสิทธิ์
+            r = self.s.post(
+                self.url, 
+                data='<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName></methodCall>', 
+                auth=self.auth, 
+                headers=self.headers,
+                timeout=10,
+                verify=False
+            )
             
-            # 2. ถ้าเจอ 401 และเซิร์ฟเวอร์แจ้งว่าต้องการ Digest
-            if r.status_code == 401 and 'digest' in r.headers.get('WWW-Authenticate', '').lower():
-                # สลับไปใช้ Digest Auth ทันที
-                self.auth = HTTPDigestAuth(self.user, self.pw)
-                r = requests.post(self.url, data='<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName></methodCall>', auth=self.auth, headers=self.headers, timeout=10)
+            # 2. กรณี 401 Unauthorized: เช็คว่าต้องการ Digest หรือไม่
+            if r.status_code == 401:
+                auth_header = r.headers.get('WWW-Authenticate', '').lower()
+                if 'digest' in auth_header:
+                    # สลับไปใช้ Digest Auth และยิงใหม่
+                    self.auth = HTTPDigestAuth(self.user, self.pw)
+                    r = self.s.post(
+                        self.url, 
+                        data='<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName></methodCall>', 
+                        auth=self.auth, 
+                        headers=self.headers,
+                        timeout=10,
+                        verify=False
+                    )
             
-            self.is_connected = (r.status_code == 200)
-            return self.is_connected
-        except:
+            # 3. ตัดสินผลการเชื่อมต่อ
+            if r.status_code == 200:
+                self.is_connected = True
+                return True
+            else:
+                self.is_connected = False
+                # print(f"⚠️ [{self.name}] Login Failed: {r.status_code}")
+                return False
+                
+        except requests.exceptions.RequestException as e:
+            self.is_connected = False
+            # print(f"❌ [{self.name}] Connection Error: {e}")
             return False
 
     def refresh_status(self):
         if not self.is_connected: return False
         try:
-            # ดึงข้อมูลผ่าน XML-RPC
+            # ใช้ XML แบบที่คุณดึงค่าได้ชัวร์ๆ (ระบุฟิลด์ d.is_active= และ d.size_bytes=)
             xml = '<?xml version="1.0"?><methodCall><methodName>d.multicall2</methodName><params><param><value><string></string></value></param><param><value><string>main</string></value></param><param><value><string>d.is_active=</string></value></param><param><value><string>d.size_bytes=</string></value></param></params></methodCall>'
-            r = requests.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=10, verify=False)
+            r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=10, verify=False)
             soup = BeautifulSoup(r.text, "xml")
 
+            # ดึงค่าตัวเลขทั้งหมด (i8) แบบที่คุณถนัด
             vals = [v.get_text() for v in soup.find_all("i8")]
-            total, active, used_bytes = len(vals)//2, 0, 0
+            
+            active = 0
+            used_bytes = 0 
+            
+            # วน Loop ทีละ 2 (is_active และ size_bytes)
             for i in range(0, len(vals), 2):
-                if int(vals[i]) == 1: active += 1
-                used_bytes += int(vals[i+1])
+                is_active = int(vals[i])
+                size = int(vals[i+1])
+                
+                if is_active == 1: 
+                    active += 1
+                used_bytes += size
 
             used_gb = used_bytes / (1024**3)
-            # ดึงขนาดไฟล์ที่จองพื้นที่ไว้แล้วแต่ยังโหลดไม่เสร็จ
-            pending_gb = self.get_downloading_size()
-            safety_buffer = 15.0 # GB สำหรับป้องกัน Quota เต็ม 99%
+            # ดึงขนาดไฟล์ที่จองพื้นที่ไว้แล้วแต่ยังโหลดไม่เสร็จ (จากฟังก์ชันเดิมของคุณ)
+            pending_gb = self.get_downloading_size() 
+            safety_buffer = 15.0 
 
+            # คำนวณพื้นที่
             if self.quota_gb > 0:
-                # พื้นที่ว่างจริง = Quota - ที่ใช้ไปแล้ว - ที่รอโหลดค้างอยู่ - Buffer กันเหนียว
+                # Safe Space = พื้นที่ยอมให้เติมงาน (หัก Used, Pending และ Buffer)
                 self.free_gb = max(0, self.quota_gb - used_gb - pending_gb - safety_buffer)
+                # Display Free = พื้นที่ว่างที่เหลือจริงๆ บนหน้า Dashboard
+                display_free = max(0, self.quota_gb - used_gb)
             else:
-                # โหมดเช็คดิสก์จริงจาก Server
-                r_free = requests.post(self.url, data='<?xml version="1.0"?><methodCall><methodName>network.disk_free</methodName></methodCall>', auth=self.auth, headers=self.headers, timeout=10, verify=False)
-                real_free = abs(int(BeautifulSoup(r_free.text, "xml").find("value").get_text().strip())) / (1024**3)
+                r_free = self.s.post(self.url, data='<?xml version="1.0"?><methodCall><methodName>network.disk_free</methodName></methodCall>', auth=self.auth, headers=self.headers, timeout=10, verify=False)
+                val_node = BeautifulSoup(r_free.text, "xml").find("value")
+                real_free = abs(int(val_node.get_text().strip())) / (1024**3)
                 self.free_gb = max(0, real_free - pending_gb - safety_buffer)
+                display_free = real_free
 
-            self.stat_msg = f"Used: {used_gb:.1f}GB | Pending: {pending_gb:.1f}GB | Safe: {self.free_gb:.1f}GB"
+            # แสดงผลรูปแบบ qBit Style: FREE | A | Used | Safe
+            self.stat_msg = f"FREE {display_free:.1f}GB | A:{active} | Used:{used_gb:.1f}G | Safe:{self.free_gb:.1f}G"
+            
             return True
-        except: return False
+        except Exception as e:
+            print(f"⚠️ Refresh Status Error: {e}")
+            return False
 
     def get_all_torrents_info(self):
         try:
@@ -627,7 +822,7 @@ class RtorrentNode:
             </params>
             </methodCall>'''
 
-            r = requests.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=20, verify=False)
+            r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=20, verify=False)
             if r.status_code != 200: return []
 
             root = ET.fromstring(r.text)
@@ -656,44 +851,21 @@ class RtorrentNode:
         try:
             # ใช้ XML-RPC ตรวจสอบชื่อไฟล์หรือ hash (ในที่นี้ใช้ hash ซึ่งแม่นยำที่สุด)
             xml = f'<?xml version="1.0"?><methodCall><methodName>d.name</methodName><params><param><value><string>{t_hash.upper()}</string></value></param></params></methodCall>'
-            r = requests.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=10, verify=False)
+            r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=10, verify=False)
             # ถ้า rTorrent คืนค่าสำเร็จ (ไม่ error) แสดงว่ามีไฟล์อยู่
             return r.status_code == 200 and "<fault>" not in r.text
         except: return False
 
     def get_downloading_size(self):
-        """ดึงขนาดไฟล์ที่กำลังโหลดค้างอยู่ (Bytes ที่เหลือ)"""
         try:
-            # ใช้ multicall เพื่อดึง size และ completed bytes ของไฟล์ที่กำลังทำงาน (view: started)
-            xml = '''<?xml version="1.0"?>
-            <methodCall>
-                <methodName>d.multicall2</methodName>
-                <params>
-                    <param><value><string></string></value></param>
-                    <param><value><string>started</string></value></param>
-                    <param><value><string>d.size_bytes=</string></value></param>
-                    <param><value><string>d.completed_bytes=</string></value></param>
-                </params>
-            </methodCall>'''
-            
-            r = requests.post(self.url, data=xml, auth=self.auth, headers=self.headers, verify=False, timeout=10)
-            if r.status_code == 200:
-                import xml.etree.ElementTree as ET
-                root = ET.fromstring(r.text)
-                total_remaining = 0
-                
-                # แกะค่า XML เพื่อหาผลรวมของ (Size - Completed)
-                # หมายเหตุ: โครงสร้าง XML ของ rTorrent อาจต้องใช้ตัวช่วย parse ที่แม่นยำ
-                # นี่คือตัวอย่างการคำนวณคร่าวๆ
-                for data_node in root.findall(".//data/value/array/data/value/array"):
-                    vals = [v.text for v in data_node.findall("./value")]
-                    if len(vals) >= 2:
-                        size = int(vals[0])
-                        completed = int(vals[1])
-                        total_remaining += (size - completed)
-                
-                return total_remaining / (1024**3) # คืนค่าเป็น GB
-            return 0.0
+            import xmlrpc.client
+            auth_url = self.url.replace("://", f"://{self.user}:{self.pw}@")
+            proxy = xmlrpc.client.ServerProxy(auth_url)
+            # ดึง size และ completed เฉพาะตัวที่ยังโหลดไม่เสร็จ (view 'started')
+            response = proxy.d.multicall2("", "started", "d.size_bytes=", "d.completed_bytes=")
+        
+            total_remaining = sum(int(t[0]) - int(t[1]) for t in response)
+            return total_remaining / (1024**3)
         except:
             return 0.0
                     
@@ -751,7 +923,7 @@ class RtorrentNode:
             </methodCall>'''
 
             # 4. ส่ง Request ไปยัง rTorrent
-            r = requests.post(
+            r = self.s.post(
                 self.url,
                 data=xml,
                 auth=self.auth,
@@ -795,7 +967,7 @@ class RtorrentNode:
               </params>
             </methodCall>'''
 
-            r = requests.post(self.url, data=xml, auth=self.auth, headers=self.headers, verify=False, timeout=10)
+            r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, verify=False, timeout=10)
             return r.status_code == 200
         except Exception as e:
             print(f"❌ [{self.name}] Delete Error: {e}")
@@ -816,33 +988,48 @@ class RtorrentNode:
                 '</params>'
                 '</methodCall>'
             )
-            requests.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=15, verify=False)
+            self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=15, verify=False)
             return True
         except: return False
         
     def get_stats_by_site(self):
+        if not self.is_connected: self.login()
         try:
-            import xmlrpc.client
+            # 1. การสร้าง Proxy: หากเซิร์ฟเวอร์ใช้ Digest ให้ใช้ Requests เข้ามาช่วย (ตามที่เคยแนะนำ)
+            # แต่ถ้ามั่นใจว่าเป็น Basic Auth หรือรันใน Local Network ใช้แบบเดิมที่คุณทำได้เลยครับ
             auth_url = self.url.replace("://", f"://{self.user}:{self.pw}@")
             proxy = xmlrpc.client.ServerProxy(auth_url)
 
-            # ดึง Label (custom1), ยอด Upload รวม (up_total), และความเร็วปัจจุบัน (up_rate)
+            # 2. ดึงข้อมูล: d.custom1 (Label), d.get_up_total (ยอดรวม), d.get_up_rate (ความเร็ว)
+            # ใช้ view "main" เพื่อความครอบคลุม
             response = proxy.d.multicall2("", "main", "d.custom1=", "d.get_up_total=", "d.get_up_rate=")
 
             site_stats = {}
             for t in response:
-                site = t[0] if t[0] else "Unknown"
+                # ล้างชื่อ Site ให้สะอาด
+                raw_site = t[0] if t[0] else "Uncategorized"
+                site = unquote(raw_site).strip()
+            
+                # rTorrent ส่งค่าเป็น Bytes มาอยู่แล้ว
                 total_up = int(t[1])
                 up_speed = int(t[2])
 
                 if site not in site_stats:
-                    site_stats[site] = {'total_up_bytes': 0, 'current_speed_bytes': 0, 'count': 0}
-            
+                    site_stats[site] = {
+                        'total_up_bytes': 0, 
+                        'current_speed_bytes': 0, 
+                        'count': 0
+                    }
+        
                 site_stats[site]['total_up_bytes'] += total_up
                 site_stats[site]['current_speed_bytes'] += up_speed
                 site_stats[site]['count'] += 1
+            
             return site_stats
-        except:
+        except Exception as e:
+            # หาก Proxy พัง ให้ลองสั่ง login ใหม่ในรอบถัดไป
+            self.is_connected = False
+            # print(f"⚠️ [{self.name}] rTorrent Stats Error: {e}")
             return {}
 
 # ========================= UPDATE TRACKER =========================
@@ -978,7 +1165,14 @@ class NodeCleaner:
         )
 
         try:
-            r = requests.post(self.node.url, data=xml, auth=self.node.auth, verify=False, timeout=15)
+            r = self.node.s.post(
+                self.node.url, 
+                data=xml, 
+                auth=self.node.auth, 
+                headers=self.node.headers, # แนะนำให้ดึง headers มาด้วย
+                verify=False, 
+                timeout=15
+            )
             if r.status_code != 200: return []
 
             soup = BeautifulSoup(r.text, "xml")
@@ -1885,60 +2079,74 @@ def extract_torrent_data(row, base_url, dl_session=None, headers=None):
     }
 
 def format_site_stats_report(all_nodes):
-    """
-    รวบรวมสถิติจากทุก Node และสร้างรายงานสรุป
-    รองรับทั้ง qBittorrent และ rTorrent
-    """
     combined_stats = {}
     errors = []
+    total_speed = 0
+    total_upload = 0
+    total_files = 0
 
-    # 1. รวบรวมข้อมูลพร้อมระบบป้องกัน Error ราย Node
     for node in all_nodes:
         try:
-            # ดึงข้อมูลจาก Node (Method นี้ต้องมีอยู่ใน Class Node ของคุณ)
             node_data = node.get_stats_by_site()
-            
-            if not node_data:
-                continue
+            if not node_data: continue
 
             for site, data in node_data.items():
-                # ป้องกันชื่อ Tracker เป็นค่าว่าง
-                site_name = site if site and str(site).strip() != "" else "Unknown"
+                site_name = str(site).strip() if site else "Unknown"
+                # กรองพวก Category ขยะ (ถ้ามี)
+                if site_name.lower() in ['', 'none', 'uncategorized', 'default']: 
+                    site_name = "Other"
                 
                 if site_name not in combined_stats:
                     combined_stats[site_name] = {'up_gb': 0, 'speed_mb': 0, 'count': 0}
                 
-                # รวมผลสถิติจากทุก Node เข้าด้วยกัน 
-                combined_stats[site_name]['up_gb'] += data.get('total_up_bytes', 0) / (1024**3)
-                combined_stats[site_name]['speed_mb'] += data.get('current_speed_bytes', 0) / (1024**2)
-                combined_stats[site_name]['count'] += data.get('count', 0)
-        except Exception as e:
-            errors.append(f"Node Error ({getattr(node, 'name', 'Unknown')}): {str(e)}")
+                up_gb = data.get('total_up_bytes', 0) / (1024**3)
+                speed_mb = data.get('current_speed_bytes', 0) / (1024**2)
+                file_count = data.get('count', 0)
 
-    # 2. ส่วนการสร้างข้อความแจ้งเตือน (BearBit Notification Style)
-    # อ้างอิงเวลาปัจจุบัน พฤษภาคม 2026
-    current_time = get_now().strftime("%Y-%m-%d %H:%M:%S")
+                combined_stats[site_name]['up_gb'] += up_gb
+                combined_stats[site_name]['speed_mb'] += speed_mb
+                combined_stats[site_name]['count'] += file_count
+                
+                # เก็บยอดรวมสะสม
+                total_speed += speed_mb
+                total_upload += up_gb
+                total_files += file_count
+
+        except Exception as e:
+            errors.append(f"{getattr(node, 'name', 'Node')}: {str(e)}")
+
+    # สร้างข้อความ
+    current_time = datetime.now().strftime("%H:%M:%S")
     msg = f"📊 <b>Universal Auto-Pilot Stats</b>\n"
-    msg += f"🕒 <i>Last Update: {current_time}</i>\n"
+    msg += f"🕒 <i>Last Sync: {current_time} | 🛰 Nodes: {len(all_nodes)}</i>\n\n"
     
     if not combined_stats:
-        return msg + "⚠️ ไม่สามารถดึงข้อมูลจาก Node ได้ในขณะนี้"
+        return msg + "⚠️ No active data from nodes."
 
+    # ตารางสถิติ
     msg += "```bash\n"
-    msg += f"{'Tracker':<12} | {'Upload':<10} | {'Speed':<10} | {'Files'}\n"
-    msg += "-" * 52 + "\n"
+    msg += f"{'Tracker':<12} | {'Upload':<9} | {'Speed':<9}\n"
+    msg += "-" * 35 + "\n"
 
-    # เรียงลำดับตามความเร็ว Speed (Descending)
+    # เรียงตาม Speed
     sorted_sites = sorted(combined_stats.items(), key=lambda x: x[1]['speed_mb'], reverse=True)
 
     for site, stat in sorted_sites:
         if stat['count'] > 0:
-            msg += f"{site[:12]:<12} | {stat['up_gb']:>7.1f} GB | {stat['speed_mb']:>7.1f} MB/s | {stat['count']:>5}\n"
+            # ปรับการแสดงผล Speed ถ้ามากกว่า 1024 MB/s ให้โชว์เป็น GB/s
+            speed_str = f"{stat['speed_mb']:>6.1f} M"
+            if stat['speed_mb'] >= 1024:
+                speed_str = f"{stat['speed_mb']/1024:>6.2f} G"
 
+            msg += f"{site[:12]:<12} | {stat['up_gb']:>6.1f}G | {speed_str}/s\n"
+
+    msg += "-" * 35 + "\n"
+    # บรรทัดสรุปยอดรวม
+    msg += f"{'TOTAL':<12} | {total_upload:>6.1f}G | {total_speed/1024 if total_speed >= 1024 else total_speed:>6.1f} {'GB/s' if total_speed >= 1024 else 'MB/s'}\n"
     msg += "```"
 
     if errors:
-        msg += "\n⚠️ <b>Warning:</b>\n" + "\n".join([f"- {err}" for err in errors[:3]])
+        msg += f"\n❌ <b>Errors ({len(errors)}):</b> <code>{errors[0][:40]}...</code>"
 
     return msg
     
