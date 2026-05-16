@@ -11,6 +11,7 @@ import time
 import re
 import psutil
 import pytz
+import html  # เพิ่มเข้ามาเพื่อใช้เคลียร์แท็กพัง
 from datetime import datetime, timedelta
 
 # --- SETUP PATH & CONFIG ---
@@ -40,12 +41,7 @@ def get_now():
 
 # --- SHARED FUNCTIONS ---
 def is_process_running(process_cmd_name):
-    """
-    ตรวจสอบว่า Process รันอยู่หรือไม่ 
-    รองรับ: 'python3 -u main.py', 'python -u main.py', 'python main.py'
-    """
-    # สร้าง Pattern: เปลี่ยน 'python3' เป็น 'python[3]?' เพื่อให้ 3 เป็น optional
-    # และจัดการช่องว่างให้ยืดหยุ่นด้วย \s+
+    """ตรวจสอบว่า Process รันอยู่หรือไม่"""
     pattern = process_cmd_name.replace("python3", r"python[3]?")
     pattern = pattern.replace(" ", r"\s+")
     
@@ -53,7 +49,6 @@ def is_process_running(process_cmd_name):
         try:
             cmdline = proc.info['cmdline']
             if cmdline:
-                # รวม list เป็น string เช่น ['python3', '-u', 'main.py'] -> 'python3 -u main.py'
                 cmd_str = " ".join(cmdline)
                 if re.search(pattern, cmd_str):
                     return True
@@ -72,11 +67,8 @@ def get_bot_runtime(script_name="main.py"):
     for proc in psutil.process_iter(['cmdline']):
         try:
             cmdline_list = proc.info.get('cmdline') or []
-            
-            # รวมอาร์กิวเมนต์ทั้งหมดเป็นสตริงเส้นเดียว เช่น "python3 -u main.py"
             full_cmdline = " ".join(cmdline_list)
             
-            # เช็คว่ามีคำว่า main.py อยู่ในคำสั่งรันหรือไม่
             if script_name in full_cmdline:
                 create_time = proc.create_time() 
                 start_time = datetime.fromtimestamp(create_time)
@@ -104,16 +96,13 @@ def get_status_text():
     SET = c.get('SETTING', {})
     main_running = is_process_running("python3 -u main.py")
 
-    # ดึงค่า Config ต่างๆ
     is_freeload = SET.get('FREELOAD_ENABLE', False)
     min_gb = SET.get('MIN_SIZE_GB', 0)
     max_gb = SET.get('MAX_SIZE_GB', 0)
-    min_percent = SET.get('MIN_FREE_PERCENT', 0) # สมมติว่าใช้คีย์นี้เก็บ %
+    min_percent = SET.get('MIN_FREE_PERCENT', 0)
 
-    # ดึงค่า Run Time
     runtime = get_bot_runtime("python3 -u main.py") if main_running else "N/A"
 
-    # จัดรูปแบบข้อความเริ่มต้น
     lines = [
         "📍 <b>System Status</b>",
         "━━━━━━━━━━━━━━━━━━",
@@ -123,40 +112,28 @@ def get_status_text():
         f"• Freeload Only: {'✅ Yes' if is_freeload else '❌ No'}"
     ]
 
-    # ✅ เงื่อนไข: แสดง Freeload Percent เฉพาะเมื่อ Freeload Only เป็น Yes เท่านั้น
     if is_freeload:
         lines.append(f"• Freeload Percent: <code>{min_percent}%</code>")
 
     lines.append("━━━━━━━━━━━━━━━━━━")
-
     return "\n".join(lines)
 
 def format_size(size_gb):
-    """
-    แปลงค่าจากหน่วยพื้นฐาน (GB) ให้เป็นหน่วยที่เหมาะสมที่สุดโดยอัตโนมัติ
-    รองรับตั้งแต่ KB ไปจนถึง PB
-    """
     if size_gb == 0: return "0.00 GB"
-    
-    # แปลงจาก GB กลับไปเป็น Bytes ก่อนเพื่อให้เริ่มคำนวณจากหน่วยเล็กสุดได้แม่นยำ
-    # (หรือจะเริ่มจาก GB เลยก็ได้ แต่การเริ่มจากหน่วยกลางๆ จะทำให้หารง่ายกว่า)
     units = ("B", "KB", "MB", "GB", "TB", "PB", "EB")
-    
-    # เริ่มต้นที่หน่วย GB (index 3 ในลิสต์ units)
     current_size = float(abs(size_gb))
     unit_index = 3 
     
-    # ถ้าค่ามากกว่า 1024 ให้ขยับหน่วยขึ้น (เช่น GB -> TB)
+    # Scale up if the number is huge (e.g., 1024 GB -> 1 TB)
     while current_size >= 1024 and unit_index < len(units) - 1:
         current_size /= 1024
         unit_index += 1
         
-    # ถ้าค่าน้อยกว่า 1 (แต่ไม่ใช่ 0) ให้ขยับหน่วยลง (เช่น GB -> MB)
+    # Scale down if the number is less than 1 (e.g., 0.5 GB -> 512 MB)
     while current_size < 1 and unit_index > 0:
         current_size *= 1024
         unit_index -= 1
         
-    # คืนค่าพร้อมเครื่องหมาย (บวก/ลบ) ตามค่าเดิมที่ส่งมา
     sign = "-" if size_gb < 0 else ""
     return f"{sign}{current_size:.2f} {units[unit_index]}"
 
@@ -192,7 +169,6 @@ def get_historical_report(site_name="TORRENTDD"):
         with open(STATS_HISTORY_FILE, 'r', encoding='utf-8') as f:
             all_history = json.load(f)
 
-        # เข้าถึงข้อมูลตาม Site Name (TORRENTDD / BEARBIT)
         history = all_history.get(site_name, {})
         if not history: 
             return f"⚠️ ไม่พบข้อมูลของเว็บ {site_name}"
@@ -208,7 +184,6 @@ def get_historical_report(site_name="TORRENTDD"):
         latest_snapshot = history[today_keys[-1]]
         h1_snapshot = history.get(today_keys[-2]) if len(today_keys) > 1 else None
 
-        # ฟังก์ชันคำนวณส่วนต่างภายใน (เรียกใช้ format_size ตัวเทพของคุณ)
         def calc_gain(new_val, old_val):
             diff = new_val - old_val
             if diff == 0: return "➖ 0.00 GB"
@@ -224,7 +199,6 @@ def get_historical_report(site_name="TORRENTDD"):
             f"📊 <b>Ratio:</b> <code>{latest_snapshot['ratio']:.3f}</code>"
         ]
 
-        # เพิ่ม Bonus เฉพาะถ้ามีข้อมูล (เช่น ใน BearBit อาจจะไม่ได้เก็บ)
         if 'bonus' in latest_snapshot:
             msg.append(f"💰 <b>Bonus:</b> <code>{latest_snapshot['bonus']:,.1f}</code>")
 
@@ -240,7 +214,6 @@ def get_historical_report(site_name="TORRENTDD"):
             "━━━━━━━━━━━━━━━━━━"
         ])
         return "\n".join(msg)
-
     except Exception as e:
         return f"❌ Report Error [{site_name}]: {str(e)}"
 
@@ -252,43 +225,35 @@ def get_monthly_report(site_name="TORRENTDD"):
         with open(STATS_HISTORY_FILE, 'r', encoding='utf-8') as f:
             all_history = json.load(f)
 
-        # เข้าถึงข้อมูลตาม Site Name
         history = all_history.get(site_name, {})
         if not history: 
             return f"⚠️ ไม่พบข้อมูลของเว็บ {site_name}"
 
         now = get_now()
-        current_month = now.strftime("%Y-%m") # เช่น "2026-05"
+        current_month = now.strftime("%Y-%m")
 
-        # กรองเอาเฉพาะ Key ของเดือนนี้และเรียงลำดับ
         monthly_keys = sorted([k for k in history.keys() if k.startswith(current_month)])
 
         if len(monthly_keys) < 2:
             return f"📊 ข้อมูลของเดือน {current_month} ({site_name}) ยังไม่เพียงพอสำหรับสรุปยอด"
 
-        # ดึงข้อมูลตัวแรกและล่าสุดของเดือน
         first_data = history[monthly_keys[0]]
         last_data = history[monthly_keys[-1]]
 
-        # คำนวณส่วนต่าง (ใช้หน่วย GB จาก JSON และ format_size ตัวเทพของคุณ)
         up_gain = last_data['up'] - first_data['up']
         dl_gain = last_data['dl'] - first_data['dl']
-        
-        # ป้องกัน Error กรณีไม่มีคีย์ bonus
         bonus_gain = last_data.get('bonus', 0) - first_data.get('bonus', 0)
 
-        # นับจำนวนวันที่เริ่มมีข้อมูลในเดือนนี้
         active_days = len(set([k.split()[0] for k in monthly_keys]))
 
         msg = [
             f"🗓️ <b>{site_name} Monthly: {current_month}</b>",
             "━━━━━━━━━━━━━━━━━━",
             f"👤 <b>User:</b> <code>{last_data['username']}</code>",
-            f"📤 <b>Total Uploaded:</b> +{format_size(up_gain)}", # เรียกใช้ฟังก์ชันแปลงหน่วย
+            f"📤 <b>Total Uploaded:</b> +{format_size(up_gain)}",
             f"📥 <b>Total Downloaded:</b> +{format_size(dl_gain)}",
         ]
 
-        # แสดง Bonus เฉพาะเมื่อมีการเปลี่ยนแปลง
         if bonus_gain != 0 or 'bonus' in last_data:
             msg.append(f"💰 <b>Total Bonus:</b> +{bonus_gain:,.1f} pts")
 
@@ -300,16 +265,14 @@ def get_monthly_report(site_name="TORRENTDD"):
             "━━━━━━━━━━━━━━━━━━"
         ])
         return "\n".join(msg)
-
     except Exception as e:
         return f"⚠️ Monthly Error [{site_name}]: {str(e)}"
 
 def format_report(report_raw, platform='tg'):
     if platform == 'dc':
-        # เปลี่ยน HTML เป็น Markdown สำหรับ Discord
         return report_raw.replace('<b>', '**').replace('</b>', '**')\
                          .replace('<code>', '`').replace('</code>', '`')
-    return report_raw # ส่ง HTML ไปตามปกติสำหรับ Telegram
+    return report_raw
 
 # --- MAIN RUNNER ---
 async def main():
@@ -345,13 +308,12 @@ async def main():
                 if str(message.chat.id) == TG_CHAT_ID:
                     await tg_bot.send_message(message.chat.id, "🕹️ Universal Remote Online", reply_markup=main_menu())
 
-            # --- เพิ่มส่วนการดึงข้อมูลบอทเพื่อโชว์ตอน Online ---
             async def get_bot_info():
-                bot_info = await tg_bot.get_me()
-                print(f"📡 Telegram Remote Online as: @{bot_info.username}")
+                try:
+                    bot_info = await tg_bot.get_me()
+                    print(f"📡 Telegram Remote Online as: @{bot_info.username}")
+                except: pass
 
-            # เรียกใช้งาน function แจ้งเตือนสถานะ
-            import asyncio
             asyncio.create_task(get_bot_info())
 
             @tg_bot.message_handler(func=lambda m: True)
@@ -360,7 +322,6 @@ async def main():
                 if chat_id != TG_CHAT_ID: return
                 txt = message.text
 
-                # --- 1. ตรวจสอบสถานะการรอรับค่า (State Management) ---
                 if chat_id in user_states:
                     state = user_states[chat_id]
                     try:
@@ -374,9 +335,9 @@ async def main():
                         elif state == "WAIT_MAX":
                             c['SETTING']['MAX_SIZE_GB'] = val
                             await tg_bot.send_message(chat_id, f"✅ อัปเดต Max Size: `{val}` GB", parse_mode='Markdown', reply_markup=settings_menu())
-                        elif state == "WAIT_PERCENT": # ✅ รับค่า %
+                        elif state == "WAIT_PERCENT":
                             c['SETTING']['MIN_FREE_PERCENT'] = int(val)
-                            await tg_bot.send_message(chat_id, f"✅ อัปเดต Freeload Percent: `{val}` %", parse_mode='Markdown',reply_markup=settings_menu())
+                            await tg_bot.send_message(chat_id, f"✅ อัปเดต Freeload Percent: `{val}` %", parse_mode='Markdown', reply_markup=settings_menu())
                         save_config(c)
                         del user_states[chat_id]
                         return
@@ -385,19 +346,15 @@ async def main():
                         del user_states[chat_id]
                         return
 
-                # --- 2. เมนูหลัก ---
                 if txt == '📊 Status Check':
                     await tg_bot.send_message(chat_id, get_status_text(), parse_mode='HTML')
                 elif txt == '📈 Stats Report':
-                    # ดึงรายชื่อเว็บทั้งหมดที่มีประวัติ
                     with open(STATS_HISTORY_FILE, 'r', encoding='utf-8') as f:
                         all_history = json.load(f)
-                    # วนลูปส่งรายงานทีละเว็บ หรือรวมเป็นข้อความเดียว
                     for site in all_history.keys():
                         report = get_historical_report(site_name=site)
                         await tg_bot.send_message(chat_id, report, parse_mode='HTML')
                 elif txt == '📈 Stats Monthly Report':
-                    # ดึงรายชื่อเว็บทั้งหมดที่มีประวัติ
                     with open(STATS_HISTORY_FILE, 'r', encoding='utf-8') as f:
                         all_history = json.load(f)
                     for site in all_history.keys():
@@ -421,14 +378,16 @@ async def main():
 
                 elif txt == '⬅️ Back':
                     await tg_bot.send_message(chat_id, "🏠 กลับหน้าหลัก", reply_markup=main_menu())
+                
                 elif txt == '📄 View Log':
-                    await tg_bot.send_message(chat_id, f"📄 **Last Log:**\n```\n{get_filtered_logs()}\n```", parse_mode='Markdown')
+                    # ✅ ป้องกัน HTML Parsing Error โดยการทำ html.escape ป้องกันอักขระแปลกปลอมใน Log
+                    safe_logs = html.escape(get_filtered_logs())
+                    await tg_bot.send_message(chat_id, f"📄 <b>Last Log:</b>\n<pre>{safe_logs}</pre>", parse_mode='HTML')
+                
                 elif txt == '📁 Download Log':
                     if os.path.exists(LOG_PATH):
                         try:
                             with open(LOG_PATH, 'rb') as f:
-                                # ✅ สำหรับ AsyncTeleBot ให้ส่ง f ไปตรงๆ
-                                # หากต้องการระบุชื่อไฟล์ให้ใช้ tuple (ชื่อไฟล์, ไฟล์ข้อมูล)
                                 await tg_bot.send_document(
                                     chat_id,
                                     document=(os.path.basename(LOG_PATH), f),
@@ -439,14 +398,13 @@ async def main():
                     else:
                         await tg_bot.send_message(chat_id, "❌ ไม่พบไฟล์ Log")
 
-                # --- Config Actions ---
                 elif txt == '📏 Set Min Size':
                     user_states[chat_id] = "WAIT_MIN"
                     await tg_bot.send_message(chat_id, "📏 ส่งตัวเลขขนาดไฟล์ **ขั้นต่ำ** (GB):", reply_markup=types.ReplyKeyboardRemove())
                 elif txt == '📐 Set Max Size':
                     user_states[chat_id] = "WAIT_MAX"
                     await tg_bot.send_message(chat_id, "📐 ส่งตัวเลขขนาดไฟล์ **สูงสุด** (GB):", reply_markup=types.ReplyKeyboardRemove())
-                elif txt == '📊 Set Min %': # คุณต้องไปเพิ่มปุ่มนี้ใน settings_menu()
+                elif txt == '📊 Set Min %':
                     user_states[chat_id] = "WAIT_PERCENT"
                     await tg_bot.send_message(chat_id, "📊 ส่งตัวเลข **% ขั้นต่ำ** ที่ต้องการ (เช่น 10):", reply_markup=types.ReplyKeyboardRemove())
 
@@ -459,15 +417,12 @@ async def main():
                     save_config(c)
                     await tg_bot.send_message(chat_id, f"♻️ เปลี่ยนโหมด Freeload เป็น: `{'✅ ON' if new_val else '❌ OFF'}`", parse_mode='Markdown')
 
-                # --- Control Actions ---
                 elif txt == '🚀 Start Bot':
                     if is_process_running("python3 -u main.py"):
                         await tg_bot.send_message(chat_id, "⚠️ บอทหลักทำงานอยู่ในขณะนี้")
                     else:
                         try:
                             await tg_bot.send_message(chat_id, "⏳ กำลังรันบอทหลัก...")
-
-                            # รันคำสั่งตาม OS (เน้น nohup สำหรับ Linux ของพี่)
                             if os.name != 'nt':
                                 run_cmd = f"nohup ./run_autopilot.sh > {LOG_PATH} 2>&1 &"
                                 subprocess.Popen(run_cmd, shell=True, cwd=BASE_DIR, preexec_fn=os.setpgrp)
@@ -475,17 +430,16 @@ async def main():
                                 run_cmd = f'start /b "" "run_autopilot.bat"'
                                 subprocess.Popen(run_cmd, shell=True, cwd=BASE_DIR)
 
-                            # --- วนเช็ค 6 รอบ รอบละ 15 วินาที (เผื่อเวลาติดตั้ง pip) ---
                             is_started = False
                             max_retries = 6
                             for i in range(1, max_retries + 1):
                                 print(f"🔍 Checking bot status... Round {i}")
-                                await asyncio.sleep(15)  # รอ 10 วินาทีในแต่ละรอบ
-            
+                                await asyncio.sleep(15)
+                    
                                 if is_process_running("python3 -u main.py"):
                                     is_started = True
                                     break
-            
+                    
                                 if i < max_retries:
                                     await tg_bot.send_message(chat_id, f"⏳ บอทกำลังเริ่มทำงาน (รอบที่ {i}/{max_retries})...")
 
@@ -493,7 +447,6 @@ async def main():
                                 await tg_bot.send_message(chat_id, "✅ บอทหลักทำงานแล้ว")
                             else:
                                 await tg_bot.send_message(chat_id, "❌ <b>รันบอทไม่สำเร็จ:</b> ไม่พบโปรเซสในระบบ โปรดเช็ค Log", parse_mode='HTML')
-
                         except Exception as e:
                             await tg_bot.send_message(chat_id, f"❌ <b>Error:</b> {str(e)}", parse_mode='HTML')
 
@@ -503,50 +456,38 @@ async def main():
                     else:
                         try:
                             await tg_bot.send_message(chat_id, "⏳ กำลังส่งสัญญาณหยุดบอทหลัก...")
-
-                            if os.name != 'nt':  # Linux/Unix
-                                # ใช้ SIGTERM (15) เพื่อให้บอทเคลียร์งานก่อนปิด หรือ SIGKILL (9) ถ้าต้องการปิดทันที
+                            if os.name != 'nt':
                                 stop_cmd = "pkill -15 -f 'python3 -u main.py'"
                                 os.system(stop_cmd)
-                            else:  # Windows
-                                # ✅ แก้ไข: ใช้ WMIC หรือ Taskkill แบบระบุชื่อไฟล์สคริปต์
-                                # เพื่อไม่ให้มันไปฆ่า Python ตัวอื่นๆ (เช่น บอทรีโมทตัวนี้)
+                            else:
                                 stop_cmd = 'wmic process where "commandline like \'%main.py%\'" delete'
                                 os.system(stop_cmd)
 
-                            # หน่วงเวลาให้ระบบเคลียร์ Process
                             await asyncio.sleep(15)
 
-                            # ตรวจสอบอีกครั้ง
                             if not is_process_running("python3 -u main.py"):
                                 await tg_bot.send_message(chat_id, "🛑 หยุดบอทหลักสำเร็จแล้ว")
                             else:
                                 await tg_bot.send_message(chat_id, "❌ <b>ไม่สามารถหยุดบอทได้:</b> โปรเซสยังค้างอยู่ในระบบ", parse_mode='HTML')
-
                         except Exception as e:
                             await tg_bot.send_message(chat_id, f"❌ <b>Error:</b> {str(e)}", parse_mode='HTML')
+                
                 elif txt == '🔄 Restart & Update':
                     await tg_bot.send_message(chat_id, "⏳ กำลังเริ่มกระบวนการ Update...")
-
                     try:
-                        # 1. ปิดบอทเดิมก่อน
                         if is_process_running("python3 -u main.py"):
                             stop_cmd = "pkill -15 -f 'python3 -u main.py'" if os.name != 'nt' else 'wmic process where "commandline like \'%main.py%\'" delete'
                             os.system(stop_cmd)
-                            await asyncio.sleep(15) # รอให้ Process คลายตัว
+                            await asyncio.sleep(15)
 
-                        # 2. ดึงโค้ดใหม่จาก Git
-                        # ใช้ && เพื่อให้มั่นใจว่าคำสั่งถัดไปจะรันเมื่อคำสั่งก่อนหน้าสำเร็จเท่านั้น
                         git_cmd = f"cd {BASE_DIR} && git fetch --all && git reset --hard origin/main"
                         git_result = os.system(git_cmd)
 
                         if git_result != 0:
                             await tg_bot.send_message(chat_id, "⚠️ <b>Git Update Failed:</b> ตรวจสอบการเชื่อมต่อหรือ Git Conflict", parse_mode='HTML')
-                            # ไม่ควรไปต่อถ้ารีเซ็ตโค้ดไม่สำเร็จ
                         else:
                             await tg_bot.send_message(chat_id, "📥 ดึงโค้ดเวอร์ชันล่าสุดสำเร็จ... กำลังเริ่มบอทใหม่")
 
-                        # 3. รันบอทใหม่ (ใช้ Popen เพื่อความเสถียร)
                         if os.name != 'nt':
                             run_cmd = f"nohup ./run_autopilot.sh > {LOG_PATH} 2>&1 &"
                             subprocess.Popen(run_cmd, shell=True, cwd=BASE_DIR, preexec_fn=os.setpgrp)
@@ -554,44 +495,34 @@ async def main():
                             run_cmd = 'start /b "" "run_autopilot.bat"'
                             subprocess.Popen(run_cmd, shell=True, cwd=BASE_DIR)
 
-                        # 4. ตรวจสอบสถานะสุดท้าย
-                        # วนเช็ค 6 รอบ รอบละ 15 วินาที (เผื่อเวลาติดตั้ง pip)
                         max_retries = 6
                         is_online = False
-
                         for i in range(1, max_retries + 1):
                             print(f"🔍 Checking bot status... Round {i}")
-                            await asyncio.sleep(15)  # รอ 10 วินาทีในแต่ละรอบ
-            
+                            await asyncio.sleep(15)
+                    
                             if is_process_running("python3 -u main.py"):
                                 is_online = True
                                 break
-            
+                    
                             if i < max_retries:
                                 await tg_bot.send_message(chat_id, f"⏳ บอทกำลังเริ่มทำงาน (รอบที่ {i}/{max_retries})...")
 
                         if is_online:
-                            await tg_bot.send_message(
-                                chat_id, 
-                                "✅ <b>Update & Restart Success!</b>\nบอทหลักกลับมาทำงานปกติแล้ว", 
-                                parse_mode='HTML'
-                            )
+                            await tg_bot.send_message(chat_id, "✅ <b>Update & Restart Success!</b>\nบอทหลักกลับมาทำงานปกติแล้ว", parse_mode='HTML')
                         else:
-                            await tg_bot.send_message(
-                                chat_id, 
-                                "❌ <b>Update Error:</b> บอทไม่ออนไลน์หลังอัปเดต 3 รอบ\nอาจจะติดที่ขั้นตอน <code>pip install</code> หรือมี Error ในโค้ด",
-                                parse_mode='HTML'
-                            )
+                            await tg_bot.send_message(chat_id, "❌ <b>Update Error:</b> บอทไม่ออนไลน์หลังอัปเดต ย้อนเช็คสคริปต์สตาร์ท", parse_mode='HTML')
                     except Exception as e:
                         await tg_bot.send_message(chat_id, f"❌ <b>Update System Error:</b> {str(e)}")
 
                 elif txt == '♻️ Restart Remote':
                     await tg_bot.send_message(chat_id, "♻️ รีสตาร์ท Remote...")
                     os._exit(0)
-                elif txt == '⬅️ Back':
-                    await tg_bot.send_message(chat_id, "🏠 กลับหน้าหลัก", reply_markup=main_menu())
 
-            tasks.append(tg_bot.polling(non_stop=True))
+            # ✅ เปลี่ยนวิธีเปิด Polling สำหรับ AsyncTeleBot เพื่อให้ทำงานร่วมกับ Discord ได้อย่างเสถียร
+            # skip_pending=True จะช่วยเคลียร์คำสั่งค้างทิ้งทันทีเมื่อเกิดเหตุเน็ตหลุด ไม่ให้บอทค้างตอนเปิดใหม่
+            tasks.append(tg_bot.infinity_polling(skip_pending=True, timeout=60, request_timeout=60))
+            
         except Exception as e: print(f"❌ TG Error: {e}")
 
     # --- 🟣 DISCORD SECTION (Private DM Mode) ---
@@ -599,16 +530,14 @@ async def main():
     if dc_cfg.get('remote_enable', False):
         try:
             intents = discord.Intents.default()
-            intents.message_content = True  # ต้องเปิดใน Discord Developer Portal ด้วย
+            intents.message_content = True
 
-            # บอทจะไม่ตอบรับคำสั่งใน Server (Prefix setup)
             dc_bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
             DC_ADMIN_ID = int(dc_cfg.get('admin_id', 0))
 
             @dc_bot.event
             async def on_ready():
                 print(f"✅ Discord Remote Online (DM Mode) as: {dc_bot.user}")
-                # ส่งข้อความทักทายเข้า DM เมื่อบอทออนไลน์
                 try:
                     admin = await dc_bot.fetch_user(DC_ADMIN_ID)
                     await admin.send("🔌 **Universal Remote Online**\nบอทพร้อมรับคำสั่งผ่าน DM แล้วครับ")
@@ -616,32 +545,26 @@ async def main():
 
             @dc_bot.event
             async def on_message(message):
-                # 1. กรองเฉพาะข้อความที่เป็น DM และส่งมาจาก Admin เท่านั้น
                 is_dm = isinstance(message.channel, discord.DMChannel)
                 is_admin = message.author.id == DC_ADMIN_ID
 
                 if message.author == dc_bot.user: return
 
                 if is_dm and is_admin:
-                    # ประมวลผลคำสั่งปกติ (!status, !log, !report)
                     await dc_bot.process_commands(message)
                 elif not is_admin:
-                    # ถ้าคนอื่นทักมา ไม่ตอบโต้ใดๆ เพื่อความเป็นส่วนตัว
                     return
 
             @dc_bot.command(name="status")
             async def dc_status(ctx):
-                # ไม่ต้องเช็ค ID ซ้ำเพราะกรองที่ on_message แล้ว
                 await ctx.send(format_report(get_status_text(), platform='dc'))
 
             @dc_bot.command(name="report")
             async def dc_report(ctx, site: str = None):
                 if site:
-                    # กรณีระบุชื่อเว็บ เช่น !report BEARBIT
                     report_data = get_historical_report(site_name=site.upper())
                     await ctx.send(format_report(report_data, platform='dc'))
                 else:
-                    # ดึงรายชื่อเว็บทั้งหมดที่มีประวัติ
                     with open(STATS_HISTORY_FILE, 'r', encoding='utf-8') as f:
                         all_history = json.load(f)
                     for site_key in all_history:
@@ -654,10 +577,8 @@ async def main():
                     report_data = get_monthly_report(site_name=site.upper())
                     await ctx.send(format_report(report_data, platform='dc'))
                 else:
-                    # ดึงรายชื่อเว็บทั้งหมดที่มีประวัติ
                     with open(STATS_HISTORY_FILE, 'r', encoding='utf-8') as f:
                         all_history = json.load(f)
-                    # วนลูปส่งรายงานทีละเว็บ หรือรวมเป็นข้อความเดียว
                     for site_key in all_history:
                         report_data = get_monthly_report(site_name=site_key)
                         await ctx.send(format_report(report_data, platform='dc'))
@@ -682,6 +603,7 @@ async def main():
 
             tasks.append(dc_bot.start(dc_cfg['remote_bot_token']))
         except Exception as e: print(f"❌ Discord Error: {e}")
+        
     if tasks: await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
