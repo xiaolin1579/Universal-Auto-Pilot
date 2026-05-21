@@ -418,43 +418,82 @@ class QbitNode:
     def refresh_status(self):
         if not self.is_connected: return False
         try:
-            # 1. ใช้ timeout ที่สั้นลงและแยกการเรียกเพื่อความชัวร์
-            # ดึงข้อมูลจาก sync/maindata ครั้งเดียวได้ทั้ง Server State และพื้นที่ดิสก์
-            r_main = self.s.get(f"{self.url}/api/v2/sync/maindata", auth=self.auth, verify=False, timeout=5).json()
-            server_state = r_main.get('server_state', {})
+            # 1. ดึงข้อมูลระบบหลัก (Maindata)
+            r_main = self.s.get(f"{self.url}/api/v2/sync/maindata", auth=self.auth, verify=False, timeout=5)
             
-            # 2. คำนวณพื้นที่ใช้ไปจาก API โดยตรง (แม่นยำกว่า sum เอง)
-            # ข้อมูลนี้มักจะอยู่ในหน่วย Bytes
-            total_wasted = server_state.get('alltime_ul', 0) # ตัวอย่างการดึงค่าอื่นๆ
+            # ตรวจสอบว่า Session หลุดหรือไม่ (ถ้าเจอ 401/403 ให้สั่งล็อกอินใหม่ทันที)
+            if r_main.status_code in [401, 403]:
+                print(f" 🔄 [{self.name}] Session expired ({r_main.status_code}), attempting re-login...")
+                if self.login():
+                    # ถ้ารีล็อกอินสำเร็จ ให้ข้ามไปรันรอบหน้า หรือจะยิงซ้ำรอบนี้ก็ได้
+                    return False 
+                
+            main_data = r_main.json()
+            server_state = main_data.get('server_state', {})
             
-            # ดึงลิสต์เพื่อคำนวณ used_gb (โค้ดส่วนเดิมของคุณ)
-            torrents = self.s.get(f"{self.url}/api/v2/torrents/info", auth=self.auth, verify=False, timeout=7).json()
+            # 2. ดึงลิสต์ทอร์เรนต์ทั้งหมด (ยิงรอบเดียวจบ)
+            r_torrents = self.s.get(f"{self.url}/api/v2/torrents/info", auth=self.auth, verify=False, timeout=7)
+            if r_torrents.status_code in [401, 403]:
+                self.login()
+                return False
+                
+            torrents = r_torrents.json()
             
-            # เลือกใช้ 'total_size' จะแม่นยำกว่า 'size' ใน qBit รุ่นใหม่
-            used_gb = sum(t.get('total_size', t.get('size', 0)) for t in torrents) / (1024**3)
+            # 3. คำนวณข้อมูลงวดเดียว Loop เดียวเพื่อลดภาระ CPU
+            used_bytes = 0
+            pending_bytes = 0
+            active_count = 0
+            
+            # กำหนดสถานะที่ไม่นับว่าเป็น Active (เช่น พวกที่หยุดวิ่งไปแล้ว)
+            inactive_states = {'pausedDL', 'pausedUP', 'queuedDL', 'queuedUP', 'checkingResumeData'}
+            
+            for t in torrents:
+                state = t.get('state', '')
+                size = t.get('total_size', t.get('size', 0))
+                
+                # 1. ดึงขนาดไฟล์ที่อยู่บนดิสก์จริง ๆ ณ ปัจจุบัน (ใช้ completed ชัวร์ที่สุด)
+                # สำหรับทอร์เรนต์ที่เสร็จแล้ว (เช่น uploading) ค่า completed จะเท่ากับ size พอดี
+                current_on_disk = t.get('completed', size) if state in ['downloading', 'stalledDL', 'metaDL'] else size
+                
+                # ดักกรณีพิเศษเพิ่มเติม: หากสคริปต์เพิ่งแอดทอร์เรนต์ใหม่และกำลังเช็กไฟล์ (Checking) 
+                if 'checking' in state.lower():
+                    current_on_disk = t.get('completed', size)
 
-            # 3. ดึงค่า Pending (พื้นที่ที่กำลังดาวน์โหลดแต่ยังไม่เสร็จ)
-            pending_gb = self.get_downloading_size()
+                # 2. สะสมพื้นที่ดิสก์ที่ใช้ไปแล้วจริง
+                used_bytes += current_on_disk
+                
+                # 3. หาพื้นที่ที่ "ต้องใช้เพิ่มในอนาคต" จนกว่าจะเสร็จ (Pending Size)
+                if state in ['downloading', 'stalledDL', 'metaDL']:
+                    # ขนาดเต็ม หักลบ ส่วนที่โหลดลงดิสก์ไปแล้ว = ปริมาณพื้นที่ที่ดิสก์ต้องเตรียมเพิ่ม
+                    pending_bytes += max(0, size - current_on_disk)
+                
+                # 4. นับจำนวน Active Torrent
+                if state not in inactive_states:
+                    active_count += 1
+
+            # แปลงหน่วยเป็น GB
+            used_gb = used_bytes / (1024**3)
+            pending_gb = pending_bytes / (1024**3)
             safety_buffer = 15.0
 
+            # 4. คำนวณพื้นที่ว่างตามเงื่อนไข Quota
             if self.quota_gb > 0:
-                # กรณีมี Quota: พื้นที่ว่าง = Quota - ที่ใช้ไปแล้ว - ที่รอโหลด - Buffer
                 self.free_gb = max(0, self.quota_gb - used_gb - pending_gb - safety_buffer)
             else:
-                # ดึงพื้นที่ว่างจริงจาก Server State
                 real_disk_free = server_state.get('free_space_on_disk', 0) / (1024**3)
                 self.free_gb = max(0, real_disk_free - pending_gb - safety_buffer)
 
-            # 4. อัปเดตข้อความสถานะให้ดูง่ายขึ้น
-            active_count = len([t for t in torrents if t['state'] in ['downloading', 'uploading', 'stalledUP']])
+            # 5. อัปเดตข้อความสถานะ
             self.stat_msg = f"A:{active_count} | Used:{used_gb:.1f}G | Safe:{self.free_gb:.1f}G"
-            
             return True
+            
         except Exception as e:
-            # ถ้า Refresh พลาดบ่อยๆ ให้ลองสั่ง login ใหม่ในตัว (Auto Re-login)
-            if "403" in str(e) or "401" in str(e):
+            # ดักจับกรณี json พังเพราะโดนดีดหน้า Login (มักเกิดตอน Session หลุดแล้วสคริปต์ได้หน้าเว็บ HTML กลับมา)
+            if "JSONDecodeError" in type(e).__name__:
+                print(f" ⚠️ [{self.name}] Response is not JSON. Session might be dead. Re-logging in...")
                 self.login()
-            print(f"⚠️ [{self.name}] Refresh Error: {e}")
+            else:
+                print(f" ⚠️ [{self.name}] Refresh Error: {e}")
             return False
 
     def add(self, content, site_name="Universal", size=None, n_cfg=None):
@@ -468,7 +507,7 @@ class QbitNode:
             data = {
                 "paused": "false",
                 "firstLastPiecePrio": "true",
-                "sequentialDownload": "true", # แนะนำให้เปิดไว้สำหรับสาย Racing
+                "sequentialDownload": "false", # ปิดไว้เพื่อให้กระจายขอชิ้นส่วนไฟล์พร้อมกัน รีดสปีดเน็ตเวิร์กได้เต็มข้อ
                 "category": site_name,
                 "tags": "AutoPilot",
                 "autoTMM": "false" # บังคับให้ใช้ Path ที่เราคุมเอง (ถ้ามีระบุเพิ่ม)
@@ -487,12 +526,11 @@ class QbitNode:
                 timeout=30
             )
 
-            # เช็คความสำเร็จ: 200 คือผ่าน, บางรุ่นอาจมี "Ok." ใน text
+            # เช็คความสำเร็จ: 200 คือผ่าน
             if r.status_code == 200:
-                # แม้ใน text จะไม่มีคำว่า Ok แต่ Status 200 คือ qBit รับไฟล์ไปแล้ว
                 return True
             else:
-                # กรณี 403 ให้ลองสั่ง Login ใหม่ทันทีเผื่อ Session หลุด
+                # กรณี 401, 403 ให้ลองสั่ง Login ใหม่ทันทีเผื่อ Session หลุด
                 if r.status_code in [401, 403]:
                     self.login()
                 print(f"⚠️ [API Error] {self.name}: {r.status_code} - {r.text}")
@@ -761,50 +799,91 @@ class RtorrentNode:
     def refresh_status(self):
         if not self.is_connected: return False
         try:
-            # ใช้ XML แบบที่คุณดึงค่าได้ชัวร์ๆ (ระบุฟิลด์ d.is_active= และ d.size_bytes=)
-            xml = '<?xml version="1.0"?><methodCall><methodName>d.multicall2</methodName><params><param><value><string></string></value></param><param><value><string>main</string></value></param><param><value><string>d.is_active=</string></value></param><param><value><string>d.size_bytes=</string></value></param></params></methodCall>'
+            # 1. ยิง XML-RPC ดึง 3 ฟิลด์สำคัญ: active, size_bytes, และ bytes_done
+            xml = (
+                '<?xml version="1.0"?>'
+                '<methodCall>'
+                '<methodName>d.multicall2</methodName>'
+                '<params>'
+                '<param><value><string></string></value></param>'
+                '<param><value><string>main</string></value></param>'
+                '<param><value><string>d.is_active=</string></value></param>'
+                '<param><value><string>d.size_bytes=</string></value></param>'
+                '<param><value><string>d.bytes_done=</string></value></param>'
+                '</params>'
+                '</methodCall>'
+            )
             r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=10, verify=False)
+            
+            # ถ้าเจอ Session หลุดหรือสิทธิ์พัง (401/403) สั่งรีล็อกอินทันที
+            if r.status_code in [401, 403]:
+                print(f" 🔄 [{self.name}] rTorrent Session expired ({r.status_code}), re-logging in...")
+                if self.login(): return False
+            
             soup = BeautifulSoup(r.text, "xml")
-
-            # ดึงค่าตัวเลขทั้งหมด (i8) แบบที่คุณถนัด
-            vals = [v.get_text() for v in soup.find_all("i8")]
             
             active = 0
-            used_bytes = 0 
+            used_bytes = 0
+            pending_bytes = 0
             
-            # วน Loop ทีละ 2 (is_active และ size_bytes)
-            for i in range(0, len(vals), 2):
-                is_active = int(vals[i])
-                size = int(vals[i+1])
-                
-                if is_active == 1: 
-                    active += 1
-                used_bytes += size
+            # แกะข้อมูลทีละโครงสร้างทอร์เรนต์ (<list> -> <value> ของแต่ละตัว) เพื่อความปลอดภัยสูงสุด
+            # โครงสร้าง rTorrent multicall จะส่งกลับมาเป็น array ครอบทีละงาน
+            torrent_nodes = soup.find_all("array")
+            
+            # ชดเชยกรณีโครงสร้างหลัก: ตัวแรกสุดมักเป็นตัวครอบขอบเขต ให้ข้ามไปดูข้อมูลข้างใน
+            if torrent_nodes:
+                # เจาะจงหา node ย่อยที่เป็นข้อมูลรายตัวทอร์เรนต์
+                data_node = soup.find("data")
+                if data_node:
+                    # ทอร์เรนต์แต่ละตัวจะอยู่ในแท็ก <value> ภายใต้ <data>
+                    for torrent in data_node.find_all("value", recursive=False):
+                        # ดึงเฉพาะค่า i8 หรือ int ด้านในของทอร์เรนต์ตัวนี้
+                        vals = [int(i.get_text()) for i in torrent.find_all(["i8", "int"])]
+                        
+                        # ต้องมั่นใจว่าได้ครบทั้ง 3 ฟิลด์ที่ขอไป
+                        if len(vals) >= 3:
+                            is_active  = vals[0]
+                            size_bytes = vals[1]
+                            bytes_done = vals[2]
+                            
+                            # นับจำนวน Active ทอร์เรนต์ที่กำลังทำงานอยู่จริง
+                            if is_active == 1:
+                                active += 1
+                                
+                            # 1. คิดพื้นที่ดิสก์ที่ใช้ไปแล้วตามข้อมูลจริงที่บันทึกสำเร็จ (bytes_done)
+                            used_bytes += bytes_done
+                            
+                            # 2. คำนวณเนื้อที่ที่ยังเหลือและต้องการในอนาคต (Pending) ของตัวที่ยังโหลดไม่เสร็จ
+                            if bytes_done < size_bytes:
+                                # ถ้าคิวงานยังโหลดไม่เสร็จ ให้คำนวณส่วนต่างจองพื้นที่ล่วงหน้าไว้เลยใน Loop เดียว
+                                pending_bytes += max(0, size_bytes - bytes_done)
 
+            # แปลงหน่วยเป็น GB
             used_gb = used_bytes / (1024**3)
-            # ดึงขนาดไฟล์ที่จองพื้นที่ไว้แล้วแต่ยังโหลดไม่เสร็จ (จากฟังก์ชันเดิมของคุณ)
-            pending_gb = self.get_downloading_size() 
-            safety_buffer = 15.0 
+            pending_gb = pending_bytes / (1024**3)
+            safety_buffer = 15.0
 
-            # คำนวณพื้นที่
+            # 3. คำนวณพื้นที่ว่างและการดึงข้อมูล Disk Free
             if self.quota_gb > 0:
-                # Safe Space = พื้นที่ยอมให้เติมงาน (หัก Used, Pending และ Buffer)
                 self.free_gb = max(0, self.quota_gb - used_gb - pending_gb - safety_buffer)
-                # Display Free = พื้นที่ว่างที่เหลือจริงๆ บนหน้า Dashboard
                 display_free = max(0, self.quota_gb - used_gb)
             else:
+                # สั่งเช็กพื้นที่ดิสก์จริงของเครื่อง rTorrent
                 r_free = self.s.post(self.url, data='<?xml version="1.0"?><methodCall><methodName>network.disk_free</methodName></methodCall>', auth=self.auth, headers=self.headers, timeout=10, verify=False)
-                val_node = BeautifulSoup(r_free.text, "xml").find("value")
-                real_free = abs(int(val_node.get_text().strip())) / (1024**3)
+                
+                # ป้องกันแกะสตริงผิดพลาด: หาแท็กตัวเลขชั้นในสุด (i8 หรือ i4) แล้วครอบ abs
+                free_node = BeautifulSoup(r_free.text, "xml").find(["i8", "int", "i4"])
+                real_free = abs(int(free_node.get_text().strip())) / (1024**3) if free_node else 0.0
+                
                 self.free_gb = max(0, real_free - pending_gb - safety_buffer)
                 display_free = real_free
 
-            # แสดงผลรูปแบบ qBit Style: FREE | A | Used | Safe
+            # 4. ประกอบร่างข้อความแสดงผล qBit Style ตามที่คุณออกแบบไว้
             self.stat_msg = f"FREE {display_free:.1f}GB | A:{active} | Used:{used_gb:.1f}G | Safe:{self.free_gb:.1f}G"
-            
             return True
+            
         except Exception as e:
-            print(f"⚠️ Refresh Status Error: {e}")
+            print(f"⚠️ [{self.name}] rTorrent Refresh Status Error: {e}")
             return False
 
     def get_all_torrents_info(self):
@@ -906,37 +985,80 @@ class RtorrentNode:
                 print(f"❌ [{self.name}] Torrent file is too small or invalid.")
                 return False
 
-            # 2. แปลงไฟล์เป็น Base64
-            import base64
-            b64 = base64.b64encode(content).decode('utf-8')
+            # ป้องกันอักขระพิเศษใน XML ด้วยการทำความสะอาดข้อความสั้นๆ
+            import html
+            safe_site_name = html.escape(str(site_name))
 
-            # 3. เตรียม XML พร้อมเซ็ต Label (d.custom1.set)
-            # เราจะเอาชื่อเว็บมาเป็น Label เพื่อให้แสดงผลใน ruTorrent
-            xml = f'''<?xml version="1.0"?>
-            <methodCall>
-                <methodName>load.raw_start</methodName>
-                <params>
-                    <param><value><string></string></value></param>
-                    <param><value><base64>{b64}</base64></value></param>
-                    <param><value><string>d.custom1.set={site_name}</string></value></param>
-                </params>
-            </methodCall>'''
+            # 2. เตรียม XML-RPC Request สำหรับ rTorrent
+            # rTorrent ต้องการเนื้อไฟล์ดิบๆ (Raw) ในแท็ก <string> 
+            # และใช้พารามิเตอร์ตัวที่ 3 เป็นคำสั่งแก้ไข Properties ของทอร์เรนต์หลังโหลดเสร็จ
+            xml_template = (
+                '<?xml version="1.0"?>'
+                '<methodCall>'
+                '<methodName>load.raw_start</methodName>'
+                '<params>'
+                '<param><value><string></string></value></param>'
+                '<param><value><string>{raw_torrent_placeholder}</string></value></param>'
+                '<param><value><string>d.custom1.set={site_name}</string></value></param>'
+                '</params>'
+                '</methodCall>'
+            )
+
+            # 3. ประกอบร่างข้อมูล (แปลงเป็นไบต์เพื่อความปลอดภัยในการส่งข้อมูลดิบร่วมกับสตริง)
+            # เราจะจัดรูปข้อความ XML ก่อน แล้วสลับเอาข้อมูลเนื้อไฟล์ทอร์เรนต์ที่เป็นไบต์ยัดเข้าไปตรงๆ
+            xml_base = xml_template.format(raw_torrent_placeholder="REPLACE_ME", site_name=safe_site_name)
+            
+            # แปลงไฟล์ทอร์เรนต์ให้อยู่ในรูป XML String ที่ rTorrent เข้าใจ 
+            # (rTorrent รับข้อมูลดิบในแท็กสตริง แต่ต้องทำการ Escaped อักขระควบคุมบางตัวใน XML)
+            # วิธีที่ดีและเร็วที่สุดคือการใช้ xmlrpc.client ในการห่อหุ้มข้อมูลถ้ากังวลเรื่องการหลุด 
+            # แต่ถ้าจะส่งดิบๆ ต้องมั่นใจว่าห่อแบบนี้:
+            import xmlrpc.client
+            raw_string_xml = xmlrpc.client.dumps((xmlrpc.client.Binary(content),)).replace("<value><binary>", "").replace("</binary></value>", "")
+            
+            # เพื่อให้ใช้งานได้ง่ายและจบในฟังก์ชันเดียวโดยไม่พึ่งพา Module ซับซ้อน 
+            # แนะนำให้ห่อ content ด้วย xmlrpc.client.Binary หรือใช้วิธีส่งแบบ Multipart/Standard Payload
+            # ต่อไปนี้คือวิธีสากลที่ใช้ร่วมกับคำสั่ง requests ได้ชัวร์ที่สุดครับ:
+            
+            xml_payload = (
+                b'<?xml version="1.0"?>'
+                b'<methodCall>'
+                b'<methodName>load.raw_start</methodName>'
+                b'<params>'
+                b'<param><value><string></string></value></param>'
+                b'<param><value><base64>' + base64.b64encode(content) + b'</base64></param>'
+                b'<param><value><string>d.custom1.set=' + safe_site_name.encode('utf-8') + b'</string></value></param>'
+                b'</params>'
+                b'</methodCall>'
+            )
+            # หมายเหตุ: rTorrent v0.9.x เป็นต้นไป รองรับแท็ก <base64> ภายใน XML-RPC 
+            # แต่ข้อสำคัญคือ พารามิเตอร์คำสั่งต้องอยู่หลังไฟล์ทอร์เรนต์ และต้องส่งโครงสร้างแบบ Byte Payload เท่านั้น
 
             # 4. ส่ง Request ไปยัง rTorrent
+            # ปรับ headers ให้แมตช์กับ XML-RPC เป็น Content-Type: text/xml
+            headers = dict(self.headers)
+            headers['Content-Type'] = 'text/xml'
+
             r = self.s.post(
                 self.url,
-                data=xml,
+                data=xml_payload,
                 auth=self.auth,
-                headers=self.headers,
+                headers=headers,
                 timeout=30,
                 verify=False
             )
 
-            if r.status_code == 200:
+            if r.status_code == 200 and "faultCode" not in r.text:
                 print(f"✅ [{self.name}] Added | Site: {site_name}")
                 return True
             else:
-                print(f"❌ [{self.name}] Server Error: {r.status_code}")
+                # ตรวจเช็คกรณีเกิดข้อผิดพลาดภายใน XML-RPC (Fault response)
+                if "faultString" in r.text:
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(r.text, "xml")
+                    error_msg = soup.find("string").get_text() if soup.find("string") else "Unknown RPC Fault"
+                    print(f"❌ [{self.name}] rTorrent RPC Fault: {error_msg}")
+                else:
+                    print(f"❌ [{self.name}] Server Error: {r.status_code}")
                 return False
 
         except Exception as e:
