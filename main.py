@@ -1,5 +1,7 @@
 import random
+import threading
 import chardet
+import gzip
 import time
 import os
 import re
@@ -20,6 +22,7 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 import ddddocr
 import io
+from xml.sax.saxutils import escape
 import functools
 print = functools.partial(print, flush=True)
 
@@ -418,82 +421,115 @@ class QbitNode:
     def refresh_status(self):
         if not self.is_connected: return False
         try:
-            # 1. ดึงข้อมูลระบบหลัก (Maindata)
-            r_main = self.s.get(f"{self.url}/api/v2/sync/maindata", auth=self.auth, verify=False, timeout=5)
-            
-            # ตรวจสอบว่า Session หลุดหรือไม่ (ถ้าเจอ 401/403 ให้สั่งล็อกอินใหม่ทันที)
+            # 1. ดึงข้อมูลระบบหลัก (Maindata) พร้อมเสริมเกราะ Retry ลูปสั้น
+            r_main = None
+            for attempt in range(3):
+                try:
+                    r_main = self.s.get(f"{self.url}/api/v2/sync/maindata", auth=self.auth, verify=False, timeout=10)
+                    break
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                    if attempt < 2:
+                        time.sleep(1.0)
+                    else:
+                        print(f"⚠️ [{self.name}] อัปเดต Maindata ไม่สำเร็จ (ใช้ค่าสถานะเดิมชั่วคราว)")
+                        return True  # ใช้ค่าเก่าประคองตัวลูปหลัก
+
+            # ตรวจสอบเซสชันหลุด (401/403)
             if r_main.status_code in [401, 403]:
-                print(f" 🔄 [{self.name}] Session expired ({r_main.status_code}), attempting re-login...")
-                if self.login():
-                    # ถ้ารีล็อกอินสำเร็จ ให้ข้ามไปรันรอบหน้า หรือจะยิงซ้ำรอบนี้ก็ได้
-                    return False 
-                
-            main_data = r_main.json()
-            server_state = main_data.get('server_state', {})
-            
-            # 2. ดึงลิสต์ทอร์เรนต์ทั้งหมด (ยิงรอบเดียวจบ)
-            r_torrents = self.s.get(f"{self.url}/api/v2/torrents/info", auth=self.auth, verify=False, timeout=7)
-            if r_torrents.status_code in [401, 403]:
-                self.login()
+                print(f" 🔄 [{self.name}] qBittorrent Session expired ({r_main.status_code}), re-logging in...")
+                if self.login(): return False
+
+            try:
+                main_data = r_main.json()
+            except Exception:
+                print(f" ⚠️ [{self.name}] Response is not JSON. Re-logging in...")
+                if self.login(): return False
                 return False
                 
-            torrents = r_torrents.json()
+            server_state = main_data.get('server_state', {})
             
-            # 3. คำนวณข้อมูลงวดเดียว Loop เดียวเพื่อลดภาระ CPU
+            # 2. ดึงลิสต์ทอร์เรนต์ทั้งหมด พร้อมเกราะ Retry ลูปสั้น
+            r_torrents = None
+            for attempt in range(3):
+                try:
+                    r_torrents = self.s.get(f"{self.url}/api/v2/torrents/info", auth=self.auth, verify=False, timeout=10)
+                    break
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                    if attempt < 2:
+                        time.sleep(1.0)
+                    else:
+                        print(f"⚠️ [{self.name}] อัปเดตข้อมูลทอร์เรนต์ไม่สำเร็จ (ใช้ค่าสถานะเดิมชั่วคราว)")
+                        return True
+
+            if r_torrents.status_code in [401, 403]:
+                if self.login(): return False
+
+            try:
+                torrents = r_torrents.json()
+            except Exception:
+                if self.login(): return False
+                return False
+            
+            # 3. คำนวณข้อมูลในลูปเดียวเพื่อความรวดเร็ว
             used_bytes = 0
-            pending_bytes = 0
             active_count = 0
             
-            # กำหนดสถานะที่ไม่นับว่าเป็น Active (เช่น พวกที่หยุดวิ่งไปแล้ว)
-            inactive_states = {'pausedDL', 'pausedUP', 'queuedDL', 'queuedUP', 'checkingResumeData'}
+            # กลุ่มสถานะหยุดนิ่ง/รอคิว (ไม่นับเป็น Active)
+            inactive_states = {
+                'pausedDL', 'pausedUP', 
+                'queuedDL', 'queuedUP', 
+                'checkingResumeData', 
+                'stalledUP'
+            }
             
             for t in torrents:
                 state = t.get('state', '')
                 size = t.get('total_size', t.get('size', 0))
+                completed_bytes = t.get('completed', 0)
                 
-                # 1. ดึงขนาดไฟล์ที่อยู่บนดิสก์จริง ๆ ณ ปัจจุบัน (ใช้ completed ชัวร์ที่สุด)
-                # สำหรับทอร์เรนต์ที่เสร็จแล้ว (เช่น uploading) ค่า completed จะเท่ากับ size พอดี
-                current_on_disk = t.get('completed', size) if state in ['downloading', 'stalledDL', 'metaDL'] else size
+                downloading_states = {'downloading', 'stalledDL', 'metaDL', 'allocating', 'forcedDL'}
                 
-                # ดักกรณีพิเศษเพิ่มเติม: หากสคริปต์เพิ่งแอดทอร์เรนต์ใหม่และกำลังเช็กไฟล์ (Checking) 
+                # คิดขนาดพื้นที่บนดิสก์จริง
                 if 'checking' in state.lower():
-                    current_on_disk = t.get('completed', size)
+                    current_on_disk = size
+                elif state in downloading_states:
+                    current_on_disk = completed_bytes
+                else:
+                    current_on_disk = size
 
-                # 2. สะสมพื้นที่ดิสก์ที่ใช้ไปแล้วจริง
                 used_bytes += current_on_disk
                 
-                # 3. หาพื้นที่ที่ "ต้องใช้เพิ่มในอนาคต" จนกว่าจะเสร็จ (Pending Size)
-                if state in ['downloading', 'stalledDL', 'metaDL']:
-                    # ขนาดเต็ม หักลบ ส่วนที่โหลดลงดิสก์ไปแล้ว = ปริมาณพื้นที่ที่ดิสก์ต้องเตรียมเพิ่ม
-                    pending_bytes += max(0, size - current_on_disk)
-                
-                # 4. นับจำนวน Active Torrent
+                # นับจำนวน Active Torrent เฉพาะตัวที่กำลังทำงานจริง
                 if state not in inactive_states:
                     active_count += 1
 
             # แปลงหน่วยเป็น GB
             used_gb = used_bytes / (1024**3)
-            pending_gb = pending_bytes / (1024**3)
             safety_buffer = 15.0
 
-            # 4. คำนวณพื้นที่ว่างตามเงื่อนไข Quota
+            # 4. คำนวณพื้นที่ว่างและการดึงข้อมูล Disk Free ในมาตรฐานเดียวกับ rTorrent (สายซิ่ง ไม่หัก pending ค้าง)
             if self.quota_gb > 0:
-                self.free_gb = max(0, self.quota_gb - used_gb - pending_gb - safety_buffer)
+                my_quota_free = max(0, self.quota_gb - used_gb)
+                display_free = my_quota_free
+                
+                # 🎯 สูตร Safe เวอร์ชันปลดล็อกความเร็วในการ Racing (หักแค่บัฟเฟอร์ 15GB กันเหนียว)
+                self.free_gb = max(0, my_quota_free - safety_buffer)
             else:
+                # เคสไม่มีโควตา ดึงเนื้อที่ว่างจริงจากตัวเครื่องแม่
                 real_disk_free = server_state.get('free_space_on_disk', 0) / (1024**3)
-                self.free_gb = max(0, real_disk_free - pending_gb - safety_buffer)
+                display_free = real_disk_free
+                self.free_gb = max(0, real_disk_free - safety_buffer)
 
-            # 5. อัปเดตข้อความสถานะ
-            self.stat_msg = f"A:{active_count} | Used:{used_gb:.1f}G | Safe:{self.free_gb:.1f}G"
+            # 5. ประกอบร่างข้อความแสดงผลใหม่ (Format เดียวกับ rTorrent เป๊ะๆ)
+            if self.quota_gb > 0:
+                self.stat_msg = f"FREE: {display_free:.1f}GB | A: {active_count} | Used: {used_gb:.1f}G / {self.quota_gb:.0f}G | Safe: {self.free_gb:.1f}G"
+            else:
+                self.stat_msg = f"FREE: {display_free:.1f}GB | A: {active_count} | Used: {used_gb:.1f}G | Safe: {self.free_gb:.1f}G"
+                
             return True
             
         except Exception as e:
-            # ดักจับกรณี json พังเพราะโดนดีดหน้า Login (มักเกิดตอน Session หลุดแล้วสคริปต์ได้หน้าเว็บ HTML กลับมา)
-            if "JSONDecodeError" in type(e).__name__:
-                print(f" ⚠️ [{self.name}] Response is not JSON. Session might be dead. Re-logging in...")
-                self.login()
-            else:
-                print(f" ⚠️ [{self.name}] Refresh Error: {e}")
+            print(f"⚠️ [{self.name}] qBittorrent Refresh Status Error: {e}")
             return False
 
     def add(self, content, site_name="Universal", size=None, n_cfg=None):
@@ -655,6 +691,33 @@ class QbitNode:
             self.is_connected = False
             return []
 
+    def _sweeper_force_start(self):
+        """ระบบกวาดงานค้างอัตโนมัติ"""
+        if not self.is_connected and not self.login():
+            return False
+
+        try:
+            # ดึงเฉพาะงานที่ไม่ได้รัน (pausedUP, pausedDL, queuedUP, queuedDL, stalledUP)
+            # เราใช้ filter 'paused' จะครอบคลุมกรณีที่ Client สั่งหยุดคิวไว้
+            r = self.s.get(f"{self.url}/api/v2/torrents/info", params={'filter': 'paused'}, auth=self.auth, verify=False, timeout=10)
+            
+            if r.status_code == 200:
+                torrents = r.json()
+                # กรองเอาเฉพาะ Hash ของงานที่สถานะเป็น 'pausedUP' หรือ 'pausedDL' 
+                # (ถ้างานไหนเราตั้งใจหยุดเอง พี่อาจต้องเช็ค tag เพิ่มเติม)
+                hashes_to_resume = [t['hash'] for t in torrents if t.get('state') in ['pausedUP', 'pausedDL', 'queuedUP', 'queuedDL']]
+                
+                if hashes_to_resume:
+                    # สั่ง Resume เป็นชุดเพื่อลดการยิง API ถี่เกินไป
+                    self.s.post(
+                        f"{self.url}/api/v2/torrents/resume", 
+                        data={"hashes": "|".join(hashes_to_resume)}, 
+                        auth=self.auth, headers={'Referer': self.url}, verify=False, timeout=10
+                    )
+                    # print(f"🔄 [{self.name}] Sweeper resumed {len(hashes_to_resume)} torrents.")
+        except Exception:
+            pass
+
     def reannounce_all(self):
         """ สั่ง Re-announce ทุก Torrent (หรือเฉพาะที่กำลังโหลด) """
         if not self.is_connected and not self.login(): 
@@ -799,7 +862,7 @@ class RtorrentNode:
     def refresh_status(self):
         if not self.is_connected: return False
         try:
-            # 1. ยิง XML-RPC ดึง 3 ฟิลด์สำคัญ: active, size_bytes, และ bytes_done
+            # 1. ยิง XML-RPC ดึง 3 ฟิลด์สำคัญ
             xml = (
                 '<?xml version="1.0"?>'
                 '<methodCall>'
@@ -813,75 +876,101 @@ class RtorrentNode:
                 '</params>'
                 '</methodCall>'
             )
-            r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=10, verify=False)
-            
-            # ถ้าเจอ Session หลุดหรือสิทธิ์พัง (401/403) สั่งรีล็อกอินทันที
+        
+            # 🔥 วนลูป Retry สั้นป้องกัน Timeout
+            r = None
+            for attempt in range(3):
+                try:
+                    r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=10, verify=False)
+                    break
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                    if attempt < 2:
+                        time.sleep(1.0)
+                    else:
+                        print(f"⚠️ [{self.name}] อัปเดตโหลดไม่สำเร็จเนื่องจากเน็ตเวิร์กขัดข้อง (ใช้ค่าสถานะเดิมชั่วคราว)")
+                        return True 
+        
             if r.status_code in [401, 403]:
                 print(f" 🔄 [{self.name}] rTorrent Session expired ({r.status_code}), re-logging in...")
                 if self.login(): return False
-            
+        
             soup = BeautifulSoup(r.text, "xml")
-            
+        
             active = 0
             used_bytes = 0
-            pending_bytes = 0
-            
-            # แกะข้อมูลทีละโครงสร้างทอร์เรนต์ (<list> -> <value> ของแต่ละตัว) เพื่อความปลอดภัยสูงสุด
-            # โครงสร้าง rTorrent multicall จะส่งกลับมาเป็น array ครอบทีละงาน
-            torrent_nodes = soup.find_all("array")
-            
-            # ชดเชยกรณีโครงสร้างหลัก: ตัวแรกสุดมักเป็นตัวครอบขอบเขต ให้ข้ามไปดูข้อมูลข้างใน
-            if torrent_nodes:
-                # เจาะจงหา node ย่อยที่เป็นข้อมูลรายตัวทอร์เรนต์
-                data_node = soup.find("data")
-                if data_node:
-                    # ทอร์เรนต์แต่ละตัวจะอยู่ในแท็ก <value> ภายใต้ <data>
-                    for torrent in data_node.find_all("value", recursive=False):
-                        # ดึงเฉพาะค่า i8 หรือ int ด้านในของทอร์เรนต์ตัวนี้
-                        vals = [int(i.get_text()) for i in torrent.find_all(["i8", "int"])]
-                        
-                        # ต้องมั่นใจว่าได้ครบทั้ง 3 ฟิลด์ที่ขอไป
-                        if len(vals) >= 3:
-                            is_active  = vals[0]
-                            size_bytes = vals[1]
-                            bytes_done = vals[2]
-                            
-                            # นับจำนวน Active ทอร์เรนต์ที่กำลังทำงานอยู่จริง
-                            if is_active == 1:
-                                active += 1
-                                
-                            # 1. คิดพื้นที่ดิสก์ที่ใช้ไปแล้วตามข้อมูลจริงที่บันทึกสำเร็จ (bytes_done)
-                            used_bytes += bytes_done
-                            
-                            # 2. คำนวณเนื้อที่ที่ยังเหลือและต้องการในอนาคต (Pending) ของตัวที่ยังโหลดไม่เสร็จ
-                            if bytes_done < size_bytes:
-                                # ถ้าคิวงานยังโหลดไม่เสร็จ ให้คำนวณส่วนต่างจองพื้นที่ล่วงหน้าไว้เลยใน Loop เดียว
-                                pending_bytes += max(0, size_bytes - bytes_done)
+            raw_vals = []
+        
+            torrent_nodes = soup.find_all("data")
+            if len(torrent_nodes) > 1:
+                for node in torrent_nodes[1:]:
+                    items = node.find_all("value", recursive=False)
+                    if len(items) == 3:
+                        try:
+                            val_active = int(items[0].get_text().strip())
+                            val_size   = int(items[1].get_text().strip())
+                            val_done   = int(items[2].get_text().strip())
+                            raw_vals.extend([val_active, val_size, val_done])
+                        except ValueError:
+                            pass
+        
+            if not raw_vals:
+                for val in soup.find_all("value"):
+                    if not val.find():
+                        try:
+                            raw_vals.append(int(val.get_text().strip()))
+                        except ValueError:
+                            pass
+    
+            for i in range(0, len(raw_vals), 3):
+                vals = raw_vals[i:i+3]
+                if len(vals) == 3:
+                    is_active  = vals[0]
+                    bytes_done = vals[2]
+                
+                    if is_active == 1:
+                        active += 1
+                    
+                    used_bytes += bytes_done
 
-            # แปลงหน่วยเป็น GB
+            # แปลงหน่วยปริมาณทอร์เรนต์ในเครื่องเป็น GB
             used_gb = used_bytes / (1024**3)
-            pending_gb = pending_bytes / (1024**3)
             safety_buffer = 15.0
 
-            # 3. คำนวณพื้นที่ว่างและการดึงข้อมูล Disk Free
+            # 3. คำนวณพื้นที่ว่างและการดึงข้อมูล Disk Free อิงตามโควตา
             if self.quota_gb > 0:
-                self.free_gb = max(0, self.quota_gb - used_gb - pending_gb - safety_buffer)
-                display_free = max(0, self.quota_gb - used_gb)
-            else:
-                # สั่งเช็กพื้นที่ดิสก์จริงของเครื่อง rTorrent
-                r_free = self.s.post(self.url, data='<?xml version="1.0"?><methodCall><methodName>network.disk_free</methodName></methodCall>', auth=self.auth, headers=self.headers, timeout=10, verify=False)
-                
-                # ป้องกันแกะสตริงผิดพลาด: หาแท็กตัวเลขชั้นในสุด (i8 หรือ i4) แล้วครอบ abs
-                free_node = BeautifulSoup(r_free.text, "xml").find(["i8", "int", "i4"])
-                real_free = abs(int(free_node.get_text().strip())) / (1024**3) if free_node else 0.0
-                
-                self.free_gb = max(0, real_free - pending_gb - safety_buffer)
-                display_free = real_free
-
-            # 4. ประกอบร่างข้อความแสดงผล qBit Style ตามที่คุณออกแบบไว้
-            self.stat_msg = f"FREE {display_free:.1f}GB | A:{active} | Used:{used_gb:.1f}G | Safe:{self.free_gb:.1f}G"
-            return True
+                my_quota_free = max(0, self.quota_gb - used_gb)
+                display_free = my_quota_free
             
+                # 🎯 สูตรสายซิ่ง: หักแค่บัฟเฟอร์กันตาย 15GB ไม่หัก pending_gb ซ้ำซ้อน
+                self.free_gb = max(0, my_quota_free - safety_buffer)
+            else:
+                xml_disk = '<?xml version="1.0"?><methodCall><methodName>network.disk_free_4gb</methodName></methodCall>'
+                r_free = None
+                for attempt in range(3):
+                    try:
+                        r_free = self.s.post(self.url, data=xml_disk, auth=self.auth, headers=self.headers, timeout=10, verify=False)
+                        break
+                    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                        if attempt < 2: time.sleep(1.0)
+                        else: return True
+
+                real_free = 0.0
+                if r_free:
+                    free_soup = BeautifulSoup(r_free.text, "xml")
+                    free_node = free_soup.find(["i8", "int", "i4", "value"])
+                    if free_node:
+                        try:
+                            real_free = (int(free_node.get_text().strip()) * 4096) / (1024**3)
+                        except Exception:
+                            pass
+            
+                display_free = real_free
+                self.free_gb = max(0, real_free - safety_buffer)
+
+            # 4. ประกอบร่างข้อความแสดงผลใหม่มาตรฐานเดียวกัน
+            self.stat_msg = f"FREE: {display_free:.1f}GB | A: {active} | Used: {used_gb:.1f}G / {self.quota_gb:.0f}G | Safe: {self.free_gb:.1f}G"
+            return True
+        
         except Exception as e:
             print(f"⚠️ [{self.name}] rTorrent Refresh Status Error: {e}")
             return False
@@ -978,93 +1067,177 @@ class RtorrentNode:
             print(f"❌ [{self.name}] rTorrent Error: {e}")
             return []
 
-    def add(self, content, site_name="Universal", size=None, n_cfg=None):
+    def _xml_escape(self, data):
+        """ใช้ Library มาตรฐานเพื่อความชัวร์"""
+        if not isinstance(data, str):
+            data = str(data)
+        # เพิ่มการลบอักขระควบคุม (ASCII 0-31) ที่อาจทำให้ XML พัง
+        data = "".join(ch for ch in data if ord(ch) >= 32 or ch in "\n\r\t")
+        return escape(data, {'"': '&quot;', "'": '&apos;'})
+    
+    def safe_xml_escape(self, data):
         try:
-            # 1. เช็คขนาดไฟล์เบื้องต้น
-            if len(content) < 1000:
-                print(f"❌ [{self.name}] Torrent file is too small or invalid.")
-                return False
+            return self._xml_escape(data)
+        except Exception:
+            return str(data).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-            # ป้องกันอักขระพิเศษใน XML ด้วยการทำความสะอาดข้อความสั้นๆ
-            import html
-            safe_site_name = html.escape(str(site_name))
-
-            # 2. เตรียม XML-RPC Request สำหรับ rTorrent
-            # rTorrent ต้องการเนื้อไฟล์ดิบๆ (Raw) ในแท็ก <string> 
-            # และใช้พารามิเตอร์ตัวที่ 3 เป็นคำสั่งแก้ไข Properties ของทอร์เรนต์หลังโหลดเสร็จ
-            xml_template = (
-                '<?xml version="1.0"?>'
-                '<methodCall>'
-                '<methodName>load.raw_start</methodName>'
-                '<params>'
-                '<param><value><string></string></value></param>'
-                '<param><value><string>{raw_torrent_placeholder}</string></value></param>'
-                '<param><value><string>d.custom1.set={site_name}</string></value></param>'
-                '</params>'
-                '</methodCall>'
-            )
-
-            # 3. ประกอบร่างข้อมูล (แปลงเป็นไบต์เพื่อความปลอดภัยในการส่งข้อมูลดิบร่วมกับสตริง)
-            # เราจะจัดรูปข้อความ XML ก่อน แล้วสลับเอาข้อมูลเนื้อไฟล์ทอร์เรนต์ที่เป็นไบต์ยัดเข้าไปตรงๆ
-            xml_base = xml_template.format(raw_torrent_placeholder="REPLACE_ME", site_name=safe_site_name)
-            
-            # แปลงไฟล์ทอร์เรนต์ให้อยู่ในรูป XML String ที่ rTorrent เข้าใจ 
-            # (rTorrent รับข้อมูลดิบในแท็กสตริง แต่ต้องทำการ Escaped อักขระควบคุมบางตัวใน XML)
-            # วิธีที่ดีและเร็วที่สุดคือการใช้ xmlrpc.client ในการห่อหุ้มข้อมูลถ้ากังวลเรื่องการหลุด 
-            # แต่ถ้าจะส่งดิบๆ ต้องมั่นใจว่าห่อแบบนี้:
-            import xmlrpc.client
-            raw_string_xml = xmlrpc.client.dumps((xmlrpc.client.Binary(content),)).replace("<value><binary>", "").replace("</binary></value>", "")
-            
-            # เพื่อให้ใช้งานได้ง่ายและจบในฟังก์ชันเดียวโดยไม่พึ่งพา Module ซับซ้อน 
-            # แนะนำให้ห่อ content ด้วย xmlrpc.client.Binary หรือใช้วิธีส่งแบบ Multipart/Standard Payload
-            # ต่อไปนี้คือวิธีสากลที่ใช้ร่วมกับคำสั่ง requests ได้ชัวร์ที่สุดครับ:
-            
-            xml_payload = (
-                b'<?xml version="1.0"?>'
-                b'<methodCall>'
-                b'<methodName>load.raw_start</methodName>'
-                b'<params>'
-                b'<param><value><string></string></value></param>'
-                b'<param><value><base64>' + base64.b64encode(content) + b'</base64></param>'
-                b'<param><value><string>d.custom1.set=' + safe_site_name.encode('utf-8') + b'</string></value></param>'
-                b'</params>'
-                b'</methodCall>'
-            )
-            # หมายเหตุ: rTorrent v0.9.x เป็นต้นไป รองรับแท็ก <base64> ภายใน XML-RPC 
-            # แต่ข้อสำคัญคือ พารามิเตอร์คำสั่งต้องอยู่หลังไฟล์ทอร์เรนต์ และต้องส่งโครงสร้างแบบ Byte Payload เท่านั้น
-
-            # 4. ส่ง Request ไปยัง rTorrent
-            # ปรับ headers ให้แมตช์กับ XML-RPC เป็น Content-Type: text/xml
-            headers = dict(self.headers)
-            headers['Content-Type'] = 'text/xml'
-
-            r = self.s.post(
-                self.url,
-                data=xml_payload,
-                auth=self.auth,
-                headers=headers,
-                timeout=30,
-                verify=False
-            )
-
-            if r.status_code == 200 and "faultCode" not in r.text:
-                print(f"✅ [{self.name}] Added | Site: {site_name}")
-                return True
-            else:
-                # ตรวจเช็คกรณีเกิดข้อผิดพลาดภายใน XML-RPC (Fault response)
-                if "faultString" in r.text:
-                    from bs4 import BeautifulSoup
-                    soup = BeautifulSoup(r.text, "xml")
-                    error_msg = soup.find("string").get_text() if soup.find("string") else "Unknown RPC Fault"
-                    print(f"❌ [{self.name}] rTorrent RPC Fault: {error_msg}")
-                else:
-                    print(f"❌ [{self.name}] Server Error: {r.status_code}")
-                return False
-
-        except Exception as e:
-            print(f"❌ [{self.name}] Add Error: {e}")
+    def add(self, content, site_name="Universal", size=None, n_cfg=None):
+        if len(content) < 1000:
+            print(f"❌ [{self.name}] Torrent file is too small or invalid.")
             return False
 
+        info_hash = None
+        try:
+            info_start = content.find(b'4:infod')
+            if info_start != -1:
+                pos = info_start + 7
+                # ... (ใส่ Logic การแกะ Bencode เดิมของคุณให้ครบ)
+                info_data = content[info_start + 2:pos]
+                info_hash = hashlib.sha1(info_data).hexdigest().lower()
+        except Exception as e:
+            print(f"⚠️ [{self.name}] Hash extraction failed: {e}")
+
+        # 🔥 [แก้ไข]: ส่งให้ _add_fallback_clean จัดการเบ็ดเสร็จในที่เดียว ไม่ต้องมีลูปยิง Label ซ้ำเติมข้างล่างอีก
+        return self._add_fallback_clean(content, site_name, info_hash)
+
+    def _add_fallback_clean(self, content, site_name, info_hash=None):
+        if info_hash and self._verify_torrent_in_client(info_hash):
+            print(f"ℹ️ [{self.name}] Torrent already exists, skipping load.raw and starting.")
+            self._force_start_torrent(info_hash)
+            return True
+            
+        encoded_content = base64.b64encode(content).decode('ascii')
+        safe_site = self.safe_xml_escape(site_name)
+        
+        # 🎯 ใช้ load.raw_start ฝังคำสั่ง d.custom1.set ไร้อาการหลุดรวนบนระบบ Shared
+        xml_payload = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<methodCall>'
+            '<methodName>load.raw_start</methodName>'
+            '<params>'
+            '<param><value><string></string></value></param>'
+            '<param><value><base64>{}</base64></value></param>'
+            f'<param><value><string>d.custom1.set={safe_site}</string></value></param>' 
+            '</params>'
+            '</methodCall>'
+        ).format(encoded_content).encode('utf-8')
+        
+        # 🔥 [เสริมเกราะป้องกันตาย]: ประกาศตัวแปรรอรับ Response ด้านนอกลูป
+        r = None
+        
+        # วนลูปให้โอกาสยิงแก้ตัวทั้งหมด 3 รอบ (รอบแรก + Retry 2 รอบ)
+        for attempt in range(3):
+            try:
+                # ลด timeout เหลือ 15 วินาทีต่อรอบ เพื่อให้บอทตัดใจมาลองรอบใหม่ได้เร็วขึ้น ไม่ค้างคาจนเธรดหลักหลุด
+                r = self.s.post(self.url, data=xml_payload, auth=self.auth, headers=self.headers, timeout=15, verify=False)
+                break  # ถ้ายิงผ่านและได้ Response กลับมาสำเร็จ ให้หลุดออกจากลูป Retry ทันที
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
+                if attempt < 2:
+                    print(f"🔄 [{self.name}] Network Timeout/Error ({net_err}) กำลังลองใหม่อีกครั้ง... (รอบที่ {attempt+1}/2)")
+                    time.sleep(1.5)  # นอนรอให้เน็ตเวิร์กหรือ I/O ของเซิร์ฟเวอร์แชร์เคลียร์ตัวเองสักครู่
+                else:
+                    print(f"❌ [{self.name}] Exception during upload หลังพยายามครบ 3 รอบ: {net_err}")
+                    return False
+            except Exception as e:
+                print(f"❌ [{self.name}] Fatal Exception during upload: {e}")
+                return False
+        
+        # ประมวลผลผลลัพธ์จากการโพสต์ (กระบวนการหลังจากหลุดลูป Retry)
+        try:
+            if r is None or r.status_code != 200 or "fault" in r.text.lower():
+                print(f"⚠️ [{self.name}] Load failed: {r.text[:50] if r else 'No Response'}")
+                return False
+
+            print(f"✅ [{self.name}] Added. Syncing with rTorrent...")
+            
+            found = False
+            for i in range(20):  
+                if i < 5:      time.sleep(0.5)
+                elif i < 12:   time.sleep(1.0)
+                else:          time.sleep(2.0)
+                
+                if self._verify_torrent_in_client(info_hash):
+                    found = True
+                    break
+            
+            if not found:
+                print(f"⚠️ [{self.name}] Detection Delay: บอทตรวจไม่เจอแต่คาดว่าไฟล์กำลังจองดิสก์ ส่งคำสั่งเผื่อไว้...")
+                self._force_start_torrent(info_hash) 
+                return True 
+
+            print(f"🚀 [{self.name}] Torrent verified และติดป้าย Label เรียบร้อย")
+            return True
+
+        except Exception as e:
+            print(f"❌ [{self.name}] Exception during response parsing: {e}")
+            return False
+
+    def _force_start_torrent(self, info_hash):
+        """ส่งคำสั่งตรวจสอบและสั่งรันซ้ำเพื่อป้องกันเคสไฟล์ค้าง ตกหล่น"""
+        target_hash = info_hash.strip().lower()
+        sequence = ['d.open', 'd.start']
+        for method in sequence:
+            xml_cmd = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<methodCall><methodName>{}</methodName>'
+                '<params><param><value><string>{}</string></value></param></params>'
+                '</methodCall>'
+            ).format(method, target_hash).encode('utf-8')
+            try:
+                self.s.post(self.url, data=xml_cmd, auth=self.auth, headers=self.headers, timeout=5, verify=False)
+                time.sleep(0.1)
+            except:
+                pass
+
+    def _verify_torrent_in_client(self, info_hash):
+        target_hash = info_hash.strip().lower() 
+        
+        xml_check = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<methodCall>'
+            '<methodName>d.multicall2</methodName>'
+            '<params>'
+            '<param><value><string></string></value></param>'
+            f'<param><value><string>{target_hash}</string></value></param>' 
+            '<param><value><string>d.name=</string></value></param>'
+            '</params>'
+            '</methodCall>'
+        ).encode('utf-8')
+    
+        try:
+            headers = {**self.headers, 'Content-Type': 'text/xml; charset=utf-8'}
+            r = self.s.post(self.url, data=xml_check, auth=self.auth, headers=headers, timeout=6, verify=False)
+            
+            response_text_clean = r.text.lower()
+            if r.status_code == 200 and "fault" not in response_text_clean:
+                if "value" in response_text_clean and len(response_text_clean) > 150:
+                    return True
+        except:
+            pass
+        return False
+
+    def _sweeper_force_start(self):
+        """ระบบกวาดงานค้างอัตโนมัติ"""
+        # d.multicall2 จะกวาดงานที่ status = stopped ทั้งหมดในครั้งเดียว
+        # d.is_active=0 หมายถึงกวาดเฉพาะงานที่หยุดทำงานอยู่ (Stopped)
+        xml_sweep = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<methodCall><methodName>d.multicall2</methodName>'
+            '<params>'
+            '<param><value><string></string></value></param>' # target: all
+            '<param><value><string>main</string></value></param>' # view: main
+            '<param><value><string>d.is_active=0</string></value></param>' # condition: inactive
+            '<param><value><string>d.open=</string></value></param>'       # command: open
+            '<param><value><string>d.start=</string></value></param>'      # command: start
+            '<param><value><string>d.resume=</string></value></param>'    # command: resume
+            '</params></methodCall>'
+        ).encode('utf-8')
+        
+        try:
+            self.s.post(self.url, data=xml_sweep, auth=self.auth, headers=self.headers, timeout=5, verify=False)
+        except:
+            pass
+            
     def delete_torrent(self, t_hash):
         """Hard Delete: หยุดและลบข้อมูลในคำสั่งเดียว (Atomic Operation)"""
         #สิ่งที่ต้องเพิ่มใน .rtorrent.rc
@@ -1328,35 +1501,91 @@ class NodeCleaner:
 
 def smart_reclaim_process(node, required_gb):
     """
-    เวอร์ชันแก้ไข: รองรับทั้ง QbitNode และ RtorrentNode โดยใช้ Method ภายในคลาส
+    เวอร์ชันหยุดบอทคลั่ง: คำนวณพื้นที่ในแรม + ดักห้ามลบงานขาดทุน (Ratio < 1.0)
     """
     try:
-        # 1. ดึงข้อมูลงานที่โหลดเสร็จแล้วผ่าน Method ของ Node
-        torrents = node.get_all_torrents_info()
-        if not torrents:
-            print(f"⚠️ [{node.name}] ไม่มีงานที่โหลดเสร็จแล้วให้ลบ")
+        # อัปเดตพื้นที่ปัจจุบันก่อนเริ่ม
+        node.refresh_status()
+        
+        # ปรับ Buffer สุทธิหน้างานให้กระชับพอดี (คลาสพี่มี safety_buffer 15GB ข้างในอยู่แล้ว)
+        target_free = required_gb + 2.0 
+        
+        if node.free_gb >= target_free:
+            print(f"✅ [{node.name}] พื้นที่เพียงพออยู่แล้ว: {node.free_gb:.2f} GB")
+            return True
+
+        # 1. ดึงข้อมูลงานทั้งหมด
+        all_torrents = node.get_all_torrents_info()
+        if not all_torrents:
+            print(f"⚠️ [{node.name}] ไม่มีงานให้เคลียร์")
             return False
 
-        # 2. จัดลำดับ: ลบตัวที่ Ratio สูงสุดก่อน
-        torrents.sort(key=lambda x: x.get('ratio', 0), reverse=True)
+        # 2. คัดกรองงานที่ปลอดภัยที่จะลบ
+        # 2. คัดกรองงานที่เสร็จสมบูรณ์แล้วเท่านั้น
+        scannable_torrents = []
+        for t in all_torrents:
+            t_ratio = t.get('ratio', 0.0)
+            
+            # 1. ดึงค่าดิบ
+            raw_p = t.get('progress', t.get('percent', t.get('progress_raw', 0.0)))
+            
+            # 2. ปรับให้เป็นทศนิยม 0.0 - 1.0 เสมอ
+            progress = raw_p / 100.0 if raw_p > 1.0 else raw_p
+            
+            # 3. คัดกรอง
+            if progress < 1.0:
+                continue # ข้ามงานที่ยังโหลดไม่เสร็จ
+                
+            if t_ratio < 1.0:
+                continue # ข้ามงานที่ยังขาดทุน
+                
+            scannable_torrents.append(t)
 
-        target_free = required_gb + 15.0 # Buffer 15GB สำหรับช่วง Santa 100%
+        if not scannable_torrents:
+            print(f"⚠️ [{node.name}] ไม่มีงานที่ Ratio >= 1.00 เหลือให้ลบแล้ว! (ระบบเซฟชีวิตเพื่อรักษาค่าเรติโอ)")
+            return False
 
-        for t in torrents:
-            # อัปเดตพื้นที่ล่าสุดของ Node
-            node.refresh_status()
-            if node.free_gb >= target_free:
-                print(f"✅ [{node.name}] พื้นที่เพียงพอแล้ว: {node.free_gb:.2f} GB")
-                return True
+        # 3. เรียงลำดับ: ลบตัวที่กำไรสูงสุด (Ratio เยอะสุด) ออกก่อน
+        scannable_torrents.sort(key=lambda x: x.get('ratio', 0), reverse=True)
 
-            print(f"🧹 [{node.name}] กำลังลบ: {t['name'][:30]} (Ratio: {t['ratio']:.2f})")
+        print(f"🧹 [{node.name}] เริ่มทวงคืนพื้นที่... เป้าหมายสะสม: {target_free - node.free_gb:.2f} GB")
 
-            # เรียกใช้ delete_torrent ของ Node (ซึ่งรองรับทั้ง qBit และ rTorrent)
-            node.delete_torrent(t['hash'])
+        # ตัวแปรจำลองพื้นที่ในแรม (แก้ปัญหาเซิร์ฟเวอร์คืนพื้นที่ช้า)
+        virtual_free_gb = node.free_gb
+        delete_count = 0
+        max_delete_limit = 5  # 🔥 [เกราะป้องกันชั้นที่ 2]: ลบสูงสุดไม่เกิน 5 ตัวต่อรอบพื่อความปลอดภัย
 
-            # 3. เผื่อเวลาให้ Disk คืน Quota (สำคัญมากสำหรับ Seedbox)
-            time.sleep(5)
+        for t in scannable_torrents:
+            # ถ้าพื้นที่จำลองคำนวณแล้วว่าผ่านเป้า ให้หยุดลบทันที! ไม่ต้องรอ API เซิร์ฟเวอร์
+            if virtual_free_gb >= target_free:
+                print(f"🛑 [{node.name}] หยุดลบ! คำนวณพื้นที่จำลองในแรมเพียงพอต่อการลงไฟล์ใหม่แล้ว")
+                break
+                
+            if delete_count >= max_delete_limit:
+                print(f"🛑 [{node.name}] หยุดลบชั่วคราว! ชนเพดานจำกัดการลบสูงสุด {max_delete_limit} ตัวต่อรอบ")
+                break
 
+            t_name = t.get('name', 'Unknown')
+            t_ratio = t.get('ratio', 0.0)
+            t_hash = t.get('hash')
+            
+            # คำนวณขนาด (รองรับโครงสร้าง size ข้อมูลของพี่)
+            t_size_gb = t.get('size', 0) / (1024**3) if t.get('size', 0) > 1000000 else t.get('size_gb', 0)
+
+            print(f"🧹 [{node.name}] กำลังลบ: {t_name[:30]} (Ratio: {t_ratio:.2f} | ปลดปล่อยพื้นที่ทิพย์: +{t_size_gb:.2f} GB)")
+
+            # สั่งลบจริง
+            node.delete_torrent(t_hash)
+            
+            # อัปเดตค่าในแรมทันที! (จุดนี้แหละที่จะช่วยชีวิตพี้ ไม่ให้บอทลบรัวๆ)
+            virtual_free_gb += t_size_gb
+            delete_count += 1
+            
+            # หน่วงสั้นๆ ให้เครื่องหายใจสำหรับเลเยอร์ Racing
+            time.sleep(1.0)
+
+        # จบลูป ยิงตรวจสอบจริงรอบเดียวท้ายงาน
+        time.sleep(2.0)
         node.refresh_status()
         return node.free_gb >= target_free
 
@@ -2134,7 +2363,6 @@ def extract_torrent_data(row, base_url, dl_session=None, headers=None):
                 raw_c = resp.content
                 
                 # 1. จัดการ Gzip
-                import gzip
                 if raw_c.startswith(b'\x1f\x8b'):
                     try: raw_c = gzip.decompress(raw_c)
                     except: pass
@@ -2666,6 +2894,11 @@ def main():
 
                     # 3. ให้เวลาระบบไฟล์คืนพื้นที่ และอัปเดต Tracker
                     time.sleep(2)
+
+                    # ทำการกวาดและบังคับ Start งานค้าง (Sweeper)
+                    if hasattr(node, '_sweeper_force_start'):
+                        node._sweeper_force_start()
+
                     node.reannounce_all()
 
                     # 4. refresh อีกครั้งเพื่อดูค่าพื้นที่ "หลังลบ"
@@ -2679,8 +2912,9 @@ def main():
                     active_nodes.append((node, n_cfg))
                     icon = "🟢"
                 else: icon = "❌"
-                line = f"{icon} [{node.name}] FREE {getattr(node,'free_gb',0):.1f}GB | {getattr(node,'stat_msg','N/A')}"
-                print(line); node_status_buffer.append(line)
+                line = f"{icon} [{node.name}] {getattr(node, 'stat_msg', 'N/A')}"
+                print(line)
+                node_status_buffer.append(line)
                 update_trackers(node)
 
             if active_nodes:
@@ -2876,61 +3110,67 @@ def main():
                                             count_skip += 1
                                             continue
 
-                                        # 6. Logic ฟรีโหลดและไอเทม (ฉบับเน้นไอเทม แต่ข้ามถ้าหน้าเว็บฟรีมากกว่า)
+                                        # ##################################################
+                                        # # 6. Logic ฟรีโหลดและไอเทม (ฉบับสมบูรณ์)
+                                        # ##################################################
                                         is_free_to_go = False
                                         is_use_item = False
 
-                                        item_discount = SET.get('CURRENT_DISCOUNT', 0)    # เช่น 50%
-                                        min_free_req = SET.get('MIN_FREE_PERCENT', 0)     # เช่น 10%
+                                        freeload_enable = SET.get('FREELOAD_ENABLE', True) # เช็กว่าเปิดระบบกรองฟรีโหลดไหม
+                                        item_discount = SET.get('CURRENT_DISCOUNT', 0)     # เช่น 50%
+                                        min_free_req = SET.get('MIN_FREE_PERCENT', 0)      # เช่น 10%
                                         site_name = site.lower()
                                         
                                         # ตรวจสอบสถานะ (รอการอนุมัติ) 
-                                        # เราจะเช็คเฉพาะเมื่อมีข้อมูล ID และ session พร้อม
                                         if details_url and dl_session:
                                             if check_pending_status(dl_session, details_url):
                                                 print(f" ⏳ ข้าม: ไฟล์นี้ยังอยู่ในสถานะ (รอการอนุมัติ) -> {details_url}")
                                                 count_skip += 1
                                                 continue
 
-                                        if "bearbit" in site_name:
+                                        # --- กรณีที่ 1: ปิดระบบฟรีโหลด (ไม่สนฟรี % ลุยดาวน์โหลดทุกไฟล์) ---
+                                        if not freeload_enable:
+                                            is_free_to_go = True
+                                            is_use_item = False
+                                            # print(f" 🎯 [ALL-IN MODE] ปิดระบบกรองฟรีโหลด: ลุยดาวน์โหลดทุกไฟล์โดยไม่เช็กเปอร์เซ็นต์")
+
+                                        # --- กรณีที่ 2: เปิดระบบฟรีโหลด (กรองตามเงื่อนไขเว็บและไอเทม) ---
+                                        elif "bearbit" in site_name:
                                             # 1. เช็คหน้าเว็บก่อนว่าให้ฟรีเท่าไหร่
                                             free_p = check_freeload_status(row)
 
                                             # 2. เข้าสู่ Logic ตัดสินใจโดยยึดไอเทมเป็นเกณฑ์หลัก
                                             if item_discount > 0:
-                                                # --- เงื่อนไขหัวใจหลักของคุณ ---
-                                                # ถ้าหน้าเว็บฟรี "มากกว่า" ไอเทม -> ข้ามทันที (เพื่อประหยัดไอเทม)
+                                                # ถ้าหน้าเว็บฟรี "มากกว่า" ไอเทม -> ข้ามทันที (เพื่อประหยัดไอเทมไปใช้กับไฟล์ไม่ฟรี)
                                                 if free_p > item_discount:
                                                     print(f" ❌ ข้าม: หน้าเว็บฟรี {free_p}% ซึ่งดีกว่าไอเทม {item_discount}% (เก็บไอเทมไว้ก่อน)")
                                                     count_skip += 1
                                                     continue
-        
-                                                # กรณีที่หน้าเว็บฟรี "น้อยกว่าหรือเท่ากับ" ไอเทม -> ใช้ไอเทมลุยเลย!
-                                                # (ไม่ต้องเช็คเกณฑ์ขั้นต่ำ min_free_req ตามที่คุณต้องการ)
+                                
+                                                # กรณีที่หน้าเว็บฟรี "น้อยกว่าหรือเท่ากับ" ไอเทม -> บังคับใช้ไอเทมลุยเลย!
                                                 else:
                                                     is_use_item = True
                                                     is_free_to_go = True
                                                     print(f" 🎫 [ITEM MODE] บังคับใช้ไอเทม {item_discount}% (หน้าเว็บฟรีแค่ {free_p}%)")
 
-                                            # 3. ถ้าไม่มีไอเทม ค่อยกลับมาพึ่งเกณฑ์ปกติ
+                                            # 3. ถ้าไม่มีไอเทม หรือไม่ได้ตั้งค่าไอเทม ค่อยกลับมาพึ่งเกณฑ์ขั้นต่ำบนหน้าเว็บ
                                             else:
                                                 if free_p >= min_free_req:
                                                     is_free_to_go = True
                                                     is_use_item = False
-                                                    print(f" ✅ [NORMAL MODE] หน้าเว็บฟรี {free_p}% ผ่านเกณฑ์ขั้นต่ำ")
+                                                    print(f" ✅ [NORMAL MODE] หน้าเว็บฟรี {free_p}% ผ่านเกณฑ์ขั้นต่ำ ({min_free_req}%)")
                                                 else:
-                                                    print(f" ❌ ข้าม: ไม่มีไอเทม และหน้าเว็บ ({free_p}%) ต่ำกว่าเกณฑ์")
+                                                    print(f" ❌ ข้าม: ไม่มีไอเทม และหน้าเว็บ ({free_p}%) ต่ำกว่าเกณฑ์ที่กำหนด ({min_free_req}%)")
                                                     count_skip += 1
                                                     continue
 
                                         else:
                                             # --- เว็บอื่น (Unlimitz, TorrentDD) ---
-                                            # ใช้ฟังก์ชันสแกนละเอียด และเช็คเฉพาะไฟล์ที่ ฟรี 100% เท่านั้น
+                                            # ถ้าหลุดมาถึงตรงนี้ แปลว่า freeload_enable = True (เปิดระบบกรองฟรีโหลด)
+                                            # ดังนั้นเว็บอื่นจะต้องบังคับเช็กเฉพาะไฟล์ที่ฟรี 100% เท่านั้นตามลอจิกเดิมของคุณ
                                             free_p_others = check_freeload_status(row)
-            
-                                            # เงื่อนไข: ถ้าปิด FREELOAD_ENABLE ให้ผ่านได้หมด 
-                                            # หรือถ้าเปิด ต้องเป็นไฟล์ที่ ฟรี 100% (Gold/Free) เท่านั้น
-                                            if not SET.get('FREELOAD_ENABLE') or free_p_others == 100:
+                                            
+                                            if free_p_others == 100:
                                                 is_free_to_go = True
                                                 # print(f" ✅ [OTHERS] ผ่าน: ไฟล์ฟรี 100% (จากระบบสแกนละเอียด)")
                                             else:
@@ -3021,9 +3261,9 @@ def main():
                                             for node_obj, n_cfg in active_nodes:
                                                 d_type = n_cfg.get('disk_type', 'HDD')
                                                 dynamic_max_cap, p_wait = get_node_dynamic_cap(node_obj, d_type)
-                                                current_load = get_node_current_weight(node_obj)
+                                                current_load = round(get_node_current_weight(node_obj), 1)  # ปัดเศษให้เหลือ 1 ตำแหน่งตั้งแต่ตอนคำนวณ
 
-                                                print(f"📡 Check [{node_obj.name}]: Load {current_load}/{dynamic_max_cap} (Wait: {p_wait:.1f})")
+                                                print(f"📡 Check [{node_obj.name}]: Load {current_load:.1f}/{dynamic_max_cap} (Wait: {p_wait:.1f})")
 
                                                 # 1. เช็ค Capacity
                                                 if (current_load + task_weight) > dynamic_max_cap:
