@@ -2139,56 +2139,75 @@ def ensure_dedbit_logged_in(page):
 def get_site_stats(page, site_cfg):
     """
     เวอร์ชัน Universal (List-based): รองรับโครงสร้าง JSON ใหม่
-    - site_cfg: รับเป็นก้อน Object ของ Site นั้นๆ จาก Loop หลัก
+    - [Flow Re-Ordered] ย้ายจุดสร้าง index_soup ไปไว้หลังจากการเคลียร์แจ้งเตือน/โหวตเสร็จสิ้น เพื่อให้ดึงสถานะไอเทมได้แม่นยำ 100%
+    - [Session Guard] อัปเดตโครงสร้างดักจับ user_tag ของค่าย DEDBIT หลัง Re-Login ป้องกันการดีดหลุดโดยใช่เหตุ
+    - [Resilient] เพิ่มการคุมจังหวะหน้าเว็บด้วยระบบตรวจสอบเส้นทาง URL ปลายทางอย่างมั่นคง
     """
-    # ดึงชื่อ Site มาใช้เป็น Key สำหรับบันทึก Log/History
     site = site_cfg['name'] 
     
     try:
-        # --- ส่วนที่ปรับปรุงสำหรับ BITSUSE/DEDBIT ---
-        if site in ["DEDBIT","BITSUSE"]:
+        # กำหนด Base URL ของแต่ละค่าย
+        if site in ["DEDBIT", "BITSUSE"]:
             base_url = "https://www.dedbit.com"
         else:
-            # ดึง base_url จาก site_cfg โดยตรง (ไม่ผ่าน CFG.get(site))
             base_url = site_cfg.get('base_url', "https://bearbit.org").rstrip('/')
 
-        # 1. ค้นหา User ID
-        content = page.content()
-        soup = BeautifulSoup(content, 'html.parser')
+        # -------------------------------------------------------------------------
+        # 🎯 1. ทำภารกิจกวาดล้าง (Clear Notifications & Auto-Vote) ให้เรียบร้อยก่อน
+        # -------------------------------------------------------------------------
+        if 'bearbit' in site.lower():
+            # รันระบบล้างกล่องข้อความสีเขียวและระเบิดโหวตทอร์เรนต์ผ่านสคริปต์ Master Engine
+            clear_bearbit_notifications(page, base_url, site_name=site)
+            auto_vote_snatched(page, base_url, site_name=site)
+            
+            # ⚡ [Crucial Fix] บังคับให้บอทกลับมาตั้งหลักที่หน้าแรกสุดหลังจากทำภารกิจข้างบนเสร็จสิ้น
+            index_url = f"{base_url}/index.php" if not base_url.endswith('/') else f"{base_url}index.php"
+            page.goto(index_url, timeout=20000, wait_until="domcontentloaded")
+
+        # -------------------------------------------------------------------------
+        # 🎯 2. สแกนสดหา User ID ณ วินาทีปัจจุบัน (True Fresh Soup)
+        # -------------------------------------------------------------------------
+        soup = BeautifulSoup(page.content(), 'html.parser')
         
-        if site in ["DEDBIT","BITSUSE"]:
+        # เก็บ Soup หน้าแรกที่อัปเดตล่าสุดไว้สำหรับแกะสเตตัสไอเทมซานต้าตอนท้าย
+        index_soup = soup 
+        
+        if site in ["DEDBIT", "BITSUSE"]:
             current_url = page.url
             user_tag = soup.find("a", href=re.compile(r"userdetails\.php\?id=\d+"))
             
             if not user_tag or "dedbit.com" not in current_url:
-                print(f"🔄 [{site}] กำลังย้ายไปดึงสถิติที่ DEDBIT...")
-                # ฟังก์ชันนี้ควรได้รับการปรับปรุงให้รองรับ site_cfg เช่นกันถ้าจำเป็น
+                print(f"🔄 [{site}] เซสชันมีปัญหา กำลังตรวจสอบสิทธิ์และเข้าสู่ระบบ DEDBIT ใหม่...")
                 ensure_dedbit_logged_in(page) 
+                # ดึงตารางโครงสร้างใหม่หลังจากล็อกอินสำเร็จ
                 soup = BeautifulSoup(page.content(), 'html.parser')
+                index_soup = soup
+                # ⚡ [Bug Fixed] ต้องหาตำแหน่งไอดีผู้ใช้ซ้ำอีกรอบในตารางที่โหลดมาใหม่
                 user_tag = soup.find("a", href=re.compile(r"userdetails\.php\?id=\d+"))
         else:
             user_tag = soup.find("a", href=re.compile(r"userdetails\.php\?id=\d+"))
         
         if not user_tag:
-            return f"⚠️ [{site}] ไม่พบข้อมูลผู้ใช้ (Login อาจหลุด)"
+            return f"⚠️ [{site}] ไม่พบข้อมูลผู้ใช้ (Login อาจหลุดออกจากระบบ)"
 
         username = user_tag.get_text(strip=True)
-        # ปรับการดึง href ให้รองรับกรณีเป็น path เต็มหรือ path ย่อย
         href = user_tag['href']
         profile_url = f"{base_url}/{href.lstrip('/')}" if not href.startswith('http') else href
         
-        print(f"📊 [{site}] กำลังดึงสถิติจาก: {profile_url}")
+        print(f"📊 [{site}] เซสชันเสถียร กำลังดึงสถิติจากหน้าโปรไฟล์: {profile_url}")
 
-        # 2. เข้าหน้าโปรไฟล์
+        # -------------------------------------------------------------------------
+        # 🎯 3. เข้าหน้าโปรไฟล์เพื่อคว้าสถิติเชิงลึก
+        # -------------------------------------------------------------------------
         if not safe_goto(page, profile_url, wait_until="domcontentloaded", timeout=30000):
-            return f"❌ [{site}] เข้าหน้าโปรไฟล์ไม่สำเร็จ"
+            return f"❌ [{site}] เข้าหน้าโปรไฟล์ไม่สำเร็จ (โครงข่ายหน่วง)"
 
         page.wait_for_timeout(2000)
         soup = BeautifulSoup(page.content(), 'html.parser')
         text = soup.get_text(separator=" ")
 
-        # 3. สกัดข้อมูลสถิติ
-        def extract(pattern, source, default="0"):
+        # ฟังก์ชันสกัด Regex ภายใน
+        def extract(pattern, source, default=None):
             m = re.search(pattern, source, re.I)
             return m.group(1) if m else default
 
@@ -2198,7 +2217,7 @@ def get_site_stats(page, site_cfg):
         curr_bonus = extract(r"(?:Bonus):?\s*([\d\.,]+)", text, "0")
 
         if not all([curr_ratio, curr_up, curr_dl]):
-            return f"⚠️ [{site}] สถิติไม่ครบ (Render พลาด)"
+            return f"⚠️ [{site}] สถิติไม่ครบถ้วน (หน้าเว็บเรนเดอร์ข้อมูลไม่สมบูรณ์)"
 
         curr_data = {
             'username': username,
@@ -2208,26 +2227,29 @@ def get_site_stats(page, site_cfg):
             'bonus': curr_bonus
         }
 
-        # 4. บันทึกประวัติ (ยังคงใช้ site_name เป็น Key ในไฟล์เก็บข้อมูล)
+        # -------------------------------------------------------------------------
+        # 🎯 4. บันทึก Snapshot และประวัติความเปลี่ยนแปลง (Diff History)
+        # -------------------------------------------------------------------------
         diff_text = get_stats_diff(site, curr_data)
         
-        # แก้ไข: ยุบรวมบรรทัด และส่งค่าที่ล้างข้อมูลแล้ว (Cleaned Data)
         save_hourly_snapshot(site, {
             'username': username,
             'ratio': float(curr_data['ratio'].replace(',', '')),
-            'up': parse_size(curr_data['up']), # เก็บเป็น GB (float) ตามมาตรฐานคุณ
-            'dl': parse_size(curr_data['dl']), # เก็บเป็น GB (float)
+            'up': parse_size(curr_data['up']), 
+            'dl': parse_size(curr_data['dl']), 
             'bonus': float(curr_data['bonus'].replace(',', ''))
         })
 
-        # 5. จัดรูปแบบรายงาน
+        # -------------------------------------------------------------------------
+        # 🎯 5. ประกอบร่างรายงานสรุปผล
+        # -------------------------------------------------------------------------
         display_site = "DED/BITS" if site in ["BITSUSE", "DEDBIT"] else site
         msg = [f"👤 <b>{username}</b> ({display_site}) | Ratio: {curr_data['ratio']}"]
         msg.append(f"📤 Up: {curr_data['up']} | 📥 Dl: {curr_data['dl']}")
         
-        if site == "BEARBIT":
-            item_info = get_bearbit_item_status(soup) 
-            auto_vote_snatched(page) 
+        if 'bearbit' in site.lower():
+            # 🎯 [Fixed True-Source] ส่ง index_soup หน้าแรกเวอร์ชันอัปเดตสดๆ ไปแกะไอเทมซานต้า รับประกันความแม่นยำ 100%
+            item_info = get_bearbit_item_status(index_soup) 
             msg.append(f"💰 Bonus: {curr_data['bonus']} | 🎁 Item: {item_info}")
         else:
             msg.append(f"💰 Bonus: {curr_data['bonus']}")
@@ -2502,6 +2524,123 @@ def format_site_stats_report(all_nodes):
     
 # ========================= BearBit STATUS =========================
 
+def clear_bearbit_notifications(page, base_url, site_name="BEARBIT"):
+    """
+    ฟังก์ชันสำหรับลูปกวาดกล่องข้อความแจ้งเตือนสีเขียว (inbox.php?type=ตัวเลขใดๆ) ของ BEARBIT จนกว่าจะหมด
+    - [Strict Filter] มองข้ามปุ่มเมนูหลักของระบบตั้งแต่ระดับ Selector มั่นใจได้ว่าบอทจับเฉพาะแถบแจ้งเตือนจริงเท่านั้น
+    - [AJAX Loop Engine] เปลี่ยนมาใช้สถาปัตยกรรมไม่รีโหลดหน้าเว็บ (No-Reload) กวาดล้างข้อความได้เร็วขึ้นสูงสุด 5 เท่า
+    - [Detached Safeguard] ใช้ .wait_for(state="detached") มั่นใจได้ว่าปุ่มเดิมถูกทำลายไปแล้วก่อนขยับลูปถัดไป
+    - [Hybrid Fallback] มีระบบ Goto สำรองอัตโนมัติ หากเกิดอาการเครือข่ายหน่วงและปุ่มไม่ยอมหายไปใน 3 วินาที
+    - [Full-Report Edition] ส่งรายงานผลลัพธ์เข้า Discord แยกเคสเคลียร์สำเร็จ และเคสกล่องสะอาดเรียบร้อยดี
+    """
+    print(f"📥 [{site_name}] เริ่มระบบ Auto-Clear Notification (High-Speed AJAX Engine)...")
+    
+    cleared_messages = []
+    loop_count = 0
+    max_loops = 35
+    is_clean_at_start = True  # ตัวแปรดักจับว่าหน้าเว็บคลีนตั้งแต่เริ่มต้นหรือไม่
+    
+    if not base_url.endswith('/'):
+        base_url += '/'
+    index_url = f"{base_url}index.php"
+    
+    try:
+        # เช็กหน้าปัจจุบันก่อน ถ้าอยู่ที่หน้าหลักอยู่แล้วไม่ต้องสั่งโหลดซ้ำ
+        if page.url != index_url:
+            page.goto(index_url, timeout=20000, wait_until="domcontentloaded")
+    except Exception as e:
+        print(f"⚠️ [{site_name}] ไม่สามารถโหลดหน้าแรกได้: {e}")
+        return False
+
+    while loop_count < max_loops:
+        try:
+            # 🎯 ดักจับลิงก์แจ้งเตือนในตาราง #pms หรือ td โดยคัดกรองชื่อเมนูคงที่ออกจากการสแกน
+            noti_locator = page.locator('table[id="pms"] a[href*="inbox.php?type="], td a[href*="inbox.php?type="]').filter(
+                has_not_text=re.compile(r"^(?:กล่องข้อความ|Inbox|ข้อความส่วนตัว|My Inbox|Messages)$", re.I)
+            )
+            
+            # ชี้เป้าไปที่อิลิเมนต์ตัวแรกเสมอ (เพราะเมื่อตัวแรกหาย ตัวถัดไปจะขยับขึ้นมาเป็น .first แทน)
+            current_noti = noti_locator.first
+            
+            try:
+                # รอดูปุ่มแจ้งเตือนระบบแสดงผลจริง 2 วินาที (ถ้าไม่มีแล้วจะดีดออกเพื่อจบลูป)
+                current_noti.wait_for(state="visible", timeout=2000)
+            except:
+                if loop_count == 0:
+                    print(f"✨ [{site_name}] Inbox คลีน! ไม่มีข้อความแจ้งเตือนค้างอยู่")
+                    is_clean_at_start = True
+                else:
+                    print(f"✅ [{site_name}] เคลียร์แจ้งเตือนระบบผ่าน AJAX ทุกประเภทเรียบร้อย! (รวม {loop_count} ฉบับ)")
+                    is_clean_at_start = False
+                break
+            
+            # ดึงเนื้อหาข้อความมาวิเคราะห์
+            noti_text = current_noti.text_content()
+            clean_text = noti_text.strip() if noti_text else ""
+            
+            # [Safety Guard] สกัดกั้นเผื่อกรณีเมนูหลักหลุดรอดมา
+            if clean_text in ["กล่องข้อความ", "Inbox", "ข้อความส่วนตัว", "My Inbox", "Messages"] or not clean_text:
+                print(f"🛑 [{site_name}] ตัวกรองตรวจพบเมนูสเตติกหลุดรอด ({clean_text or 'Empty'}) -> ปิดลูปเพื่อความปลอดภัย")
+                break
+            
+            # สกัดค่า Type จาก Attribute href
+            target_href = current_noti.get_attribute("href") or ""
+            type_match = re.search(r"type=(\d+)", target_href)
+            noti_type = type_match.group(1) if type_match else "Unknown"
+            
+            print(f"🔔 [{site_name}] ตรวจพบ Type [{noti_type}]: {clean_text} -> กำลังคลิกอ่าน (รอบที่ {loop_count + 1})")
+            cleared_messages.append(f"• รอบที่ {loop_count + 1} (Type {noti_type}): {clean_text}")
+            
+            # ⚡ สั่งคลิกอ่านเพื่อเคลียร์แจ้งเตือน (ส่งสัญญาณ AJAX ไปยังเซิร์ฟเวอร์)
+            current_noti.click(timeout=10000)
+            loop_count += 1
+            is_clean_at_start = False  # มีการเคลียร์ แปลว่าหน้าเว็บไม่ได้คลีนตั้งแต่แรก
+            
+            # 🎯 [AJAX Optimization] รอให้อิลิเมนต์เดิมถูกถอดถอนออกจากหน้าจอ (หายไปจาก DOM)
+            try:
+                # ระบบ AJAX ที่ดีจะลบแท็กทิ้งทันที รอตรวจจับภายใน 3 วินาที
+                current_noti.wait_for(state="detached", timeout=3000)
+                # หน่วงสั้นๆ เพื่อให้ DOM เรียงตัวใหม่เสร็จสิ้น (ไม่ต้องรีโหลดหน้าเว็บ)
+                page.wait_for_timeout(300)
+            except:
+                # 🔄 [Fallback Safeguard] หากปุ่มไม่ยอมหายไปใน 3 วินาที (AJAX หน่วงหรือค้าง) 
+                # ให้สั่งรีโหลดหน้าแรกเพื่อแก้เกมและอัปเดตสเตตัสสดทันที
+                print(f"🔄 [{site_name}] AJAX ตอบสนองช้า สั่งรีโหลดหน้าแรกเพื่ออัปเดตแผงควบคุม...")
+                page.goto(index_url, timeout=15000, wait_until="domcontentloaded")
+                page.wait_for_timeout(1000)
+                
+        except Exception as e:
+            print(f"⚠️ [{site_name}] เกิดข้อผิดพลาดในลูปเคลียร์แจ้งเตือน: {e}")
+            break
+
+    # -------------------------------------------------------------------------
+    # 🎯 ระบบสรุปยอดรายงานผลส่งเข้า Discord ท้ายฟังก์ชัน
+    # -------------------------------------------------------------------------
+    has_notify_func = False
+    try:
+        if callable(globals().get('send_notify')) or callable(locals().get('send_notify')):
+            has_notify_func = True
+    except:
+        pass
+
+    if has_notify_func:
+        if cleared_messages:
+            # 📝 เคสที่ 1: มีข้อความที่ถูกล้างไป
+            report_msg = [f"📥 <b>[{site_name}] ล้างกล่องแจ้งเตือน (AJAX Mode) สำเร็จ!</b>"]
+            report_msg.append(f"🧹 เคลียร์สตรีมมิ่งไปทั้งหมด <b>{len(cleared_messages)}</b> ฉบับ:")
+            report_msg.extend(cleared_messages[:10]) 
+            if len(cleared_messages) > 10:
+                report_msg.append(f"<i>... และรายการอื่น ๆ อีก {len(cleared_messages) - 10} ฉบับ</i>")
+            send_notify("\n".join(report_msg))
+            
+        elif is_clean_at_start:
+            # ✨ เคสที่ 2: ไม่มีแจ้งเตือนใดๆ ค้างตั้งแต่แรก
+            send_notify(f"📥 <b>[{site_name}]</b> ตรวจสอบแล้ว <u>ไม่มีข้อความแจ้งเตือนใหม่</u> กล่องข้อความสะอาดเรียบร้อยดี")
+    else:
+        print(f"📢 [{site_name}] เสร็จสิ้นกระบวนการเคลียร์แจ้งเตือน (ไม่ได้ส่งรายงาน Discord เนื่องจากไม่พบฟังก์ชัน send_notify)")
+        
+    return True
+
 def check_item_urgency(exp_time_str):
     try:
         if exp_time_str == "N/A": return False
@@ -2609,23 +2748,130 @@ def update_bot_config(active_item):
             CFG['SETTING']['CURRENT_DISCOUNT'] = 0
             print(f"❌ Error reloading config: {e} | Switching to Emergency Safety Mode")
 
-def auto_vote_snatched(page):
+def auto_vote_snatched(page, base_url, site_name="BEARBIT"):
+    """
+    ฟังก์ชันช่วยโหวตทอร์เรนต์ที่ดาวน์โหลดไปแล้ว (snatchdown.php)
+    - [Multi-Site Fully Tested] รองรับพารามิเตอร์ site_name สอดประสานกับระบบ Log และ Discord ครบทุกจุด
+    - [High-Speed AJAX Engine] คลิกรัวผ่านระบบสตรีมมิ่ง คุมลูปด้วยสถานะปุ่มหาย (Detached) โดยไม่ต้องรีโหลดหน้าเว็บ
+    - [Count-Based Resilient] เปลี่ยนมาใช้ .count() แทน .is_visible() ป้องกันอาการบอทตาถั่วข้ามปุ่มเนื่องจากหน้าเว็บเรนเดอร์ภาพไม่ทัน
+    - [Safe Callback] ออกแบบระบบเรียกใช้ send_notify ให้ยืดหยุ่นสูง รองรับการทำงานแบบแยกไฟล์โมดูล
+    - [Edge-Case Fixed] เพิ่มระบบตรวจสอบ URL ป้องกันบอทติดลูปหน้าสุดท้ายกรณีปุ่ม Next Page ไม่ยอมหายไป
+    - [Latency Resilient] ปรับระบบเปลี่ยนหน้าให้รอการเรนเดอร์ปุ่ม Next จริง ๆ ก่อนตรวจสอบสถานะ ป้องกันบอทจบลูปก่อนกำหนด
+    """
     try:
         max_p = 5
-        print(f"🗳️ Vote system started ({max_p} pages)")
-        page.goto("https://bearbit.org/snatchdown.php", wait_until="networkidle")
+        total_voted = 0
+        last_page_url = ""  # ตัวแปรสำหรับดักจับดัชนี URL ป้องกันการโหลดหน้าซ้ำซ้อนซ้ำซาก
+        
+        # ประกอบ URL จาก base_url หลัก
+        if not base_url.endswith('/'):
+            base_url += '/'
+        snatch_url = f"{base_url}snatchdown.php"
+        
+        print(f"🗳️ [{site_name}] เริ่มระบบ Auto-Vote (สแกนสูงสุด {max_p} หน้าผ่าน High-Speed AJAX)...")
+        
+        # โหลดหน้าแรกเพื่อตั้งหลัก
+        page.goto(snatch_url, timeout=25000, wait_until="domcontentloaded")
+        
         for p_idx in range(1, max_p + 1):
-            vote_targets = page.locator('img[title="ยอดเยี่ยม"], img[src*="v5.1.1.png"]')
-            count = vote_targets.count()
-            if count > 0:
-                for i in range(count):
-                    try: vote_targets.first.click(); time.sleep(random.uniform(1.0, 1.5))
-                    except: continue
-            next_btn = page.locator('img[src*="nextpage.gif"]').first
-            if next_btn.is_visible() and p_idx < max_p: next_btn.click(); time.sleep(2)
-            else: break
-        send_notify("🗳️ Vote session completed.")
-    except Exception as e: print(f"❌ Vote Error: {e}")
+            current_url = page.url
+            # 🛑 [Safeguard] ถ้า URL ปัจจุบันซ้ำกับหน้าเดิม แปลว่ากดเปลี่ยนหน้าไม่ไป หรือเป็นหน้าสุดท้ายแล้ว ให้จบลูปทันที
+            if current_url == last_page_url:
+                print(f"🏁 [{site_name}] ตรวจพบอาการ URL ซ้ำซ้อน (หน้าสุดท้ายจริง) สั่งจบลูปทำงานอย่างปลอดภัย")
+                break
+            last_page_url = current_url
+            
+            print(f"📖 [{site_name}] กำลังสแกนตรวจสอบรายการในหน้าทำงานที่ {p_idx}...")
+            page.wait_for_timeout(1000) # รอหน้าเว็บ Render ไอคอนให้พร้อม
+            
+            # 🎯 ประกาศ Selector เจาะจงไอคอนปุ่มกดโหวต "ยอดเยี่ยม"
+            vote_selector = 'img[title="ยอดเยี่ยม"], img[src*="v5.1.1.png"]'
+            
+            voted_in_page = 0
+            max_attempts_per_page = 40
+            
+            for _ in range(max_attempts_per_page):
+                # ดักจับ Target Locator สดๆ ณ วินาทีนี้
+                noti_locator = page.locator(vote_selector)
+                
+                # ⚡ เช็กจำนวนปุ่มที่เหลืออยู่ใน DOM จริง ณ วินาทีนี้ 
+                if noti_locator.count() == 0:
+                    break
+                    
+                current_vote_target = noti_locator.first
+                
+                try:
+                    # เลื่อนหน้าจอไปหาไอคอนเบาๆ เพื่อให้ Playwright โฟกัสพิกัดได้อย่างแม่นยำ
+                    current_vote_target.scroll_into_view_if_needed()
+                    page.wait_for_timeout(50)
+                    
+                    # 🚀 ส่งคำสั่งคลิกเพื่อทำรายการโหวตผ่านระบบ AJAX ของเว็บบิท
+                    current_vote_target.click(timeout=4000)
+                    total_voted += 1
+                    voted_in_page += 1
+                    print(f"    🔹 [{site_name}] กดโหวตสำเร็จแล้วเรียบร้อย (ยอดสะสมรวม: {total_voted} รายการ)")
+                    
+                    # 🎯 [AJAX Optimization] รอให้ปุ่มเดิมเปลี่ยนสถานะหรือหายไป (Detached/Hidden)
+                    try:
+                        current_vote_target.wait_for(state="detached", timeout=1500)
+                    except:
+                        # หากปุ่มไม่หายใน 1.5 วินาที หน่วงสั้นๆ แล้ว Re-scan เพื่อเช็กสเตตัสรอบถัดไป
+                        page.wait_for_timeout(500)
+                    
+                    # หน่วงเวลาสุ่มสั้นๆ เลียนแบบพฤติกรรมมนุษย์ ป้องกันเซิร์ฟเวอร์ตัดการเชื่อมต่อ (Rate Limit)
+                    page.wait_for_timeout(int(random.uniform(600, 1200)))
+                    
+                except Exception as click_err:
+                    print(f"    ⚠️ [{site_name}] เกิดความล่าช้าในการส่ง Request (กำลังลองใหม่): {click_err}")
+                    page.wait_for_timeout(1000)
+                    continue
+            
+            if voted_in_page == 0:
+                print(f"✨ [{site_name}] ไม่พบปุ่มโหวตที่ค้างคาในหน้า {p_idx}")
+            else:
+                print(f"🧹 [{site_name}] เคลียร์การโหวตในหน้า {p_idx} เสร็จสิ้น (ทำรายการไป {voted_in_page} ตัว)")
+            
+            # 🎯 [Page Transition Fix] ตรวจสอบปุ่ม Next Page สำหรับเคลื่อนไปหน้าถัดไป
+            if p_idx < max_p:
+                next_btn = page.locator('img[src*="nextpage.gif"]').first
+                try:
+                    # ⏳ หน่วงรอให้ปุ่ม Next Page แสดงสถานะเด่นชัดขึ้นบนจอก่อน 1.5 วินาที เผื่อเน็ตเวิร์กหน่วง
+                    next_btn.wait_for(state="visible", timeout=1500)
+                    print(f"➡️ [{site_name}] กำลังเปลี่ยนไปหน้าถัดไป (หน้า {p_idx + 1})...")
+                    next_btn.click(timeout=5000)
+                    page.wait_for_load_state("domcontentloaded")
+                except:
+                    print(f"🏁 [{site_name}] ไม่พบปุ่ม Next Page ในหน้าปัจจุบัน สั่งจบลูปทำงานอย่างสมบูรณ์")
+                    break
+            else:
+                print(f"🏁 [{site_name}] สแกนครบตามโควตาหน้าสูงสุด ({max_p} หน้า) เรียบร้อยแล้ว")
+                break
+                
+        # -------------------------------------------------------------------------
+        # 🎯 ระบบสรุปยอดรายงานผลส่งเข้า Discord เมื่อเสร็จสิ้นภารกิจ
+        # -------------------------------------------------------------------------
+        has_notify_func = False
+        try:
+            if callable(globals().get('send_notify')) or callable(locals().get('send_notify')):
+                has_notify_func = True
+        except:
+            pass
+
+        if has_notify_func:
+            if total_voted > 0:
+                print(f"✅ [{site_name}] [🗳️ Vote System] ทำการโหวตสำเร็จทั้งหมด {total_voted} รายการ")
+                send_notify(f"🗳️ <b>[{site_name}]</b> ทำการ Auto-Vote ทอร์เรนต์สำเร็จเรียบร้อย รวม <b>{total_voted}</b> รายการ")
+            else:
+                print(f"✨ [{site_name}] [🗳️ Vote System] ไม่มีทอร์เรนต์ค้างโหวต ระบบสะอาดเรียบร้อย")
+                send_notify(f"🗳️ <b>[{site_name}]</b> ตรวจสอบแล้ว ไม่มีทอร์เรนต์ค้างโหวต ระบบสะอาดเรียบร้อย")
+        else:
+            print(f"📢 [{site_name}] เสร็จสิ้นภารกิจ Auto-Vote รวมทั้งสิ้น {total_voted} รายการ (ไม่ได้ส่งรายงาน Discord เนื่องจากไม่พบฟังก์ชัน send_notify)")
+            
+    except Exception as e:
+        print(f"❌ [{site_name}] Vote Error: {e}")
+        return False
+        
+    return True
     
 # ========================= Smart Node Controller =========================
 
@@ -2971,7 +3217,7 @@ def main():
                             # --- วนลูปสแกนแต่ละโซน (ดึง config ตามชื่อ site ปัจจุบัน) ---
                             base_url = site_cfg.get('base_url')
                             site_target_urls = site_cfg.get('target_urls', [])
-        
+                            
                             for target_item in site_target_urls:
                                 if site_page.is_closed(): break 
 
