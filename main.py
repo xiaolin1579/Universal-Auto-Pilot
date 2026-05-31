@@ -1357,66 +1357,84 @@ class NodeCleaner:
         self.node_cfg = node_clean_cfg or {}
         self.global_cfg = global_clean_cfg or {}
 
-    def process(self, force_emergency=False):
-        """
-        ระบบตรวจสอบและลบทอร์เรนต์ที่หมดอายุ
-        :param force_emergency: บังคับใช้โหมดลบด่วน (ใช้เมื่อต้องการคืนพื้นที่ทันที)
-        """
-        node_enable = self.node_cfg.get('enable')
-        global_enable = self.global_cfg.get('enable', False)
+    def _get_node_free_gb(self):
+        try:
+            val = getattr(self.node, 'free_gb', 100.0)
+            return float(val) if val is not None else 100.0
+        except Exception:
+            return 100.0
 
-        # ตรวจสอบสิทธิ์การใช้งาน (Node Priority > Global)
-        is_enabled = node_enable or global_enable
+    def process(self, force_emergency=False):
+        if 'enable' in self.node_cfg:
+            is_enabled = self.node_cfg['enable']
+        else:
+            is_enabled = self.global_cfg.get('enable', False)
+
         if not is_enabled:
             return
 
-        # เช็คสภาวะดิสก์เต็ม (Emergency) ถ้าพื้นที่เหลือน้อยกว่า 10GB หรือถูกสั่ง Force
-        # โดยอ้างอิงจากค่า free_gb ของ Node นั้นๆ
-        is_emergency = force_emergency or (self.node.free_gb < 10.0)
+        current_free = self._get_node_free_gb()
+        is_emergency = force_emergency or (current_free < 10.0)
+
         if is_emergency:
-            print(f"🚨 [EMERGENCY CLEAN] [{self.node.name}] พื้นที่วิกฤตเหลือ {self.node.free_gb:.2f}GB")
+            print(f"🚨 [EMERGENCY TRIGGERED] [{self.node.name}] พื้นที่วิกฤตเหลือ {current_free:.2f}GB -> ส่งต่อให้ระบบ Smart Reclaim ทวงคืนพื้นที่")
+            # ส่งผ่านพารามิเตอร์ประเภทคลาสของโหนดไปด้วย เพื่อจัดกลุ่มคำสั่งลบแบบกลุ่มใหญ่ (Bulk)
+            class_name = self.node.__class__.__name__.lower()
+            node_type = "qbit" if "qbit" in class_name else "rtorrent"
+            
+            success = smart_reclaim_process(self.node, required_gb=10.0, is_emergency=True, node_type=node_type)
+            print(f"♻️ [Emergency Result] [{self.node.name}] จบรอบประมวลผล Smart Reclaim (Success: {success})")
+            return
 
-        print(f"🔍 Debug: [{self.node.name}] Starting cleanup process... (Emergency: {is_emergency})")
-
+        print(f"🔍 Debug: [{self.node.name}] Starting cleanup process... (Normal Idle Mode)")
         try:
             removed_list = []
-            if isinstance(self.node, QbitNode):
+            class_name = self.node.__class__.__name__.lower()
+            
+            if "qbit" in class_name:
                 removed_list = self._clean_qbit(is_emergency)
-            elif isinstance(self.node, RtorrentNode):
+            elif "rtorrent" in class_name:
                 removed_list = self._clean_rtorrent(is_emergency)
 
             if removed_list:
-                status_title = "🚨 EMERGENCY Cleanup" if is_emergency else "🧹 Cleanup Summary"
+                status_title = "🧹 Cleanup Summary (Idle Only)"
                 msg = f"{status_title} [{self.node.name}]:\n" + "\n".join(removed_list)
-                send_notify(msg)
+                if callable(globals().get('send_notify')):
+                    send_notify(msg)
+                else:
+                    print(f"📢 Notification (No send_notify func):\n{msg}")
         except Exception as e:
             print(f"⚠️ [{self.node.name}] Clean Error: {e}")
 
-    def _should_remove(self, ratio, age_hours, is_emergency=False):
-        """
-        Logic การตัดสินใจลบไฟล์
-        """
-        # หากอยู่ในโหมดฉุกเฉิน จะลดเกณฑ์การลบลงครึ่งหนึ่ง (ลบง่ายขึ้น) เพื่อรีบคืนพื้นที่
+    def _should_remove(self, ratio, age_hours, up_speed, leechers, is_emergency=False):
         threshold_div = 2 if is_emergency else 1
 
-        use_node_cfg = self.node_cfg.get('enable', False)
-        cfg = self.node_cfg if use_node_cfg else self.global_cfg
+        def get_cfg_value(key, default):
+            if key in self.node_cfg:
+                return self.node_cfg[key]
+            return self.global_cfg.get(key, default)
 
-        # ถ้าพื้นที่เป็น 0.0GB จริงๆ ให้ใช้เกณฑ์ "ล้างป่าช้า"
-        if self.node.free_gb <= 0.01:
-            # ลบไฟล์ที่อยู่เกิน 2 ชม. ทิ้งทันทีเพื่อกู้ชีพ Node
-            if age_hours >= 2: return True
+        if not is_emergency:
+            max_idle_hours = get_cfg_value('max_idle_hours', 6)
+            min_active_speed = get_cfg_value('min_active_speed_kb', 50) * 1024
+            
+            if up_speed > min_active_speed or leechers > 0:
+                return False
+                
+            if age_hours < max_idle_hours:
+                return False
 
-        # ดึงค่า Config (Ratio / Min Time / Max Time)
-        min_ratio = (cfg.get('min_ratio', 1.0)) / threshold_div
-        min_time = (cfg.get('min_time', 360) / 60) / threshold_div
-        max_time = (cfg.get('max_time', 1440) / 60) / threshold_div
+        if self._get_node_free_gb() <= 0.01:
+            if age_hours >= 2: 
+                return True
 
-        # 1. ลบถ้าอยู่มานานเกิน Max Time
+        min_ratio = get_cfg_value('min_ratio', 1.0) / threshold_div
+        min_time = (get_cfg_value('min_time', 360) / 60) / threshold_div
+        max_time = (get_cfg_value('max_time', 1440) / 60) / threshold_div
+
         if age_hours >= max_time:
             return True
 
-        # 2. ลบถ้าอยู่เกิน Min Time และ Ratio ถึงเป้าหมาย
         if age_hours >= min_time and ratio >= min_ratio:
             return True
 
@@ -1424,31 +1442,41 @@ class NodeCleaner:
 
     def _clean_qbit(self, is_emergency):
         res = []
-        # ดึงข้อมูลจาก qBittorrent Web API
-        r = self.node.s.get(f"{self.node.url}/api/v2/torrents/info", auth=self.node.auth, verify=False, timeout=15)
-        if r.status_code != 200: return []
+        try:
+            headers = {"Accept-Encoding": "gzip, deflate", "Connection": "keep-alive"}
+            r = self.node.s.get(f"{self.node.url}/api/v2/torrents/info", auth=self.node.auth, headers=headers, verify=False, timeout=15)
+            if r.status_code != 200: 
+                return []
 
-        torrents = r.json()
-        now = time.time()
-        for t in torrents:
-            # ข้ามถ้ายังโหลดไม่เสร็จ
-            if t.get('progress', 0) < 1: continue
+            torrents = r.json()
+            now = time.time()
+            for t in torrents:
+                progress = t.get('progress', 0)
+                if progress < 1 or t.get('completion_on', 0) <= 0: 
+                    continue
 
-            completion_on = t.get('completion_on', 0)
-            if completion_on <= 0: continue
+                try:
+                    age_hours = (now - float(t['completion_on'])) / 3600
+                    ratio = float(t.get('ratio', 0))
+                    up_speed = float(t.get('upspeed', 0))      
+                    leechers = int(t.get('num_leechers', 0))
+                except (ValueError, TypeError):
+                    continue
 
-            age_hours = (now - completion_on) / 3600
-            ratio = t.get('ratio', 0)
-
-            if self._should_remove(ratio, age_hours, is_emergency):
-                if self.node.delete_torrent(t['hash']):
-                    line = f"  🗑️ {t['name'][:30]} (R:{ratio:.2f}, {age_hours:.1f}h)"
-                    print(line); res.append(line)
+                if self._should_remove(ratio, age_hours, up_speed, leechers, is_emergency):
+                    if self.node.delete_torrent(t['hash']):
+                        raw_name = t.get('name', 'Unknown')
+                        name_safeguard = raw_name[:27] + "..." if len(raw_name) > 27 else raw_name
+                        mode_icon = "🚨" if is_emergency else "💤"
+                        line = f"  {mode_icon} {name_safeguard} (R:{ratio:.2f}, {age_hours:.1f}h)"
+                        print(line)
+                        res.append(line)
+        except Exception as e:
+            print(f"⚠️ [{self.node.name}] qBittorrent Fetch Error: {e}")
         return res
 
     def _clean_rtorrent(self, is_emergency):
         res = []
-        # XML-RPC สำหรับ rTorrent multicall
         xml = (
             '<?xml version="1.0"?><methodCall><methodName>d.multicall2</methodName>'
             '<params><param><value><string></string></value></param>'
@@ -1456,138 +1484,206 @@ class NodeCleaner:
             '<param><value><string>d.hash=</string></value></param>'
             '<param><value><string>d.ratio=</string></value></param>'
             '<param><value><string>d.timestamp.finished=</string></value></param>'
+            '<param><value><string>d.up.rate=</string></value></param>'
+            '<param><value><string>d.peers_accounted=</string></value></param>'
             '<param><value><string>d.name=</string></value></param></params></methodCall>'
         )
 
         try:
-            r = self.node.s.post(
-                self.node.url, 
-                data=xml, 
-                auth=self.node.auth, 
-                headers=self.node.headers, # แนะนำให้ดึง headers มาด้วย
-                verify=False, 
-                timeout=15
-            )
-            if r.status_code != 200: return []
+            req_headers = getattr(self.node, 'headers', {}).copy()
+            if "Connection" not in req_headers:
+                req_headers["Connection"] = "close" 
+
+            r = self.node.s.post(self.node.url, data=xml, auth=self.node.auth, headers=req_headers, verify=False, timeout=15)
+            if r.status_code != 200: 
+                return []
 
             soup = BeautifulSoup(r.text, "xml")
-            response = soup.find('methodResponse')
-            if not response: return []
-
-            torrent_entries = response.find_all('data')
+            param_values = soup.find_all('value')
             now = time.time()
 
-            for entry in torrent_entries:
-                vals = [v.get_text().strip() for v in entry.find_all('value', recursive=False)]
-                if len(vals) < 4: continue
+            for p_val in param_values:
+                inner_array = p_val.find('array')
+                if not inner_array:
+                    continue
+                
+                vals = [v.get_text().strip() for v in inner_array.find_all('value')]
+                if len(vals) < 6:
+                    continue
 
-                t_hash, t_ratio_raw, t_finish, t_name = vals[0], vals[1], vals[2], vals[3]
+                t_hash, t_ratio_raw, t_finish, t_uprate, t_peers, t_name = vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]
 
-                if not t_finish.isdigit() or int(t_finish) <= 0: continue
+                if not t_finish.isdigit() or int(t_finish) <= 0: 
+                    continue
 
-                ratio = int(t_ratio_raw) / 1000 if t_ratio_raw.isdigit() else 0
-                age_hours = (now - int(t_finish)) / 3600
+                try:
+                    ratio = int(t_ratio_raw) / 1000 if t_ratio_raw.isdigit() else 0.0
+                    age_hours = (now - int(t_finish)) / 3600
+                    up_speed = int(t_uprate) if t_uprate.isdigit() else 0
+                    leechers = int(t_peers) if t_peers.isdigit() else 0
+                except (ValueError, TypeError):
+                    continue
 
-                if self._should_remove(ratio, age_hours, is_emergency):
+                if self._should_remove(ratio, age_hours, up_speed, leechers, is_emergency):
                     if self.node.delete_torrent(t_hash):
-                        line = f"  🗑️ {t_name[:30]} (R:{ratio:.2f}, {age_hours:.1f}h)"
-                        print(line); res.append(line)
+                        name_safeguard = t_name[:27] + "..." if len(t_name) > 27 else t_name
+                        mode_icon = "🚨" if is_emergency else "💤"
+                        line = f"  {mode_icon} {name_safeguard} (R:{ratio:.2f}, {age_hours:.1f}h)"
+                        print(line)
+                        res.append(line)
 
+            soup.decompose()
         except Exception as e:
             print(f"⚠️ [{self.node.name}] rTorrent Clean Error: {str(e)}")
+            
         return res
 
-# ========================= Smart Reclaim Space =========================
 
-def smart_reclaim_process(node, required_gb):
+# ========================= Smart Reclaim Space (Hardened Version) =========================
+
+def _bulk_delete_qbit(node, target_hashes):
+    """ ส่งคำสั่งลบแบบ Batch ของ qBittorrent ในครั้งเดียว """
+    try:
+        hashes_str = "|".join(target_hashes)
+        # ใช้ API ที่รองรับการลบทีละหลายๆ ตัวพร้อมลบข้อมูลบนดิสก์จริง
+        url = f"{node.url}/api/v2/torrents/delete"
+        r = node.s.post(url, data={"hashes": hashes_str, "deleteFiles": "true"}, auth=node.auth, timeout=15, verify=False)
+        return r.status_code == 200
+    except Exception as e:
+        print(f"❌ Bulk Delete qBit Error: {e}")
+        return False
+
+def _bulk_delete_rtorrent(node, target_hashes):
+    """ ห่อหุ้มคำสั่งลบส่งแบบ XML-RPC system.multicall เพื่อลด Thread Lockup ใน rTorrent """
+    try:
+        xml_parts = ['<?xml version="1.0"?><methodCall><methodName>system.multicall</methodName><params><param><value><array><data>']
+        for h in target_hashes:
+            xml_parts.append(
+                f'<value><struct>'
+                f'<member><name>methodName</name><value><string>d.erase</string></value></member>'
+                f'<member><name>params</name><value><array><data><value><string>{h}</string></value></data></array></value></member>'
+                f'</struct></value>'
+            )
+        xml_parts.append('</data></array></value></param></params></methodCall>')
+        xml_data = "".join(xml_parts)
+        
+        req_headers = getattr(node, 'headers', {}).copy()
+        req_headers["Connection"] = "close"
+        r = node.s.post(node.url, data=xml_data, auth=node.auth, headers=req_headers, verify=False, timeout=15)
+        return r.status_code == 200
+    except Exception as e:
+        print(f"❌ Bulk Delete rTorrent Error: {e}")
+        return False
+
+
+def smart_reclaim_process(node, required_gb, is_emergency=False, node_type="qbit"):
     """
-    เวอร์ชันหยุดบอทคลั่ง: คำนวณพื้นที่ในแรม + ดักห้ามลบงานขาดทุน (Ratio < 1.0)
+    เวอร์ชัน Hardened Multi-Gbps Optimized:
+    - [Real Download Size] คำนวณเนื้อที่ตามจำนวนที่ถูกเขียนลงดิสก์จริง ป้องกันทอร์เรนต์หลอก/โหลดค้าง
+    - [Bulk Execution] รวมคำสั่งลบเป็นก้อนเดียว (Single-Shot) ป้องกัน API คอขวดและลดอาการ Thread Lockup
+    - [High-Frequency Adaptive Loop] ปรับลูป Sync ตรวจเช็กพื้นที่ละเอียดขึ้น ถี่ขึ้น เพื่อแข่งกับสปีดการเขียนดิสก์ระดับ 20Gbps+
     """
     try:
-        # อัปเดตพื้นที่ปัจจุบันก่อนเริ่ม
         node.refresh_status()
-        
-        # ปรับ Buffer สุทธิหน้างานให้กระชับพอดี (คลาสพี่มี safety_buffer 15GB ข้างในอยู่แล้ว)
         target_free = required_gb + 2.0 
+        current_free = float(node.free_gb) if getattr(node, 'free_gb', None) is not None else 0.0
         
-        if node.free_gb >= target_free:
-            print(f"✅ [{node.name}] พื้นที่เพียงพออยู่แล้ว: {node.free_gb:.2f} GB")
+        if current_free >= target_free:
+            print(f"✅ [{node.name}] พื้นที่ดิสก์จริงเพียงพออยู่แล้ว: {current_free:.2f} GB")
             return True
 
-        # 1. ดึงข้อมูลงานทั้งหมด
         all_torrents = node.get_all_torrents_info()
         if not all_torrents:
-            print(f"⚠️ [{node.name}] ไม่มีงานให้เคลียร์")
+            print(f"⚠️ [{node.name}] ไม่มีงานในระบบให้เคลียร์")
             return False
 
-        # 2. คัดกรองงานที่ปลอดภัยที่จะลบ
-        # 2. คัดกรองงานที่เสร็จสมบูรณ์แล้วเท่านั้น
         scannable_torrents = []
         for t in all_torrents:
-            t_ratio = t.get('ratio', 0.0)
-            
-            # 1. ดึงค่าดิบ
-            raw_p = t.get('progress', t.get('percent', t.get('progress_raw', 0.0)))
-            
-            # 2. ปรับให้เป็นทศนิยม 0.0 - 1.0 เสมอ
-            progress = raw_p / 100.0 if raw_p > 1.0 else raw_p
-            
-            # 3. คัดกรอง
-            if progress < 1.0:
-                continue # ข้ามงานที่ยังโหลดไม่เสร็จ
+            try:
+                t_ratio = float(t.get('ratio', 0.0))
+                raw_p = float(t.get('progress', t.get('percent', t.get('progress_raw', 0.0))))
+                progress = raw_p / 100.0 if raw_p > 1.0 else raw_p
                 
-            if t_ratio < 1.0:
-                continue # ข้ามงานที่ยังขาดทุน
+                if progress < 1.0 or t_ratio < 1.0:
+                    continue 
+                    
+                # 🛡️ [Hardened 1]: คำนวณจากขนาดจริงที่ดาวน์โหลดเสร็จ (Downloaded Bytes) เพื่อป้องกัน Sparse File หลอกตา
+                # qbit มักใช้ 'downloaded' หรือ 'completed', rtorrent มีค่าประมวลผลขนาดจริง
+                raw_size = float(t.get('completed', t.get('downloaded', t.get('size', t.get('total_size', 0)))))
+                t_size_gb = raw_size / (1024**3) if raw_size > 1000000 else float(t.get('size_gb', 0))
                 
-            scannable_torrents.append(t)
+                if t_size_gb < 1.0:
+                    continue
+
+                t['_calculated_size_gb'] = t_size_gb
+                t['_calculated_ratio'] = t_ratio
+                scannable_torrents.append(t)
+            except (ValueError, TypeError):
+                continue
 
         if not scannable_torrents:
-            print(f"⚠️ [{node.name}] ไม่มีงานที่ Ratio >= 1.00 เหลือให้ลบแล้ว! (ระบบเซฟชีวิตเพื่อรักษาค่าเรติโอ)")
+            print(f"⚠️ [{node.name}] ไม่มีงานขนาดใหญ่ (>=1GB) และ Ratio >= 1.0 เหลือให้สละชีพ")
             return False
 
-        # 3. เรียงลำดับ: ลบตัวที่กำไรสูงสุด (Ratio เยอะสุด) ออกก่อน
-        scannable_torrents.sort(key=lambda x: x.get('ratio', 0), reverse=True)
+        # จัดลำดับ: เอาไฟล์จริงที่กินพื้นที่มากที่สุดและทำกำไรสูงสุดออกก่อน
+        scannable_torrents.sort(key=lambda x: (x['_calculated_size_gb'], x['_calculated_ratio']), reverse=True)
 
-        print(f"🧹 [{node.name}] เริ่มทวงคืนพื้นที่... เป้าหมายสะสม: {target_free - node.free_gb:.2f} GB")
-
-        # ตัวแปรจำลองพื้นที่ในแรม (แก้ปัญหาเซิร์ฟเวอร์คืนพื้นที่ช้า)
-        virtual_free_gb = node.free_gb
-        delete_count = 0
-        max_delete_limit = 5  # 🔥 [เกราะป้องกันชั้นที่ 2]: ลบสูงสุดไม่เกิน 5 ตัวต่อรอบพื่อความปลอดภัย
+        virtual_free_gb = current_free
+        targets_to_delete = []
+        target_hashes = []
+        reclaimed_logs = []
+        
+        max_delete_limit = 12 if is_emergency else 5
 
         for t in scannable_torrents:
-            # ถ้าพื้นที่จำลองคำนวณแล้วว่าผ่านเป้า ให้หยุดลบทันที! ไม่ต้องรอ API เซิร์ฟเวอร์
-            if virtual_free_gb >= target_free:
-                print(f"🛑 [{node.name}] หยุดลบ! คำนวณพื้นที่จำลองในแรมเพียงพอต่อการลงไฟล์ใหม่แล้ว")
+            if virtual_free_gb >= target_free or len(targets_to_delete) >= max_delete_limit:
                 break
-                
-            if delete_count >= max_delete_limit:
-                print(f"🛑 [{node.name}] หยุดลบชั่วคราว! ชนเพดานจำกัดการลบสูงสุด {max_delete_limit} ตัวต่อรอบ")
-                break
-
-            t_name = t.get('name', 'Unknown')
-            t_ratio = t.get('ratio', 0.0)
-            t_hash = t.get('hash')
             
-            # คำนวณขนาด (รองรับโครงสร้าง size ข้อมูลของพี่)
-            t_size_gb = t.get('size', 0) / (1024**3) if t.get('size', 0) > 1000000 else t.get('size_gb', 0)
+            targets_to_delete.append(t)
+            target_hashes.append(t.get('hash'))
+            virtual_free_gb += t['_calculated_size_gb']
 
-            print(f"🧹 [{node.name}] กำลังลบ: {t_name[:30]} (Ratio: {t_ratio:.2f} | ปลดปล่อยพื้นที่ทิพย์: +{t_size_gb:.2f} GB)")
+        if not targets_to_delete:
+            return False
 
-            # สั่งลบจริง
-            node.delete_torrent(t_hash)
+        print(f"🧹 [{node.name}] ตรวจพบเป้าหมายกวาดล้างแบบกลุ่ม {len(targets_to_delete)} รายการ -> กำลังยิงคำสั่ง Single-Shot Bulk Deletion")
+        
+        # ⚡ [Hardened 2]: ยิงคำสั่งถอนรากถอนโคนแบบส่งทีเดียวจบ (Bulk Deletion)
+        bulk_success = False
+        if node_type == "qbit":
+            bulk_success = _bulk_delete_qbit(node, target_hashes)
+        else:
+            bulk_success = _bulk_delete_rtorrent(node, target_hashes)
+
+        if bulk_success:
+            for t in targets_to_delete:
+                t_name = t.get('name', 'Unknown')
+                name_safeguard = t_name[:25] + "..." if len(t_name) > 25 else t_name
+                reclaimed_logs.append(f"  🔥 [Bulk-Purged] {name_safeguard} (R:{t['_calculated_ratio']:.2f} | +{t['_calculated_size_gb']:.2f}GB)")
+        else:
+            # Fallback หากระบบ Bulk ขัดข้อง ให้สลับไปใช้ยิงทีละตัวแบบดั้งเดิม
+            print("⚠️ Bulk purge failed, falling back to sequential delete.")
+            for t in targets_to_delete:
+                if node.delete_torrent(t.get('hash')):
+                    reclaimed_logs.append(f"  ⚠️ [Fallback-Reclaimed] {t.get('name')[:25]} (+{t['_calculated_size_gb']:.2f}GB)")
+                    time.sleep(0.1)
+
+        if reclaimed_logs and callable(globals().get('send_notify')):
+            send_notify(f"🚨 <b>[Bulk Smart Reclaim Action]</b> [{node.name}]\nเครือข่ายความเร็วสูงยิงคำสั่งลบแบบกลุ่มลด I/O Delay เรียบร้อย ({len(reclaimed_logs)} รายการ):\n" + "\n".join(reclaimed_logs))
+
+        # 💡 [Hardened 3]: ลูปตรวจเช็กพื้นที่ดิสก์ความถี่สูงแบบสลับความไว (High-Frequency Adaptive Monitor)
+        # ตรวจสอบบ่อยขึ้น (ทุกๆ 0.5 วินาที จำนวน 16 รอบ = 8 วินาทีรวม) เพื่อดักจับค่าดิสก์ที่ผันผวนได้อย่างทันท่วงที
+        print(f"⏳ [{node.name}] กำลังตรวจสอบการคืนบล็อกพื้นที่ระดับฮาร์ดแวร์ดิสก์จริง...")
+        for attempt in range(16):
+            time.sleep(0.5) 
+            node.refresh_status()
+            final_free = float(node.free_gb) if getattr(node, 'free_gb', None) is not None else 0.0
             
-            # อัปเดตค่าในแรมทันที! (จุดนี้แหละที่จะช่วยชีวิตพี้ ไม่ให้บอทลบรัวๆ)
-            virtual_free_gb += t_size_gb
-            delete_count += 1
-            
-            # หน่วงสั้นๆ ให้เครื่องหายใจสำหรับเลเยอร์ Racing
-            time.sleep(1.0)
+            if final_free >= target_free:
+                print(f"✅ [{node.name}] พื้นที่ดิสก์จริงสะท้อนข้อมูลกลับขึ้นมาตามเป้าหมาย: {final_free:.2f} GB (ในรอบสแกนที่ {attempt+1})")
+                return True
 
-        # จบลูป ยิงตรวจสอบจริงรอบเดียวท้ายงาน
-        time.sleep(2.0)
-        node.refresh_status()
-        return node.free_gb >= target_free
+        return final_free >= required_gb
 
     except Exception as e:
         print(f"❌ Reclaim Error on {node.name}: {str(e)}")
