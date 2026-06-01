@@ -2757,18 +2757,28 @@ def check_item_urgency(exp_time_str):
     except:
         return False
 
+RE_ITEM_ROW = re.compile(r"สถานะไอเทม|Item Status", re.I)
+RE_EXP_DATE = re.compile(r"(\d{2}[-/]\d{2}[-/]\d{4}\s+\d{2}:\d{2}:\d{2})")
+
 def get_bearbit_item_status(soup):
     try:
         active_item = "NONE"
         display_exp = "N/A"
 
-        # ปรับ Regex ให้ดักจับได้กว้างขึ้น (ครอบคลุมทั้งตารางรายละเอียด)
-        item_row = soup.find("td", string=re.compile(r"สถานะไอเทม|Item Status|หมดอายุ Item", re.I))
+        # ⚡ [Hardened]: tag.name.lower() รองรับทั้ง td และ TD ป้องกันโค้ดข้ามแท็กตัวพิมพ์ใหญ่
+        item_row = soup.find(
+            lambda tag: tag.name and tag.name.lower() == "td" and RE_ITEM_ROW.search(tag.get_text())
+        )
+        
         if item_row:
             target_td = item_row.find_next_sibling("td")
-            full_text = target_td.get_text(" ", strip=True)
+            if not target_td:
+                return "NONE"
+                
+            # เคลียร์เศษ White space และสัญลักษณ์ช่องว่างพิเศษจาก HTML
+            full_text = target_td.get_text(" ", strip=True).replace("\xa0", " ")
 
-            # --- แมปปิ้งไอเทมแบบละเอียดยิ่งขึ้น ---
+            # --- แมปปิ้งไอเทมตามคีย์เวิร์ด ---
             item_map = {
                 "FREELOAD_100": ["ซานตาคลอส", "100%", "Santa Claus"],
                 "FREELOAD_50": ["ตุ๊กตาซานต้า", "50%", "Santa Doll"],
@@ -2781,18 +2791,29 @@ def get_bearbit_item_status(soup):
                     active_item = key
                     break
 
-            # ดึงวันเวลาหมดอายุ (ดักจับทั้งแบบมีขีด - และแบบสแลช /)
-            exp_match = re.search(r"(\d{2}[-/]\d{2}[-/]\d{4}\s+\d{2}:\d{2}:\d{2})", full_text)
+            # ดึงวันเวลาหมดอายุด้วย Pre-compiled Regex
+            exp_match = RE_EXP_DATE.search(full_text)
             if exp_match:
-                raw_exp = exp_match.group(1).replace("/", "-") # Normalize format
+                raw_exp = exp_match.group(1).replace("/", "-")
                 display_exp = raw_exp
                 
-                # เช็คด่วน: ถ้าจะหมดอายุใน 30 นาที ให้แจ้งเตือน (Urgency Check)
-                if check_item_urgency(raw_exp):
-                    display_exp += " ⚠️ ใกล้หมดอายุ!"
+                # 🛡️ [Fail-Safe ย่อย]: ครอบป้องกันเผื่อฟังก์ชันคำนวณเวลาขัดข้อง
+                try:
+                    if 'check_item_urgency' in globals() and check_item_urgency(raw_exp):
+                        display_exp += " ⚠️ ใกล้หมดอายุ!"
+                except Exception as time_err:
+                    print(f"⚠️ [Time Check Warning] {time_err}")
+                    display_exp += " (Time Check Error)"
 
+            # ทำการอัปเดตคอนฟิกและคืนค่าผลลัพธ์
             if active_item != "NONE":
-                update_bot_config(active_item)
+                if 'update_bot_config' in globals():
+                    try:
+                        update_bot_config(active_item)
+                    except Exception as cfg_err:
+                        print(f"⚠️ [Config Update Warning] {cfg_err}")
+                
+                # คืนค่าไอเทมเสมอเมื่อเจอคีย์เวิร์ดแมปปิ้ง
                 return f"<b>{active_item}</b> ({display_exp})"
                 
         return "NONE"
@@ -2847,91 +2868,107 @@ def update_bot_config(active_item):
 def auto_vote_snatched(page, base_url, site_name="BEARBIT"):
     """
     ฟังก์ชันช่วยโหวตทอร์เรนต์ที่ดาวน์โหลดไปแล้ว (snatchdown.php)
-    - [Multi-Site Fully Tested] รองรับพารามิเตอร์ site_name สอดประสานกับระบบ Log และ Discord ครบทุกจุด
-    - [High-Speed AJAX Engine] คลิกรัวผ่านระบบสตรีมมิ่ง คุมลูปด้วยสถานะปุ่มหาย (Detached) โดยไม่ต้องรีโหลดหน้าเว็บ
-    - [Count-Based Resilient] เปลี่ยนมาใช้ .count() แทน .is_visible() ป้องกันอาการบอทตาถั่วข้ามปุ่มเนื่องจากหน้าเว็บเรนเดอร์ภาพไม่ทัน
-    - [Safe Callback] ออกแบบระบบเรียกใช้ send_notify ให้ยืดหยุ่นสูง รองรับการทำงานแบบแยกไฟล์โมดูล
-    - [Edge-Case Fixed] เพิ่มระบบตรวจสอบ URL ป้องกันบอทติดลูปหน้าสุดท้ายกรณีปุ่ม Next Page ไม่ยอมหายไป
-    - [Latency Resilient] ปรับระบบเปลี่ยนหน้าให้รอการเรนเดอร์ปุ่ม Next จริง ๆ ก่อนตรวจสอบสถานะ ป้องกันบอทจบลูปก่อนกำหนด
+    - [Unique Row Tracker] กวาดข้อมูลระดับแถว (TR) ดักจับ Torrent ID ป้องกันการกดซ้ำซ้อนกรณีงานซ้ำกัน
+    - [High-Speed AJAX Engine] คลิกรัวผ่านระบบสตรีมมิ่ง คุมลูปโดยไม่ต้องรีโหลดหน้าเว็บ
+    - [Safe Callback & Latency Resilient] ปรับการรับส่ง Request และระบบเปลี่ยนหน้าให้ทนทานต่อเน็ตเวิร์กหน่วง
     """
     try:
         max_p = 5
         total_voted = 0
-        last_page_url = ""  # ตัวแปรสำหรับดักจับดัชนี URL ป้องกันการโหลดหน้าซ้ำซ้อนซ้ำซาก
+        last_page_url = ""  # ตัวแปรสำหรับดักจับดัชนี URL ป้องกันการโหลดหน้าซ้ำซ้อน
         
         # ประกอบ URL จาก base_url หลัก
         if not base_url.endswith('/'):
             base_url += '/'
         snatch_url = f"{base_url}snatchdown.php"
         
-        print(f"🗳️ [{site_name}] เริ่มระบบ Auto-Vote (สแกนสูงสุด {max_p} หน้าผ่าน High-Speed AJAX)...")
+        print(f"🗳️ [{site_name}] เริ่มระบบ Auto-Vote (สแกนสูงสุด {max_p} หน้า ผ่านระบบกรองงานซ้ำ)...")
         
         # โหลดหน้าแรกเพื่อตั้งหลัก
         page.goto(snatch_url, timeout=25000, wait_until="domcontentloaded")
         
+        # คอนฟิก Selector
+        vote_img_selector = 'img[title="ยอดเยี่ยม"], img[src*="v5.1.1.png"]'
+        # เจาะจงแถวที่มีข้อมูลทอร์เรนต์ (มักจะมีลิงก์รายละเอียด details.php?id=...)
+        row_selector = 'tr:has(a[href*="details.php"])'
+        
         for p_idx in range(1, max_p + 1):
             current_url = page.url
-            # 🛑 [Safeguard] ถ้า URL ปัจจุบันซ้ำกับหน้าเดิม แปลว่ากดเปลี่ยนหน้าไม่ไป หรือเป็นหน้าสุดท้ายแล้ว ให้จบลูปทันที
             if current_url == last_page_url:
                 print(f"🏁 [{site_name}] ตรวจพบอาการ URL ซ้ำซ้อน (หน้าสุดท้ายจริง) สั่งจบลูปทำงานอย่างปลอดภัย")
                 break
             last_page_url = current_url
             
             print(f"📖 [{site_name}] กำลังสแกนตรวจสอบรายการในหน้าทำงานที่ {p_idx}...")
-            page.wait_for_timeout(1000) # รอหน้าเว็บ Render ไอคอนให้พร้อม
+            page.wait_for_timeout(1500) # รอหน้าเว็บและโครงสร้างตารางเรนเดอร์เสร็จสมบูรณ์
             
-            # 🎯 ประกาศ Selector เจาะจงไอคอนปุ่มกดโหวต "ยอดเยี่ยม"
-            vote_selector = 'img[title="ยอดเยี่ยม"], img[src*="v5.1.1.png"]'
+            # ดึงแถวข้อมูลทั้งหมดในหน้าปัจจุบัน ณ วินาทีนี้
+            rows = page.locator(row_selector)
+            row_count = rows.count()
             
-            voted_in_page = 0
-            max_attempts_per_page = 40
-            
-            for _ in range(max_attempts_per_page):
-                # ดักจับ Target Locator สดๆ ณ วินาทีนี้
-                noti_locator = page.locator(vote_selector)
-                
-                # ⚡ เช็กจำนวนปุ่มที่เหลืออยู่ใน DOM จริง ณ วินาทีนี้ 
-                if noti_locator.count() == 0:
-                    break
-                    
-                current_vote_target = noti_locator.first
-                
-                try:
-                    # เลื่อนหน้าจอไปหาไอคอนเบาๆ เพื่อให้ Playwright โฟกัสพิกัดได้อย่างแม่นยำ
-                    current_vote_target.scroll_into_view_if_needed()
-                    page.wait_for_timeout(50)
-                    
-                    # 🚀 ส่งคำสั่งคลิกเพื่อทำรายการโหวตผ่านระบบ AJAX ของเว็บบิท
-                    current_vote_target.click(timeout=4000)
-                    total_voted += 1
-                    voted_in_page += 1
-                    print(f"    🔹 [{site_name}] กดโหวตสำเร็จแล้วเรียบร้อย (ยอดสะสมรวม: {total_voted} รายการ)")
-                    
-                    # 🎯 [AJAX Optimization] รอให้ปุ่มเดิมเปลี่ยนสถานะหรือหายไป (Detached/Hidden)
-                    try:
-                        current_vote_target.wait_for(state="detached", timeout=1500)
-                    except:
-                        # หากปุ่มไม่หายใน 1.5 วินาที หน่วงสั้นๆ แล้ว Re-scan เพื่อเช็กสเตตัสรอบถัดไป
-                        page.wait_for_timeout(500)
-                    
-                    # หน่วงเวลาสุ่มสั้นๆ เลียนแบบพฤติกรรมมนุษย์ ป้องกันเซิร์ฟเวอร์ตัดการเชื่อมต่อ (Rate Limit)
-                    page.wait_for_timeout(int(random.uniform(600, 1200)))
-                    
-                except Exception as click_err:
-                    print(f"    ⚠️ [{site_name}] เกิดความล่าช้าในการส่ง Request (กำลังลองใหม่): {click_err}")
-                    page.wait_for_timeout(1000)
-                    continue
-            
-            if voted_in_page == 0:
-                print(f"✨ [{site_name}] ไม่พบปุ่มโหวตที่ค้างคาในหน้า {p_idx}")
+            if row_count == 0:
+                print(f"✨ [{site_name}] ไม่พบแถวรายการข้อมูลในหน้า {p_idx}")
             else:
-                print(f"🧹 [{site_name}] เคลียร์การโหวตในหน้า {p_idx} เสร็จสิ้น (ทำรายการไป {voted_in_page} ตัว)")
+                voted_in_page = 0
+                seen_torrent_ids = set() # เก็บ Torrent ID ที่พบในหน้านี้เพื่อกรองตัวซ้ำ
+                
+                for r_idx in range(row_count):
+                    current_row = rows.nth(r_idx)
+                    
+                    # 🔍 1. สกัดหา Torrent ID จาก Tag <a> ในแถวนั้นเพื่อใช้เป็นเครื่องมือคัดกรองความซ้ำซ้อน
+                    link_element = current_row.locator('a[href*="details.php"]').first
+                    if link_element.count() == 0:
+                        continue
+                        
+                    href = link_element.get_attribute("href") or ""
+                    # ใช้ Regex ตัดดึงเอาเฉพาะตัวเลข ID ลิงก์ย้อนหลัง (เช่น details.php?id=12345 -> 12345)
+                    id_match = re.search(r"id=(\d+)", href)
+                    torrent_id = id_match.group(1) if id_match else href
+                    
+                    # 🛑 [CORE LOGIC] เช็กด่วนว่างานนี้เคยเจอตัวแรกไปหรือยัง?
+                    if torrent_id in seen_torrent_ids:
+                        # ถ้ายับยั้งไว้ได้สำเร็จ แปลว่าเป็นตัวซ้ำ -> ปล่อยข้ามทันทีตามเงื่อนไขที่ต้องการ
+                        continue
+                    
+                    # เพิ่มเข้าคลังความจำว่าคัดกรองงาน ID นี้ไปแล้ว (ตัวถัดไปที่ซ้ำกันจะโดน Skip ทันที)
+                    seen_torrent_ids.add(torrent_id)
+                    
+                    # 🔍 2. ตรวจสอบว่าแถวนี้มีปุ่มให้กดโหวตหรือไม่
+                    vote_btn = current_row.locator(vote_img_selector).first
+                    if vote_btn.count() == 0:
+                        continue # ถ้าไม่มีปุ่มโหวต (อาจจะโหวตไปแล้วในอดีต) ให้ข้ามไปแถวถัดไป
+                        
+                    try:
+                        # เลื่อนจอและโฟกัสพิกัดปุ่มในแถว
+                        vote_btn.scroll_into_view_if_needed()
+                        page.wait_for_timeout(100)
+                        
+                        # 🚀 ยิงคำสั่งคลิกโหวตผ่านระบบ AJAX ของเว็บบิท
+                        vote_btn.click(timeout=4000)
+                        total_voted += 1
+                        voted_in_page += 1
+                        print(f"    🔹 [{site_name}] กดโหวตตัวแรกสำเร็จ (ID: {torrent_id}) [ยอดสะสมรวม: {total_voted}]")
+                        
+                        # รอให้ปุ่มในแถวนั้นจางหายไป (Detached)
+                        try:
+                            vote_btn.wait_for(state="detached", timeout=1500)
+                        except:
+                            page.wait_for_timeout(300)
+                            
+                        # หน่วงเวลาสุ่มเสมือนมนุษย์จริง ป้องกัน Rate Limit จาก Firewall
+                        page.wait_for_timeout(int(random.uniform(600, 1200)))
+                        
+                    except Exception as click_err:
+                        print(f"    ⚠️ [{site_name}] พลาดจังหวะคลิกในแถวที่ {r_idx} (จะลองใหม่รอบถัดไป): {click_err}")
+                        page.wait_for_timeout(500)
+                
+                if voted_in_page > 0:
+                    print(f"🧹 [{site_name}] เคลียร์การโหวตในหน้า {p_idx} เสร็จสิ้น (โหวตตัวไม่ซ้ำไป {voted_in_page} รายการ)")
             
-            # 🎯 [Page Transition Fix] ตรวจสอบปุ่ม Next Page สำหรับเคลื่อนไปหน้าถัดไป
+            # 🎯 [Page Transition Fix] ขยับหน้าถัดไป
             if p_idx < max_p:
                 next_btn = page.locator('img[src*="nextpage.gif"]').first
                 try:
-                    # ⏳ หน่วงรอให้ปุ่ม Next Page แสดงสถานะเด่นชัดขึ้นบนจอก่อน 1.5 วินาที เผื่อเน็ตเวิร์กหน่วง
                     next_btn.wait_for(state="visible", timeout=1500)
                     print(f"➡️ [{site_name}] กำลังเปลี่ยนไปหน้าถัดไป (หน้า {p_idx + 1})...")
                     next_btn.click(timeout=5000)
@@ -2944,7 +2981,7 @@ def auto_vote_snatched(page, base_url, site_name="BEARBIT"):
                 break
                 
         # -------------------------------------------------------------------------
-        # 🎯 ระบบสรุปยอดรายงานผลส่งเข้า Discord เมื่อเสร็จสิ้นภารกิจ
+        # 🎯 ระบบสรุปยอดรายงานผลส่งเข้า Discord
         # -------------------------------------------------------------------------
         has_notify_func = False
         try:
@@ -2955,13 +2992,11 @@ def auto_vote_snatched(page, base_url, site_name="BEARBIT"):
 
         if has_notify_func:
             if total_voted > 0:
-                print(f"✅ [{site_name}] [🗳️ Vote System] ทำการโหวตสำเร็จทั้งหมด {total_voted} รายการ")
-                send_notify(f"🗳️ <b>[{site_name}]</b> ทำการ Auto-Vote ทอร์เรนต์สำเร็จเรียบร้อย รวม <b>{total_voted}</b> รายการ")
+                send_notify(f"🗳️ <b>[{site_name}]</b> ทำการ Auto-Vote ทอร์เรนต์สำเร็จ (กรองงานซ้ำแล้ว) รวม <b>{total_voted}</b> รายการ")
             else:
-                print(f"✨ [{site_name}] [🗳️ Vote System] ไม่มีทอร์เรนต์ค้างโหวต ระบบสะอาดเรียบร้อย")
                 send_notify(f"🗳️ <b>[{site_name}]</b> ตรวจสอบแล้ว ไม่มีทอร์เรนต์ค้างโหวต ระบบสะอาดเรียบร้อย")
         else:
-            print(f"📢 [{site_name}] เสร็จสิ้นภารกิจ Auto-Vote รวมทั้งสิ้น {total_voted} รายการ (ไม่ได้ส่งรายงาน Discord เนื่องจากไม่พบฟังก์ชัน send_notify)")
+            print(f"📢 [{site_name}] เสร็จสิ้นภารกิจ Auto-Vote รวมทั้งสิ้น {total_voted} รายการ")
             
     except Exception as e:
         print(f"❌ [{site_name}] Vote Error: {e}")
