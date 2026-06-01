@@ -977,6 +977,7 @@ class RtorrentNode:
 
     def get_all_torrents_info(self):
         try:
+            # ⚡ [Unified Payload]: ดึงค่า d.timestamp.finished= และ d.left_bytes= มาคุมเกมสเปซไทม์
             xml = '''<?xml version="1.0"?>
             <methodCall>
             <methodName>d.multicall2</methodName>
@@ -987,29 +988,85 @@ class RtorrentNode:
                 <param><value><string>d.ratio=</string></value></param>
                 <param><value><string>d.complete=</string></value></param>
                 <param><value><string>d.name=</string></value></param>
+                <param><value><string>d.size_bytes=</string></value></param>
+                <param><value><string>d.left_bytes=</string></value></param>
+                <param><value><string>d.timestamp.finished=</string></value></param>
             </params>
             </methodCall>'''
 
-            r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=20, verify=False)
+            req_headers = getattr(self, 'headers', {}).copy()
+            if "Connection" not in req_headers: 
+                req_headers["Connection"] = "close"
+
+            r = self.s.post(self.url, data=xml, auth=self.auth, headers=req_headers, timeout=20, verify=False)
             if r.status_code != 200: return []
 
+            import xml.etree.ElementTree as ET
+            import time
             root = ET.fromstring(r.text)
-            # rTorrent XML-RPC คืนค่าเป็น nested arrays
             data = root.findall(".//value/array/data/value/array/data")
 
             results = []
             for item in data:
                 values = item.findall("./value")
-                # values[0]=hash, [1]=ratio, [2]=complete, [3]=name
-                is_complete = values[2].find("./i4").text == "1"
+                if len(values) < 7: continue  # ปรับเพิ่มตาม Payload (7 สล็อต)
 
-                if is_complete:
+                def safe_get_text(val_node, tag_list=["./string", "./i4", "./int"]):
+                    if val_node is None: return ""
+                    for tag in tag_list:
+                        target = val_node.find(tag)
+                        if target is not None and target.text is not None:
+                            return target.text.strip()
+                    return val_node.text.strip() if val_node.text else ""
+
+                t_hash = safe_get_text(values[0])
+                t_ratio_str = safe_get_text(values[1])
+                t_complete_str = safe_get_text(values[2])
+                t_name = safe_get_text(values[3])
+                t_size_str = safe_get_text(values[4])
+                t_left_str = safe_get_text(values[5])
+                t_ts_finished_str = safe_get_text(values[6]) # ดึง Epoch Time ของ rTorrent
+
+                # 🛡️ สกัดดาวรุ่งตัวเหลือง (กำลังดาวน์โหลด)
+                is_complete = (t_complete_str == "1")
+                left_bytes = int(t_left_str) if t_left_str.isdigit() else 0
+                
+                if not is_complete or left_bytes > 0:
+                    continue
+
+                if t_hash:
+                    try:
+                        ratio_val = int(t_ratio_str) / 1000.0 if t_ratio_str.isdigit() else 0.0
+                        size_bytes = int(t_size_str) if t_size_str.isdigit() else 0
+                        ts_finished = int(t_ts_finished_str) if t_ts_finished_str.isdigit() else 0
+                        
+                        # ⏳ [Anti-Ghost Guard]: คำนวณอายุเป็นชั่วโมงให้เบ็ดเสร็จจากข้างใน
+                        if ts_finished <= 0:
+                            # ป้องกันเลข 0 แปลงร่างเป็นอายุ 56 ปี โดยบังคับให้เป็นขยะนิ่งรอตรวจ (หรือตั้งเกณฑ์ตามชอบ)
+                            # ในที่นี้ให้เซ็ตเป็น max_time เผื่อให้โดนด่าน 1 สับทิ้งทันทีถ้ามันค้างคา
+                            age_hours = 99.0 
+                        else:
+                            age_hours = (time.time() - ts_finished) / 3600.0
+
+                    except Exception:
+                        ratio_val = 0.0
+                        size_bytes = 0
+                        age_hours = 0.0
+
+                    # 🎯 ปรับแต่ง Output Dictionary ให้มีคีย์ล้อไปกับฝั่ง qBittorrent เพื่อให้ลูปนอกประมวลผลได้ง่าย
                     results.append({
-                        'hash': values[0].find("./string").text,
-                        'ratio': int(values[1].find("./i4").text) / 1000.0,
-                        'name': values[3].find("./string").text
+                        'hash': t_hash,
+                        'ratio': ratio_val,
+                        'name': t_name,
+                        'size': size_bytes / (1024**3), # ปรับหน่วยเป็น GB ให้ตรงกับ qBittorrent
+                        'age_hours': age_hours,         # ส่งอายุชั่วโมงที่แม่นยำออกไปตรงๆ
+                        'progress': 1.0
                     })
+                    
+            # เรียงลำดับตาม Ratio (มากไปน้อย) เหมือนโครงสร้างของ qBittorrent เป๊ะ!
+            results.sort(key=lambda x: x.get('ratio', 0), reverse=True)
             return results
+
         except Exception as e:
             print(f"❌ rTorrent Reclaim Error: {e}")
             return []
@@ -1365,20 +1422,36 @@ class NodeCleaner:
             return 100.0
 
     def process(self, force_emergency=False):
-        if 'enable' in self.node_cfg:
-            is_enabled = self.node_cfg['enable']
+        # 🔄 [แก้ไขลอจิกสิทธิ์การทำงานใหม่]:
+        # ค้นหาค่าเปิด/ปิดระบบจาก Config ระดับโหนด (clean_settings)
+        node_enable = self.node_cfg.get('enable', self.node_cfg.get('ENABLE', None))
+        
+        # ค้นหาค่าเปิด/ปิดระบบจาก Config ระดับ Global_clean
+        global_enable = self.global_cfg.get('enable', self.global_cfg.get('ENABLE', False))
+        
+        # 🎯 [ตรรกะตัดสิน]: ใช้ค่าของโหนดเป็นหลักถ้าเปิด แต่ถ้าโหนดปิดหรือไม่ได้ตั้ง ให้เช็กต่อว่า Global เปิดอยู่ไหม
+        if node_enable is True:
+            is_enabled = True
+        elif node_enable is False:
+            # 💡 แม้โหนดใน clean_settings จะใส่ false แต่อยู่ในเกณฑ์ "ใช้ค่าโหนดเป็นหลักถ้าเปิด ถ้าปิดให้ใช้ค่า global"
+            is_enabled = global_enable
         else:
-            is_enabled = self.global_cfg.get('enable', False)
+            # กรณีที่ในโหนดไม่ได้ระบุคีย์ enable ไว้เลย ให้ใช้สิทธิ์ของ Global เป็นหลัก
+            is_enabled = global_enable
+
+        # 📡 Report สถานะการทำงานจริงออกคอนโซล
+        print(f"⚙️ [Cleaner Engine] Node: {self.node.name} | Status: {'ACTIVE' if is_enabled else 'DISABLED'} (Node_Cfg: {node_enable}, Global_Cfg: {global_enable})")
 
         if not is_enabled:
+            print(f"💤 [Cleaner Bypass] Skipped [{self.node.name}] เพราะระบบถูกปิดการใช้งาน")
             return
 
         current_free = self._get_node_free_gb()
         is_emergency = force_emergency or (current_free < 10.0)
 
+        # === [1. สายงานฉุกเฉิน (Emergency Mode) - ยิง Bulk จบในตัว] ===
         if is_emergency:
             print(f"🚨 [EMERGENCY TRIGGERED] [{self.node.name}] พื้นที่วิกฤตเหลือ {current_free:.2f}GB -> ส่งต่อให้ระบบ Smart Reclaim ทวงคืนพื้นที่")
-            # ส่งผ่านพารามิเตอร์ประเภทคลาสของโหนดไปด้วย เพื่อจัดกลุ่มคำสั่งลบแบบกลุ่มใหญ่ (Bulk)
             class_name = self.node.__class__.__name__.lower()
             node_type = "qbit" if "qbit" in class_name else "rtorrent"
             
@@ -1386,61 +1459,97 @@ class NodeCleaner:
             print(f"♻️ [Emergency Result] [{self.node.name}] จบรอบประมวลผล Smart Reclaim (Success: {success})")
             return
 
-        print(f"🔍 Debug: [{self.node.name}] Starting cleanup process... (Normal Idle Mode)")
+        # === [2. สายงานปกติ (Normal Idle Mode) - ทยอยเก็บกวาดนุ่ม ๆ] ===
+        print(f"🔍 Debug: [{self.node.name}] Starting cleanup process... (Normal Idle Mode | Free: {current_free:.2f}GB)")
         try:
             removed_list = []
             class_name = self.node.__class__.__name__.lower()
             
             if "qbit" in class_name:
-                removed_list = self._clean_qbit(is_emergency)
+                removed_list = self._clean_qbit()
             elif "rtorrent" in class_name:
-                removed_list = self._clean_rtorrent(is_emergency)
+                removed_list = self._clean_rtorrent()
 
             if removed_list:
                 status_title = "🧹 Cleanup Summary (Idle Only)"
-                msg = f"{status_title} [{self.node.name}]:\n" + "\n".join(removed_list)
+                msg = f"<b>{status_title}</b> [{self.node.name}]:\n" + "\n".join(removed_list)
                 if callable(globals().get('send_notify')):
                     send_notify(msg)
                 else:
                     print(f"📢 Notification (No send_notify func):\n{msg}")
+            else:
+                print(f"✨ [{self.node.name}] ตรวจสอบเสร็จสิ้น: ไม่มีไฟล์ขยะที่ตรงตามเกณฑ์การลบปกติ")
         except Exception as e:
             print(f"⚠️ [{self.node.name}] Clean Error: {e}")
 
-    def _should_remove(self, ratio, age_hours, up_speed, leechers, is_emergency=False):
-        threshold_div = 2 if is_emergency else 1
-
+    def _should_remove(self, ratio, age_hours, up_speed, leechers):
         def get_cfg_value(key, default):
-            if key in self.node_cfg:
-                return self.node_cfg[key]
-            return self.global_cfg.get(key, default)
-
-        if not is_emergency:
-            max_idle_hours = get_cfg_value('max_idle_hours', 6)
-            min_active_speed = get_cfg_value('min_active_speed_kb', 50) * 1024
+            # 1. ดึงก้อนย่อยออกมาเช็กสถานะการใช้งาน
+            clean_sets = self.node_cfg.get('clean_settings', {})
             
-            if up_speed > min_active_speed or leechers > 0:
-                return False
+            # 🟢 [ทางเลือกที่ 1] ถ้าเปิดใช้งานเฉพาะโหนด (enable: true) -> บังคับดึงในนี้เท่านั้น
+            if clean_sets and clean_sets.get('enable', False) is True:
+                if key in clean_sets:
+                    return clean_sets[key]
+                if key.upper() in clean_sets:
+                    return clean_sets[key.upper()]
+                # หมายเหตุ: ถ้าใน clean_settings ไม่มีคีย์นั้น ให้ไหลลงไปเอาค่า Global ด้านล่างสุดได้
                 
-            if age_hours < max_idle_hours:
-                return False
+            # 🔴 [ทางเลือกที่ 2] ถ้าก้อนย่อยสั่งปิด (enable: false) หรือไม่มีก้อนนี้อยู่
+            # ระบบจะ "ข้าม" การเช็กคีย์ใน self.node_cfg ไปเลยทันที! เพื่อป้องกันลูปนอกดึงค่ามาคลี่ทับชั้น
+            else:
+                # บังคับร่วงลงมาหาค่าที่ GLOBAL_CLEAN ด้านล่างนี้โดยตรง ไม่แวะข้างทางครับพี่
+                pass
 
-        if self._get_node_free_gb() <= 0.01:
-            if age_hours >= 2: 
-                return True
+            # 🌐 [ประตูทางออกสากล] ดึงค่าจาก GLOBAL_CLEAN (หรือค่า Default สำรอง) เสมอ
+            return self.global_cfg.get(key.lower(), self.global_cfg.get(key.upper(), default))
 
-        min_ratio = get_cfg_value('min_ratio', 1.0) / threshold_div
-        min_time = (get_cfg_value('min_time', 360) / 60) / threshold_div
-        max_time = (get_cfg_value('max_time', 1440) / 60) / threshold_div
+        # 🔄 โหลดเกณฑ์การตัดสินใจทั้งหมด
+        min_ratio = float(get_cfg_value('min_ratio', 1.5))
+        min_time = float(get_cfg_value('min_time', 720)) / 60.0
+        max_time = float(get_cfg_value('max_time', 1440)) / 60.0
+        max_idle_hours = float(get_cfg_value('max_idle_hours', 6))
+        min_active_speed = float(get_cfg_value('min_active_speed_kb', 50)) * 1024
 
+        is_completely_idle = (up_speed < min_active_speed and leechers == 0)
+
+        # 👻 [ด่านพิเศษ: Ghost Torrent Safeguard] ดักจับทอร์เรนต์ผี/ข้อมูลเวลาเพี้ยนจาก rTorrent
+        # หากหลุดรอดจากระบบหลักมาได้ แต่อายุเพี้ยนเกิน 30 วัน หรือติดลบ สั่งดีดทิ้งทันที (คงไว้บนสุดเพื่อความปลอดภัย)
+        if age_hours > 720.0 or age_hours < 0:
+            print(f"👻 [Ghost Detected] ตรวจพบทอร์เรนต์ผี/ข้อมูลเพี้ยน (Age: {age_hours:.1f}h) -> ส่งคำสั่งกวาดล้างทันที")
+            return True
+
+        # 📡 [ด่านที่ 1 (เดิมคือด่าน 2): ปกป้องไฟล์วิ่งแรง] 
+        # ย้ายขึ้นมาอยู่บนสุด! ตราบใดที่สปีดยังวิ่งดี หรือมีคู่สาย บอทจะห้ามลบและปล่อยให้วิ่งต่อทันที โดยไม่สนว่าอายุจะเกิน max_time หรือไม่
+        if not is_completely_idle:
+            return False
+
+        # === หลังจากด่านนี้ แปลว่าไฟล์อยู่ในสถานะนิ่งสนิท (Idle) 100% แล้วเท่านั้น ===
+
+        # 🚨 [ด่านที่ 2 (เดิมคือด่าน 1): เพดานเวลาสูงสุดสำหรับไฟล์ที่นิ่งแล้ว] 
+        # หากไฟล์นิ่งสนิท 100% แล้ว และอายุเดินชนเพดาน max_time สั่งเคลียร์ทิ้งทันทีทุกกรณี
         if age_hours >= max_time:
             return True
 
-        if age_hours >= min_time and ratio >= min_ratio:
+        # 🎯 [ด่านที่ 3: เกณฑ์เวลาขั้นต่ำ สำหรับไฟล์ที่นิ่งแล้ว]
+        if age_hours >= min_time:
+            # เคส 3.1: ทำกำไรแชร์ Ratio ได้ตามเป้าหมายหลักสำเร็จ (เช่น >= 1.5) -> ลบ
+            if ratio >= min_ratio:
+                return True
+            
+            # เคส 3.2: แม้ Ratio จะไม่ถึงเป้า แต่นิ่งและพ้นเกณฑ์ค้ำประกันเวลา (min_time) มาแล้ว -> ลบ
             return True
 
+        # 💤 [ด่านที่ 4: ดักจับขยะตายซากช่วงต้น]
+        # สำหรับไฟล์ที่อายุยังไม่ถึง min_time แต่นอนนิ่งสนิทตั้งแต่ออกตัว ไร้วี่แววคนโหลด (Ratio ต่ำติดดิน < 0.1)
+        # และปล่อยทิ้งไว้จนเวลาเงียบเกินเกณฑ์ (max_idle_hours) แล้ว -> สั่งสับทิ้ง
+        if age_hours >= max_idle_hours and ratio < 0.1:
+            return True
+
+        # มาตรการเซฟตี้สุดท้าย: รอดทุกด่าน ปล่อยให้สี้ดต่อไป
         return False
 
-    def _clean_qbit(self, is_emergency):
+    def _clean_qbit(self):
         res = []
         try:
             headers = {"Accept-Encoding": "gzip, deflate", "Connection": "keep-alive"}
@@ -1463,19 +1572,22 @@ class NodeCleaner:
                 except (ValueError, TypeError):
                     continue
 
-                if self._should_remove(ratio, age_hours, up_speed, leechers, is_emergency):
+                if self._should_remove(ratio, age_hours, up_speed, leechers):
                     if self.node.delete_torrent(t['hash']):
                         raw_name = t.get('name', 'Unknown')
                         name_safeguard = raw_name[:27] + "..." if len(raw_name) > 27 else raw_name
-                        mode_icon = "🚨" if is_emergency else "💤"
-                        line = f"  {mode_icon} {name_safeguard} (R:{ratio:.2f}, {age_hours:.1f}h)"
+                        line = f"  💤 {name_safeguard} (R:{ratio:.2f}, {age_hours:.1f}h)"
                         print(line)
                         res.append(line)
         except Exception as e:
             print(f"⚠️ [{self.node.name}] qBittorrent Fetch Error: {e}")
         return res
 
-    def _clean_rtorrent(self, is_emergency):
+    def _clean_rtorrent(self):
+        if BeautifulSoup is None:
+            print(f"❌ [{self.node.name}] rTorrent Clean Failed: bs4 (BeautifulSoup) is not installed.")
+            return []
+
         res = []
         xml = (
             '<?xml version="1.0"?><methodCall><methodName>d.multicall2</methodName>'
@@ -1489,6 +1601,7 @@ class NodeCleaner:
             '<param><value><string>d.name=</string></value></param></params></methodCall>'
         )
 
+        soup = None
         try:
             req_headers = getattr(self.node, 'headers', {}).copy()
             if "Connection" not in req_headers:
@@ -1499,45 +1612,69 @@ class NodeCleaner:
                 return []
 
             soup = BeautifulSoup(r.text, "xml")
-            param_values = soup.find_all('value')
+            
+            # 🎯 [Rock-Solid XML Traversal]: ใช้ find_all สากลของ bs4 ดักหาแท็ก <data> ชั้นใน
+            torrent_datasets = soup.find_all("data")
+            
+            target_loops = []
+            for d in torrent_datasets:
+                # กรองคัดเลือกเฉพาะก้อนข้อมูลทอร์เรนต์รายตัวที่แท้จริง
+                parent_val = d.find_parent("value")
+                if parent_val and parent_val.find_parent("array"):
+                    # ข้อมูลไอเทมข้างใน multicall2 จะอยู่ในแท็ก <value> ที่เป็นลูกตรงของ <data> ชั้นในสุด
+                    target_loops.extend(d.find_all("value", recursive=False))
+
+            # ⚡ มาตรการสำรองชัวร์ที่สุด: ถ้าโครงสร้างซับซ้อนเกินไป ให้ใช้การเจาะเลเยอร์ CSS Selector ตรงๆ
+            if not target_loops:
+                target_loops = soup.select("value > array > data > value > array > data > value")
+
             now = time.time()
 
-            for p_val in param_values:
-                inner_array = p_val.find('array')
+            for item in target_loops:
+                # มองหาชุดข้อมูลที่เป็นลูกใน <array> ของไอเทมแต่ละตัว
+                inner_array = item.find('array')
                 if not inner_array:
                     continue
                 
-                vals = [v.get_text().strip() for v in inner_array.find_all('value')]
-                if len(vals) < 6:
+                val_nodes = inner_array.find_all('value', recursive=False)
+                if len(val_nodes) < 6:
                     continue
 
+                vals = [v.get_text().strip() for v in val_nodes]
                 t_hash, t_ratio_raw, t_finish, t_uprate, t_peers, t_name = vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]
 
+                # 🛡️ [Anti-Ghost Safeguard]: ดักจับค่าแฝง
                 if not t_finish.isdigit() or int(t_finish) <= 0: 
                     continue
 
                 try:
                     ratio = int(t_ratio_raw) / 1000 if t_ratio_raw.isdigit() else 0.0
-                    age_hours = (now - int(t_finish)) / 3600
+                    
+                    ts_val = int(t_finish)
+                    # ⏳ เกราะค้ำประกันเวลา: ถ้าวินาทีต่ำกว่าปี 2001 (เช่น หลุดเศษเลข 17, 18 วินาทีมา) ให้เตะทิ้งทันที
+                    if ts_val < 1000000000: 
+                        continue
+                        
+                    age_hours = (now - ts_val) / 3600
                     up_speed = int(t_uprate) if t_uprate.isdigit() else 0
                     leechers = int(t_peers) if t_peers.isdigit() else 0
                 except (ValueError, TypeError):
                     continue
 
-                if self._should_remove(ratio, age_hours, up_speed, leechers, is_emergency):
+                if self._should_remove(ratio, age_hours, up_speed, leechers):
                     if self.node.delete_torrent(t_hash):
                         name_safeguard = t_name[:27] + "..." if len(t_name) > 27 else t_name
-                        mode_icon = "🚨" if is_emergency else "💤"
-                        line = f"  {mode_icon} {name_safeguard} (R:{ratio:.2f}, {age_hours:.1f}h)"
+                        line = f"   💤 {name_safeguard} (R:{ratio:.2f}, {age_hours:.1f}h)"
                         print(line)
                         res.append(line)
 
-            soup.decompose()
         except Exception as e:
             print(f"⚠️ [{self.node.name}] rTorrent Clean Error: {str(e)}")
+        finally:
+            if soup is not None:
+                soup.decompose()
             
         return res
-
 
 # ========================= Smart Reclaim Space (Hardened Version) =========================
 
@@ -3265,9 +3402,11 @@ def main():
                     node.refresh_status()
                     pre_free = node.free_gb  # เก็บค่าพื้นที่ "ก่อนลบ"
 
-                    # 2. เริ่ม Cleanup (ส่งแรงกระตุ้นให้โหมด Emergency ทำงาน)
-                    # ตรวจสอบให้แน่ใจว่าได้อัปเดตคลาส NodeCleaner ให้รับค่า is_emergency แล้ว
-                    NodeCleaner(node, n_cfg.get('clean_settings', {}), global_clean).process()
+                    # ตรวจสอบสภาวะวิกฤตล่วงหน้าจากลูปหลัก (ตัวอย่างเช่น ดิสก์เหลือน้อยกว่าขั้นต่ำ หรือระบบตั้งค่าสั่ง Force มา)
+                    is_system_emergency = pre_free < 15.0 
+
+                    # 2. เริ่ม Cleanup (ส่งตัวแปรควบคุมเข้าไปกระตุ้นโหมด Emergency ผ่านเมธอด process)
+                    NodeCleaner(node, n_cfg.get('clean_settings', {}), global_clean).process(force_emergency=is_system_emergency)
 
                     # 3. ให้เวลาระบบไฟล์คืนพื้นที่ และอัปเดต Tracker
                     time.sleep(2)
@@ -3649,13 +3788,24 @@ def main():
 
                                                 # 2. เช็คพื้นที่สุทธิ
                                                 effective_free_gb = node_obj.free_gb - node_obj.get_downloading_size()
-                                                if effective_free_gb < (t_size_gb + 15.0):
-                                                    print(f" 🧹 พื้นที่น้อยไป... พยายาม Reclaim")
-                                                    smart_reclaim_process(node_obj, t_size_gb)
-                                                    node_obj.refresh_status() # อัปเดตหลังลบ
+    
+                                                # กำหนดเกณฑ์บัฟเฟอร์ความปลอดภัยขั้นต่ำ (Safe Margin) ป้องกันค่าดิสก์สวิงไปชนเขต Emergency ของลูปอื่น
+                                                safe_buffer = 15.0
+                                                if effective_free_gb < (t_size_gb + safe_buffer):
+                                                    print(f" 🧹 [Effective Space Low] {node_obj.name} สุทธิเหลือ {effective_free_gb:.1f}GB -> พยายามใช้ Bulk Reclaim เคลียร์ทาง")
+        
+                                                    # ส่งพารามิเตอร์ขนาดที่ระบบต้องการทวงคืนสุทธิ เพื่อให้ฟังก์ชันลบไฟล์ประมวลผลได้อย่างแม่นยำ
+                                                    smart_reclaim_process(node_obj, required_gb=(t_size_gb + safe_buffer), is_emergency=False)
+        
+                                                    # 🔄 [Fixed 1]: อัปเดตข้อมูลฮาร์ดแวร์จริงทันทีหลังยิงคำสั่งลบแบบกลุ่มจบ
+                                                    node_obj.refresh_status() 
+        
+                                                    # 🔄 [Fixed 2]: คำนวณเนื้อที่สุทธิ (หักลบงานกำลังโหลด) ใหม่อีกรอบหลังลบ เพื่อดูความจุที่แท้จริง
+                                                    effective_free_gb = node_obj.free_gb - node_obj.get_downloading_size()
 
-                                                    if node_obj.free_gb < (t_size_gb + 2.0):
-                                                        print(f" ❌ พื้นที่ยังไม่พอ... ลอง Node ถัดไป")
+                                                    # เช็คด่านสุดท้ายอิงตามพื้นที่สุทธิที่คำนวณใหม่ ต้องไม่ต่ำกว่าเกณฑ์ความจุไฟล์ + บัฟเฟอร์ขั้นต่ำ (เช่น 5-10 GB)
+                                                    if effective_free_gb < (t_size_gb + 5.0):
+                                                        print(f" ❌ [Space Insufficient] {node_obj.name} ทวงคืนพื้นที่สุทธิแล้วยังไม่ปลอดภัยพอ ({effective_free_gb:.1f}GB) -> ลอง Node ถัดไป")
                                                         continue
 
                                                 # ✅ 3. ดำเนินการ Add ไฟล์ทันทีที่เจอ Node ที่เหมาะสม
