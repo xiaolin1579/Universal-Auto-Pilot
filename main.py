@@ -2437,6 +2437,13 @@ def get_site_stats(page, site_cfg):
 
         page.wait_for_timeout(2000)
         soup = BeautifulSoup(page.content(), 'html.parser')
+        
+        # 🎯 [เกราะป้องกันชั้นที่ 1]: สกัดแกะไอเทมทันที ณ วินาทีนี้ เก็บใส่ตัวแปรไว้ก่อนเลย!
+        # ป้องกันไม่ให้ฟังก์ชัน Diff หรือฟังก์ชัน Snapshot ด้านล่างแอบมาโยกหน้าเว็บหนี
+        bearbit_item_cache = "NONE"
+        if 'bearbit' in site.lower():
+            bearbit_item_cache = get_bearbit_item_status(soup)
+
         text = soup.get_text(separator=" ")
 
         # ฟังก์ชันสกัด Regex ภายใน
@@ -2481,9 +2488,8 @@ def get_site_stats(page, site_cfg):
         msg.append(f"📤 Up: {curr_data['up']} | 📥 Dl: {curr_data['dl']}")
         
         if 'bearbit' in site.lower():
-            # 🎯 [Fixed True-Source] ส่ง index_soup หน้าแรกเวอร์ชันอัปเดตสดๆ ไปแกะไอเทมซานต้า รับประกันความแม่นยำ 100%
-            item_info = get_bearbit_item_status(index_soup) 
-            msg.append(f"💰 Bonus: {curr_data['bonus']} | 🎁 Item: {item_info}")
+            # 🎯 [เกราะป้องกันชั้นที่ 2]: ดึงข้อมูลจากแคชตัวแปรที่ดักสกัดไว้ด้านบนมาพ่นออกรายงานตรงๆ
+            msg.append(f"💰 Bonus: {curr_data['bonus']} | 🎁 Item: {bearbit_item_cache}")
         else:
             msg.append(f"💰 Bonus: {curr_data['bonus']}")
 
@@ -2894,7 +2900,7 @@ def check_item_urgency(exp_time_str):
     except:
         return False
 
-RE_ITEM_ROW = re.compile(r"สถานะไอเทม|Item Status", re.I)
+RE_ITEM_ROW = re.compile(r"Item\s*Status|สถานะ\s*ไอเทม", re.I)
 RE_EXP_DATE = re.compile(r"(\d{2}[-/]\d{2}[-/]\d{4}\s+\d{2}:\d{2}:\d{2})")
 
 def get_bearbit_item_status(soup):
@@ -2902,57 +2908,61 @@ def get_bearbit_item_status(soup):
         active_item = "NONE"
         display_exp = "N/A"
 
-        # ⚡ [Hardened]: tag.name.lower() รองรับทั้ง td และ TD ป้องกันโค้ดข้ามแท็กตัวพิมพ์ใหญ่
-        item_row = soup.find(
-            lambda tag: tag.name and tag.name.lower() == "td" and RE_ITEM_ROW.search(tag.get_text())
-        )
+        # ⚡ ขั้นเด็ดขาด: หา Element ใดๆ ก็ตามที่มีคำว่า Item Status หรือ สถานะไอเทม อยู่ข้างใน
+        # วิธีนี้จะครอบคลุมทุกแท็ก ไม่ว่าจะเป็น td, b, font, span หรือ tr
+        target_element = soup.find(string=RE_ITEM_ROW)
         
-        if item_row:
-            target_td = item_row.find_next_sibling("td")
-            if not target_td:
-                return "NONE"
-                
-            # เคลียร์เศษ White space และสัญลักษณ์ช่องว่างพิเศษจาก HTML
-            full_text = target_td.get_text(" ", strip=True).replace("\xa0", " ")
+        if target_element:
+            # วิ่งหาแท็กบรรพบุรุษที่ใกล้ที่สุดเพื่อกวาดเนื้อหาในบล็อกตารางรอบข้างทั้งหมดมาวิเคราะห์
+            # ป้องกันปัญหา find_next('td') แล้วเจอช่องว่างหรือเจอแท็กคั่น
+            parent_context = target_element.find_parent(["tr", "table"])
+            if parent_context:
+                full_text = parent_context.get_text(" ", strip=True).replace("\xa0", " ")
+                clean_text = " ".join(full_text.split())
+            else:
+                # กรณีหาแท็กครอบไม่เจอ ให้ดึง Text จากจุดนั้นยาวลงไปด้านล่าง 300 ตัวอักษรดักไว้เลย
+                full_text = target_element.find_next().get_text(" ", strip=True)
+                clean_text = " ".join(full_text.split())
+        else:
+            # 🛡️ เกราะสำรองชั้นสุดท้าย: ถ้าหาจาก Element ไม่เจอ ให้สแกนดึงจาก text รวมของ soup เลย
+            full_text = soup.get_text(" ", strip=True).replace("\xa0", " ")
+            clean_text = " ".join(full_text.split())
 
-            # --- แมปปิ้งไอเทมตามคีย์เวิร์ด ---
-            item_map = {
-                "FREELOAD_100": ["ซานตาคลอส", "100%", "Santa Claus"],
-                "FREELOAD_50": ["ตุ๊กตาซานต้า", "50%", "Santa Doll"],
-                "FREELOAD_15": ["หยินหยาง", "15%", "Yin Yang"],
-                "FREELOAD_10": ["แหวนครองพิภพ", "10%", "One Ring"]
-            }
+        # 🎯 ลอจิกการจับคู่ไอเทม (เพิ่มความทนทาน ค้นหาในกลุ่มข้อความที่กวาดมาได้กว้างขึ้น)
+        item_map = {
+            "FREELOAD_100": ["ซานตาคลอส", "100%", "Santa Claus"],
+            "FREELOAD_50": ["ตุ๊กตาซานต้า", "50%", "Santa Doll"], 
+            "FREELOAD_15": ["หยินหยาง", "15%", "Yin Yang"],
+            "FREELOAD_10": ["แหวนครองพิภพ", "10%", "One Ring"]
+        }
 
-            for key, keywords in item_map.items():
-                if any(k in full_text for k in keywords):
-                    active_item = key
-                    break
+        # สแกนหาไอเทมที่ทำงานอยู่
+        for key, keywords in item_map.items():
+            if any(k in clean_text for k in keywords):
+                active_item = key
+                break
 
-            # ดึงวันเวลาหมดอายุด้วย Pre-compiled Regex
-            exp_match = RE_EXP_DATE.search(full_text)
-            if exp_match:
-                raw_exp = exp_match.group(1).replace("/", "-")
-                display_exp = raw_exp
-                
-                # 🛡️ [Fail-Safe ย่อย]: ครอบป้องกันเผื่อฟังก์ชันคำนวณเวลาขัดข้อง
+        # ดึงวันเวลาหมดอายุด้วย Regex
+        exp_match = RE_EXP_DATE.search(clean_text)
+        if exp_match:
+            display_exp = exp_match.group(1).replace("/", "-")
+            
+            try:
+                if 'check_item_urgency' in globals() and check_item_urgency(display_exp):
+                    display_exp += " ⚠️ ใกล้หมดอายุ!"
+            except Exception as time_err:
+                display_exp += " (Time Check Error)"
+
+        # ส่งสัญญาณไปอัปเดตคอนฟิกบอทหลัก
+        if active_item != "NONE":
+            if 'update_bot_config' in globals():
                 try:
-                    if 'check_item_urgency' in globals() and check_item_urgency(raw_exp):
-                        display_exp += " ⚠️ ใกล้หมดอายุ!"
-                except Exception as time_err:
-                    print(f"⚠️ [Time Check Warning] {time_err}")
-                    display_exp += " (Time Check Error)"
-
-            # ทำการอัปเดตคอนฟิกและคืนค่าผลลัพธ์
-            if active_item != "NONE":
-                if 'update_bot_config' in globals():
-                    try:
-                        update_bot_config(active_item)
-                    except Exception as cfg_err:
-                        print(f"⚠️ [Config Update Warning] {cfg_err}")
-                
-                # คืนค่าไอเทมเสมอเมื่อเจอคีย์เวิร์ดแมปปิ้ง
-                return f"<b>{active_item}</b> ({display_exp})"
-                
+                    update_bot_config(active_item)
+                except Exception as cfg_err:
+                    print(f"⚠️ [Config Update Warning] {cfg_err}")
+            
+            return f"{active_item} ({display_exp})"
+            
         return "NONE"
     except Exception as e:
         return f"ERROR ({str(e)[:20]})"
