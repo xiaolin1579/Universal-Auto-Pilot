@@ -1484,69 +1484,53 @@ class NodeCleaner:
 
     def _should_remove(self, ratio, age_hours, up_speed, leechers):
         def get_cfg_value(key, default):
-            # 1. ดึงก้อนย่อยออกมาเช็กสถานะการใช้งาน
             clean_sets = self.node_cfg.get('clean_settings', {})
-            
-            # 🟢 [ทางเลือกที่ 1] ถ้าเปิดใช้งานเฉพาะโหนด (enable: true) -> บังคับดึงในนี้เท่านั้น
             if clean_sets and clean_sets.get('enable', False) is True:
-                if key in clean_sets:
-                    return clean_sets[key]
-                if key.upper() in clean_sets:
-                    return clean_sets[key.upper()]
-                # หมายเหตุ: ถ้าใน clean_settings ไม่มีคีย์นั้น ให้ไหลลงไปเอาค่า Global ด้านล่างสุดได้
-                
-            # 🔴 [ทางเลือกที่ 2] ถ้าก้อนย่อยสั่งปิด (enable: false) หรือไม่มีก้อนนี้อยู่
-            # ระบบจะ "ข้าม" การเช็กคีย์ใน self.node_cfg ไปเลยทันที! เพื่อป้องกันลูปนอกดึงค่ามาคลี่ทับชั้น
-            else:
-                # บังคับร่วงลงมาหาค่าที่ GLOBAL_CLEAN ด้านล่างนี้โดยตรง ไม่แวะข้างทางครับพี่
-                pass
-
-            # 🌐 [ประตูทางออกสากล] ดึงค่าจาก GLOBAL_CLEAN (หรือค่า Default สำรอง) เสมอ
+                if key in clean_sets: return clean_sets[key]
+                if key.upper() in clean_sets: return clean_sets[key.upper()]
             return self.global_cfg.get(key.lower(), self.global_cfg.get(key.upper(), default))
 
-        # 🔄 โหลดเกณฑ์การตัดสินใจทั้งหมด
         min_ratio = float(get_cfg_value('min_ratio', 1.5))
         min_time = float(get_cfg_value('min_time', 720)) / 60.0
         max_time = float(get_cfg_value('max_time', 1440)) / 60.0
         max_idle_hours = float(get_cfg_value('max_idle_hours', 6))
-        min_active_speed = float(get_cfg_value('min_active_speed_kb', 50)) * 1024
-
+        
+        # 📡 [ปรับจุดที่ 1]: ปรับเพิ่มเกณฑ์สปีดขั้นต่ำเล็กน้อย (เช่น 5 KB/s) เพื่อป้องกันเศษสปีดแกว่งตอน Sync Tracker ดึงขาลอจิก
+        min_active_speed = 5.0 * 1024  # บังคับขั้นต่ำ 5 KB/s ถ้าน้อยกว่านี้ถือว่านิ่งสนิทจริง
         is_completely_idle = (up_speed < min_active_speed and leechers == 0)
 
-        # 👻 [ด่านพิเศษ: Ghost Torrent Safeguard] ดักจับทอร์เรนต์ผี/ข้อมูลเวลาเพี้ยนจาก rTorrent
-        # หากหลุดรอดจากระบบหลักมาได้ แต่อายุเพี้ยนเกิน 30 วัน หรือติดลบ สั่งดีดทิ้งทันที (คงไว้บนสุดเพื่อความปลอดภัย)
+        # 👻 Ghost Torrent Safeguard
         if age_hours > 720.0 or age_hours < 0:
-            print(f"👻 [Ghost Detected] ตรวจพบทอร์เรนต์ผี/ข้อมูลเพี้ยน (Age: {age_hours:.1f}h) -> ส่งคำสั่งกวาดล้างทันที")
             return True
 
-        # 📡 [ด่านที่ 1 (เดิมคือด่าน 2): ปกป้องไฟล์วิ่งแรง] 
-        # ย้ายขึ้นมาอยู่บนสุด! ตราบใดที่สปีดยังวิ่งดี หรือมีคู่สาย บอทจะห้ามลบและปล่อยให้วิ่งต่อทันที โดยไม่สนว่าอายุจะเกิน max_time หรือไม่
+        # ด่านที่ 1: ปกป้องไฟล์วิ่งแรง (ถ้าวิ่งเกิน 5 KB/s และมีคนดูด ห้ามลบ)
         if not is_completely_idle:
             return False
 
         # === หลังจากด่านนี้ แปลว่าไฟล์อยู่ในสถานะนิ่งสนิท (Idle) 100% แล้วเท่านั้น ===
 
-        # 🚨 [ด่านที่ 2 (เดิมคือด่าน 1): เพดานเวลาสูงสุดสำหรับไฟล์ที่นิ่งแล้ว] 
-        # หากไฟล์นิ่งสนิท 100% แล้ว และอายุเดินชนเพดาน max_time สั่งเคลียร์ทิ้งทันทีทุกกรณี
+        # 🚨 [ด่านที่ 2]: เพดานเวลาสูงสุด (เซฟตี้ขยะค้างฟ้า - ชน 24 ชม. ปลิวทันทีไม่สนเกณฑ์ใดๆ)
         if age_hours >= max_time:
+            print(f"🚨 [Max Time Exceeded] อายุ {age_hours:.1f}h ชนเพดานสูงสุด {max_time:.1f}h -> สั่งสับทิ้ง")
             return True
 
-        # 🎯 [ด่านที่ 3: เกณฑ์เวลาขั้นต่ำ สำหรับไฟล์ที่นิ่งแล้ว]
+        # 💤 [ด่านที่ 3]: ดักจับขยะตายซาก (สลับขึ้นมาเหนือด่านเงื่อนไขคู่ เพื่อล้างบางพวกไร้วี่แววคนโหลด)
+        # ตราบใดที่อายุนิ่งเกินเกณฑ์ (6 ชม.) และ Ratio ต่ำติดดิน (< 0.1) สั่งสับทิ้งทันที ไม่ต้องให้อยู่จนแก่
+        if age_hours >= max_idle_hours and ratio < 0.1:
+            print(f"💤 [Idle Dead] ขยะนอนนิ่งตั้งแต่ออกตัว อายุ {age_hours:.1f}h (Ratio: {ratio:.2f}) -> สั่งลบ")
+            return True
+
+        # 🎯 [ด่านที่ 4]: เกณฑ์อัปเกรดใหม่ของพี่ (min_ratio + min_time = ลบ)
+        # ไฟล์ที่จะผ่านมาถึงด่านนี้ได้ แปลว่าต้องเป็นไฟล์ที่มีประโยชน์ (Ratio >= 0.1) เท่านั้น
         if age_hours >= min_time:
-            # เคส 3.1: ทำกำไรแชร์ Ratio ได้ตามเป้าหมายหลักสำเร็จ (เช่น >= 1.5) -> ลบ
             if ratio >= min_ratio:
+                print(f"💰 [Target Reached] อายุพ้นเกณฑ์ ({age_hours:.1f}h >= {min_time}h) + Ratio ({ratio:.2f} >= {min_ratio}) ชนเป้าคู่ -> เคลียร์พื้นที่")
                 return True
             
-            # เคส 3.2: แม้ Ratio จะไม่ถึงเป้า แต่นิ่งและพ้นเกณฑ์ค้ำประกันเวลา (min_time) มาแล้ว -> ลบ
-            return True
+            # 💡 [Option เสริมค้ำประกันดิสก์]: ถ้าอายุเกิน min_time แล้วแต่ Ratio ยังไม่ถึงเป้า 1.5 
+            # บอทจะยังไม่ลบ เพื่อปล่อยให้อุ้มสี้ดทำกำไรต่อไปจนกว่าจะไปชนเพดาน max_time 24 ชม. ด้านบน
+            return False
 
-        # 💤 [ด่านที่ 4: ดักจับขยะตายซากช่วงต้น]
-        # สำหรับไฟล์ที่อายุยังไม่ถึง min_time แต่นอนนิ่งสนิทตั้งแต่ออกตัว ไร้วี่แววคนโหลด (Ratio ต่ำติดดิน < 0.1)
-        # และปล่อยทิ้งไว้จนเวลาเงียบเกินเกณฑ์ (max_idle_hours) แล้ว -> สั่งสับทิ้ง
-        if age_hours >= max_idle_hours and ratio < 0.1:
-            return True
-
-        # มาตรการเซฟตี้สุดท้าย: รอดทุกด่าน ปล่อยให้สี้ดต่อไป
         return False
 
     def _clean_qbit(self):
@@ -1589,6 +1573,7 @@ class NodeCleaner:
             return []
 
         res = []
+        # 🔄 XML มาตรฐานสำหรับดึงข้อมูล 6 คีย์หลัก
         xml = (
             '<?xml version="1.0"?><methodCall><methodName>d.multicall2</methodName>'
             '<params><param><value><string></string></value></param>'
@@ -1597,7 +1582,7 @@ class NodeCleaner:
             '<param><value><string>d.ratio=</string></value></param>'
             '<param><value><string>d.timestamp.finished=</string></value></param>'
             '<param><value><string>d.up.rate=</string></value></param>'
-            '<param><value><string>d.peers_accounted=</string></value></param>'
+            '<param><value><string>d.incomplete=</string></value></param>'
             '<param><value><string>d.name=</string></value></param></params></methodCall>'
         )
 
@@ -1613,58 +1598,59 @@ class NodeCleaner:
 
             soup = BeautifulSoup(r.text, "xml")
             
-            # 🎯 [Rock-Solid XML Traversal]: ใช้ find_all สากลของ bs4 ดักหาแท็ก <data> ชั้นใน
-            torrent_datasets = soup.find_all("data")
-            
-            target_loops = []
-            for d in torrent_datasets:
-                # กรองคัดเลือกเฉพาะก้อนข้อมูลทอร์เรนต์รายตัวที่แท้จริง
-                parent_val = d.find_parent("value")
-                if parent_val and parent_val.find_parent("array"):
-                    # ข้อมูลไอเทมข้างใน multicall2 จะอยู่ในแท็ก <value> ที่เป็นลูกตรงของ <data> ชั้นในสุด
-                    target_loops.extend(d.find_all("value", recursive=False))
-
-            # ⚡ มาตรการสำรองชัวร์ที่สุด: ถ้าโครงสร้างซับซ้อนเกินไป ให้ใช้การเจาะเลเยอร์ CSS Selector ตรงๆ
-            if not target_loops:
-                target_loops = soup.select("value > array > data > value > array > data > value")
+            # 🎯 เจาะเข้าหากลุ่มข้อมูลทอร์เรนต์รายตัว (ห่อหุ้มชั้นในสุดของ multicall2 response)
+            items = soup.select("methodResponse > params > param > value > array > data > value")
+            if not items:
+                items = soup.select("value > array > data > value")
 
             now = time.time()
 
-            for item in target_loops:
-                # มองหาชุดข้อมูลที่เป็นลูกใน <array> ของไอเทมแต่ละตัว
-                inner_array = item.find('array')
-                if not inner_array:
-                    continue
+            for item in items:
+                # 🎯 [แก้ไขจุดคอขวด]: เจาะลงไปที่แท็ก data ชั้นในสุดของแต่ละไอเทม เพื่อดึงข้อมูลพารามิเตอร์โดยตรง
+                t_data = item.find('data')
+                if not t_data:
+                    # มาตรการสำรองหากไม่มีแท็ก data ซ้อน
+                    t_data = item.find('array') if item.find('array') else item
+                    
+                val_nodes = t_data.find_all('value', recursive=False)
                 
-                val_nodes = inner_array.find_all('value', recursive=False)
-                if len(val_nodes) < 6:
+                vals = []
+                for v in val_nodes:
+                    inner_data = v.find(['string', 'i4', 'int'])
+                    if inner_data:
+                        vals.append(inner_data.get_text().strip())
+                    else:
+                        vals.append(v.get_text().strip())
+
+                if len(vals) < 6:
                     continue
 
-                vals = [v.get_text().strip() for v in val_nodes]
-                t_hash, t_ratio_raw, t_finish, t_uprate, t_peers, t_name = vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]
+                # 🎯 แมตช์ตัวแปรตรงพิกัด 100%
+                t_hash, t_ratio_raw, t_finish, t_uprate, t_leechers_raw, t_name = vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]
 
-                # 🛡️ [Anti-Ghost Safeguard]: ดักจับค่าแฝง
-                if not t_finish.isdigit() or int(t_finish) <= 0: 
+                if not t_finish: 
                     continue
 
                 try:
                     ratio = int(t_ratio_raw) / 1000 if t_ratio_raw.isdigit() else 0.0
-                    
                     ts_val = int(t_finish)
-                    # ⏳ เกราะค้ำประกันเวลา: ถ้าวินาทีต่ำกว่าปี 2001 (เช่น หลุดเศษเลข 17, 18 วินาทีมา) ให้เตะทิ้งทันที
-                    if ts_val < 1000000000: 
-                        continue
+                    
+                    # ⏳ จัดการทอร์เรนต์ผี/ข้อมูลเอ๋อ
+                    if ts_val <= 0:
+                        age_hours = 9999.0  
+                    else:
+                        age_hours = (now - ts_val) / 3600
                         
-                    age_hours = (now - ts_val) / 3600
                     up_speed = int(t_uprate) if t_uprate.isdigit() else 0
-                    leechers = int(t_peers) if t_peers.isdigit() else 0
+                    leechers = int(t_leechers_raw) if t_leechers_raw.isdigit() else 0
                 except (ValueError, TypeError):
                     continue
 
+                # ยิงเข้าด่านวิเคราะห์ความเหมาะสมในการลบ
                 if self._should_remove(ratio, age_hours, up_speed, leechers):
                     if self.node.delete_torrent(t_hash):
                         name_safeguard = t_name[:27] + "..." if len(t_name) > 27 else t_name
-                        line = f"   💤 {name_safeguard} (R:{ratio:.2f}, {age_hours:.1f}h)"
+                        line = f"    🧹 เคลียร์: {name_safeguard} (R:{ratio:.2f}, {age_hours:.1f}h)"
                         print(line)
                         res.append(line)
 
