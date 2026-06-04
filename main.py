@@ -3546,29 +3546,48 @@ def main():
                                 count_skip = 0    # นับจำนวนที่ข้าม
                         
                                 # ดึงรายการ Torrent
-                                all_details = soup.find_all("a", href=re.compile(r"details(new)?\.php\?id=\d+"))
                                 rows = []
+                                all_trs = soup.find_all("tr")
 
-                                # --- วนลูปสกัดเฉพาะรายการไฟล์จริง ---
-                                for a in all_details:
-                                    # 1. เช็คชื่อไฟล์เบื้องต้น
-                                    t_text = a.get_text(strip=True)
-                                    if len(t_text) <= 5: continue
-    
-                                    # 2. ป้องกันการดึงสถิติผู้ใช้ (Ratio, Bonus, User Profile)
-                                    # ปกติสถิติพวกนี้มักจะมีคำเฉพาะ หรืออยู่ใน ID/Class ที่ต่างออกไป
-                                    parent_tr = a.find_parent("tr")
-    
-                                    if parent_tr and parent_tr not in rows:
-                                        # ตรวจสอบว่าในแถว (row) นั้นมีคำบ่งชี้ว่าเป็นข้อมูลส่วนตัวหรือไม่
-                                        row_raw_text = parent_tr.get_text().lower()
-                                        user_stat_keywords = ['ratio:', 'bonus:', 'upload:', 'download:', 'อัพโหลด:', 'ดาวน์โหลด:']
-        
-                                        # ถ้าในแถวมีคำพวกนี้ ให้ข้ามไปเลย เพราะไม่ใช่แถวของ Torrent
-                                        if any(key in row_raw_text for key in user_stat_keywords):
+                                for tr in all_trs:
+                                    tr_str = str(tr)
+                                    
+                                    # คัดกรองขั้นแรก: แถวทอร์เรนต์จริงของ BearBit/TorrentDD ต้องมีลิงก์รายละเอียดไฟล์อยู่ในแถวชัวร์ๆ
+                                    if "details.php?id=" not in tr_str and "detailsnew.php?id=" not in tr_str:
+                                        continue
+                                        
+                                    # 1. 🛡️ ตัดแถวโปรไฟล์ผู้ใช้/แถบสถิติด้านบนออกอย่างเด็ดขาด (เช็คจากหน้าuserdetails.php)
+                                    if tr.find("a", href=re.compile(r"userdetails\.php", re.I)):
+                                        continue
+                                        
+                                    # 2. 🛡️ เช็คคีย์เวิร์ดสถิติส่วนตัวด้านบนสุด (ตรวจเฉพาะแถวที่ไม่มีคอลัมน์ทอร์เรนต์จริง)
+                                    tr_text_lower = tr.get_text().lower()
+                                    all_tds = tr.find_all("td")
+                                    
+                                    # แถวทอร์เรนต์ของ BearBit/TorrentDD จะต้องมีคอลัมน์ (td) ค่อนข้างเยอะ (ปกติ > 8 คอลัมน์ขึ้นไปตามรูป)
+                                    # ถ้าคอลัมน์น้อยแสดงว่าเป็นแถวสถิติ แถวล็อกอิน หรือแถวแจ้งเตือนระบบด้านบน แน่นอน
+                                    if len(all_tds) < 6:
+                                        strict_user_keywords = ['ratio:', 'bonus:', 'upload:', 'download:', 'อัพโหลด:', 'ดาวน์โหลด:']
+                                        if any(key in tr_text_lower for key in strict_user_keywords):
                                             continue
-            
-                                        rows.append(parent_tr)
+                                            
+                                    # 3. 🎯 [อัปเกรดใหม่ - เหนียวแน่นหนึบ] ยืนยันแถวไฟล์ทอร์เรนต์จริง
+                                    # เช็คลิงก์ดาวน์โหลดมาตรฐาน (รองรับ download.php, d.php, download_vip.php, download_file.php)
+                                    has_download_link = tr.find("a", href=re.compile(r"(download(?:_[a-zA-Z0-9]+)?|d)\.php", re.I)) or \
+                                                        tr.find("button", onclick=re.compile(r"download", re.I))
+                                    
+                                    # 🟢 [Backup Check]: ถ้าจาก href ปกติยังไม่เจอ ให้เช็คจาก คลาสของปุ่ม หรือ ตัวหนังสือภาษาไทยบนปุ่มดาวน์โหลด VIP ตรงๆ
+                                    if not has_download_link:
+                                        has_download_link = tr.find("a", class_=re.compile(r"dl|vip|green|blue|btn", re.I)) or \
+                                                            tr.find("a", string=re.compile(r"ปุ่มดาวน์โหลด|ดาวน์โหลดสำหรับ", re.I))
+
+                                    # เช็คตัวบ่งชี้ขนาดไฟล์ในตารางแถวนั้น
+                                    has_size_indicator = re.search(r'\d+(?:\.\d+)?\s*(GB|MB|TB)', tr_text_lower, re.I)
+                                    
+                                    # 🔥 ถ้ามีปุ่ม/ลิงก์ดาวน์โหลดรูปแบบใดรูปแบบหนึ่ง และระบุขนาดไฟล์ ดึงเข้าคิวสแกนทันที!
+                                    if has_download_link and has_size_indicator:
+                                        if tr not in rows:
+                                            rows.append(tr)
                                 # --- วนลูปรายไฟล์ในโซน ---
                                 for row in rows:
                                     try:
