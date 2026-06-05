@@ -2511,7 +2511,7 @@ def extract_torrent_data(row, base_url, dl_session=None, headers=None):
     row_text = row.get_text(separator=' ', strip=True)
     all_tds = row.find_all("td")
     
-    # --- 1. สกัด ID & Title (คงเดิม) ---
+    # --- 1. สกัด ID & Title ---
     title_tag = row.find("a", href=re.compile(r"details(?:new)?\.php\?id=(\d+)", re.I))
     t_id, title, details_url = None, "Unknown File", None
     if title_tag:
@@ -2522,72 +2522,60 @@ def extract_torrent_data(row, base_url, dl_session=None, headers=None):
             t_id = match.group(1)
             details_url = f"{base_url.rstrip('/')}/details.php?id={t_id}"
 
-    # --- 2. สถานะ Locked/Sticky (คงเดิม) ---
+    # --- 2. สถานะ Locked/Sticky ---
     is_hard_locked = any(x in row_str for x in ['Locked !!', 'fa-ban'])
     is_sticky = any(x in row_str for x in ['📌', 'sticky', 'Auto Sticky:'])
 
-    # --- 3. 🔥 กลยุทธ์สแกนข้อมูลแบบ Hybrid (เน้นความแม่นยำสูง) ---
+    # --- 3. 🔥 กลยุทธ์สแกนข้อมูล (มุ่งเป้าคอลัมน์วันลงระบบจริง) ---
     l, s, c = 0, 0, 0
     t_size_str = "0 GB"
     raw_date_str = ""
 
-    # วนลูปเช็คข้อมูลทีละคอลัมน์ โดยเลือกเฉพาะคอลัมน์ที่ไม่ใช่ส่วน Responsive (มือถือ)
     for td in all_tds:
-        # กรองคอลัมน์ที่ซ้ำซ้อนออก (TorrentDD ใช้ dp-show สำหรับมือถือ)
         td_class = str(td.get('class', []))
         if 'dp-show' in td_class:
             continue
             
         txt = td.get_text(separator=' ', strip=True)
         
-        # 1. สกัด Size: มองหาหน่วยวัด (Priority 1)
+        # 1. สกัด Size: มองหาหน่วยวัด
         if t_size_str == "0 GB":
             size_match = re.search(r'(\d+(?:\.\d+)?)\s*(GB|MB|TB|KB)', txt, re.I)
             if size_match:
                 t_size_str = f"{size_match.group(1)} {size_match.group(2).upper()}"
         
-        # 2. สกัด Date: มองหาแพทเทิร์นวันที่
-        if not raw_date_str:
+        # 2. สกัด Date จากระบบตารางเว็บจริง
+        # กฎเหล็ก: ข้ามช่องที่มีความยาวตัวอักษรเยอะเกิน 30 ตัว (เพราะนั่นคือช่องชื่อไฟล์ชัวร์ๆ ป้องกันวันที่ปลอม)
+        if len(txt) < 30:
             date_match = re.search(r'(\d{2,4}[-/]\d{2}[-/]\d{2,4})', txt)
             if date_match:
                 time_match = re.search(r'(\d{2}:\d{2}:\d{2})', txt)
+                # ดึงวันลงระบบจริงที่มาพร้อมเวลาคั่นสากล
                 raw_date_str = f"{date_match.group(1)} {time_match.group(1) if time_match else '00:00:00'}"
 
     # --- 4. สกัด Peers (Seeders/Leechers) ---
     try:
-        # กรองคอลัมน์มือถือออกเหมือนเดิม
         clean_tds = [td for td in all_tds if 'dp-show' not in str(td.get('class', []))]
-        
         if len(clean_tds) >= 8:
-            # ขยับตำแหน่งมาทางซ้าย 1 ช่อง เพราะช่องสุดท้ายคือ "ผู้อัพ"
-            s = extract_digit(clean_tds[-3]) # ปล่อย (Seeders)
-            l = extract_digit(clean_tds[-2]) # โหลด (Leechers)
-            c = extract_digit(clean_tds[-4]) # เสร็จ (Completed)
+            s = extract_digit(clean_tds[-3]) 
+            l = extract_digit(clean_tds[-2]) 
+            c = extract_digit(clean_tds[-4]) 
             
-        # ตรวจสอบความสมเหตุสมผล (Sanity Check)
-        # ถ้า Leechers มากเกินปกติ หรือชื่อไฟล์ดันมีตัวเลขที่ทำให้ Regex หลุดมา
-        if l > 10000: 
-            l = 0 # ป้องกันค่าปี ค.ศ. หรือ ID หลุดมาเป็นจำนวนคนโหลด
+        if l > 10000: l = 0 
             
     except Exception as e:
         print(f"⚠️ Error parsing Peers: {e}")
 
     # --- 5. ค้นหาลิงก์ดาวน์โหลด ---
     download_url = None
-
-    # STEP A: หาจากหน้า List (TorrentDD Version)
-    # 1. หาแบบปุ่มทั่วไป (<a>)
     dl_pattern = re.compile(rf"(download(?:new)?|d)\.php\?.*(id|keyalert1)={t_id or ''}", re.I)
     btn_dl = row.find("a", href=dl_pattern)
     
     if not btn_dl:
-        # 2. หาจากปุ่ม <button> (โครงสร้างเฉพาะของ TorrentDD)
-        # มองหาปุ่มที่มีคำสั่ง download.php ใน onclick
         btn_dl = row.find("button", onclick=re.compile(rf"download\.php/{t_id or ''}", re.I))
 
     if btn_dl:
         if btn_dl.name == "button":
-            # สกัด URL จาก onclick: document.location = 'url'
             onclick_str = btn_dl.get('onclick', '')
             url_match = re.search(r"'(.*?)'", onclick_str)
             path = url_match.group(1).lstrip('/') if url_match else ""
@@ -2597,7 +2585,7 @@ def extract_torrent_data(row, base_url, dl_session=None, headers=None):
         if path:
             download_url = f"{base_url.rstrip('/')}/{path}"
 
-    # STEP B: Deep Scan (มุดเข้าหน้า Details)
+    # STEP B: Deep Scan
     if not download_url and details_url and dl_session:
         try:
             local_headers = headers.copy() if headers else {}
@@ -2605,58 +2593,37 @@ def extract_torrent_data(row, base_url, dl_session=None, headers=None):
             local_headers['Referer'] = base_url
             
             resp = dl_session.get(details_url, headers=local_headers, timeout=15)
-            
             if resp.status_code == 200:
                 raw_c = resp.content
-                
-                # 1. จัดการ Gzip
                 if raw_c.startswith(b'\x1f\x8b'):
                     try: raw_c = gzip.decompress(raw_c)
                     except: pass
                 
-                # 2. จัดการ Encoding
                 det = chardet.detect(raw_c)
                 enc = det.get('encoding') or 'tis-620'
-                try:
-                    decoded_html = raw_c.decode(enc, errors='replace')
-                except:
-                    decoded_html = raw_c.decode('tis-620', errors='replace')
+                try: decoded_html = raw_c.decode(enc, errors='replace')
+                except: decoded_html = raw_c.decode('tis-620', errors='replace')
 
                 soup_details = BeautifulSoup(decoded_html, 'html.parser')
-
-                # --- กลยุทธ์ค้นหาปุ่มดาวน์โหลด (รองรับทั้ง <a> และ <button>) ---
-                dl_tag = None
+                dl_tag = soup_details.find("a", href=dl_pattern) or \
+                         soup_details.find("button", onclick=re.compile(rf"download\.php/{t_id}", re.I))
                 
-                # แบบที่ 1: หาจาก <a> มาตรฐาน (BearBit / Unlimitz)
-                # dl_pattern ควรนิยามไว้ก่อนเข้า Step B หรือใช้ re.compile(rf"(download(?:new)?|d)\.php\?.*(id|keyalert1)={t_id}", re.I)
-                dl_tag = soup_details.find("a", href=dl_pattern)
-                
-                # แบบที่ 2: หาจาก <button> onclick (TorrentDD)
-                if not dl_tag:
-                    # มองหา button ที่มีคำว่า download.php และตามด้วย ID
-                    dl_tag = soup_details.find("button", onclick=re.compile(rf"download\.php/{t_id}", re.I))
-
-                # แบบที่ 3: ไม้ตายสุดท้าย (Class หรือ .torrent)
                 if not dl_tag:
                     dl_tag = soup_details.find("a", class_=re.compile(r"bb-dl-btn|index", re.I)) or \
                              soup_details.find("a", href=re.compile(rf"\.torrent.*{t_id}", re.I))
 
-                # --- การสกัด URL จริงจาก Tag ที่พบ ---
                 if dl_tag:
                     action_url = ""
                     if dl_tag.name == "button":
-                        # สกัดค่าระหว่าง '...' ใน onclick
                         onclick_str = dl_tag.get('onclick', '')
                         url_match = re.search(r"'(.*?)'", onclick_str)
-                        if url_match:
-                            action_url = url_match.group(1).strip()
+                        if url_match: action_url = url_match.group(1).strip()
                     else:
                         action_url = dl_tag.get('href', '').strip()
 
                     if action_url:
                         action_url = action_url.lstrip('/')
                         download_url = action_url if action_url.startswith('http') else f"{base_url.rstrip('/')}/{action_url}"
-
         except Exception as e:
             print(f"⚠️ [{t_id}] Error scanning Details: {e}")
 
@@ -3264,10 +3231,10 @@ def is_fresh_and_racing(data, max_age_hours=24):
             print(f" ⏭️ ข้าม: [Locked/Banned] {short_title}")
             return False
 
-        # 2. 🔥 ยุทธศาสตร์สกัดเวลา (Priority Search)
+        # 2. 🔥 ยุทธศาสตร์สกัดเวลา: โฟกัสตารางวันลงของระบบเว็บอย่างเดียว (Pure System Date)
         time_str = ""
         
-        # กฎข้อที่ 1: ถ้าเจอ 'วันนี้' หรือ 'เมื่อวาน' ให้เชื่ออันนี้ก่อน (เพราะสดใหม่แน่นอน)
+        # กฎข้อที่ 1: ตรวจจับ 'วันนี้/เมื่อวาน' ของระบบบอร์ดก่อน (เป็นระเบียบและแน่นอนที่สุด)
         if 'วันนี้' in raw_text:
             t_match = re.search(r'(\d{2}:\d{2}:\d{2})', raw_text)
             time_part = t_match.group(1) if t_match else now.strftime('%H:%M:%S')
@@ -3278,60 +3245,50 @@ def is_fresh_and_racing(data, max_age_hours=24):
             time_part = t_match.group(1) if t_match else "00:00:00"
             time_str = f"{yesterday.strftime('%Y-%m-%d')} {time_part}"
         
-        # กฎข้อที่ 2: ถ้าไม่เจอ ให้ใช้ raw_date ที่สกัดมาจากคอลัมน์วันที่ (ถ้ามี)
+        # กฎข้อที่ 2: ใช้ค่า raw_date จากคอลัมน์วันลงในระบบตารางที่คัดกรองชื่อไฟล์ออกไปแล้ว
         if not time_str:
             time_str = data.get('raw_date', '')
 
-        # กฎข้อที่ 3: ถ้ายังไม่มีอีก (เช่น Sticky) ให้ใช้เวลาปัจจุบันไปเลย
+        # กฎข้อที่ 3: มาตรการเซฟตี้สุดท้าย
         if not time_str:
             time_str = now.strftime('%Y-%m-%d %H:%M:%S')
 
-        # 3. 🛠 จัดการฟอร์แมตและแปลงเป็น datetime (แก้ปัญหา Error Time Format)
+        # 3. 🛠 จัดการฟอร์แมตและแปลงเป็น datetime
         try:
-            # ล้างคราบอักขระและเปลี่ยน / เป็น - ให้หมด
-            clean_time = time_str.strip().replace('/', '-')
+            clean_time = time_str.strip().replace('/', '-').replace('.', '-')
             
-            # กรณีเจอวันที่ในชื่อไฟล์ที่ไม่มีเวลา (เช่น 08-05-26) ให้เติมเวลาหลอก
             if ' ' not in clean_time and len(clean_time) <= 10:
                 clean_time += " 00:00:00"
             
-            clean_time = clean_time[:19] # เอาแค่ YYYY-MM-DD HH:MM:SS
+            clean_time = clean_time[:19]
             
-            # แยกเช็คปี 2 หลัก หรือ 4 หลัก
-            date_part = clean_time.split(' ')[0]
-            year_part = date_part.split('-')[-1]
-            
-            # ตรวจสอบ Format: dd-mm-yy หรือ yyyy-mm-dd
-            if len(year_part) == 2:
-                # ปี 2 หลัก (เช่น 26)
-                fmt = '%d-%m-%y %H:%M:%S' if clean_time[2] == '-' else '%y-%m-%d %H:%M:%S'
+            date_blocks = clean_time.split(' ')[0].split('-')
+            if len(date_blocks[0]) == 4:
+                fmt = '%Y-%m-%d %H:%M:%S'
+            elif len(date_blocks[-1]) == 4:
+                fmt = '%d-%m-%Y %H:%M:%S'
+            elif len(date_blocks[0]) == 2 and int(date_blocks[0]) > 12:
+                fmt = '%y-%m-%d %H:%M:%S'
             else:
-                # ปี 4 หลัก (เช่น 2026)
-                fmt = '%d-%m-%Y %H:%M:%S' if clean_time[2] == '-' else '%Y-%m-%d %H:%M:%S'
+                fmt = '%d-%m-%y %H:%M:%S'
             
             naive_time = datetime.strptime(clean_time, fmt)
             upload_time = tz.localize(naive_time)
             
         except Exception:
-            # ไม้ตายสุดท้าย: ถ้าแปลงไม่ได้จริงๆ ให้ถือเป็นเวลาปัจจุบัน (เพื่อ Racing)
             upload_time = now
 
-        # 4. Racing Logic (คำนวณอายุและ Ratio)
+        # 4. Racing Logic (คำนวณอายุจากตารางวันลงที่แท้จริง)
         age_delta = now - upload_time
         total_hours = age_delta.total_seconds() / 3600
         
-        if age_delta.total_seconds() < -300: return False # เวลามั่ว (ล้ำหน้าปัจจุบัน)
+        if age_delta.total_seconds() < -300: return False
 
         demand_ratio = data['leechers'] / max(1, data['seeders'])
 
-        # Log สรุปสถานะ
-        print(f" 📊 Peers: {short_title}.. (S:{data['seeders']} L:{data['leechers']} C:{data['completed']} Ratio:{demand_ratio:.2f} Age:{total_hours:.1f}ชม.)")
+        print(f" 📊 System Date: {short_title}.. (S:{data['seeders']} L:{data['leechers']} Age:{total_hours:.1f}ชม.)")
 
         # --- เงื่อนไขการกรอง ---
-        if data.get('is_sticky') and total_hours > 12:
-            print(f" ⏭️ ข้าม: [Sticky เก่า]")
-            return False
-
         if total_hours > max_age_hours:
             print(f" ⏭️ ข้าม: [เก่าเกิน {max_age_hours} ชม.]")
             return False
