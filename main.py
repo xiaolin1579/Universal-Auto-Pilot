@@ -1163,15 +1163,17 @@ class RtorrentNode:
         return self._add_fallback_clean(content, site_name, info_hash)
 
     def _add_fallback_clean(self, content, site_name, info_hash=None):
+        safe_site = self.safe_xml_escape(site_name)
+
         if info_hash and self._verify_torrent_in_client(info_hash):
-            print(f"ℹ️ [{self.name}] Torrent already exists, skipping load.raw and starting.")
-            self._force_start_torrent(info_hash)
+            print(f"ℹ️ [{self.name}] Torrent already exists -> บังคับติดป้ายค่ายเว็บและสับสวิตช์เริ่มงานซ้ำทันที...")
+            self._force_start_torrent(info_hash, safe_site)
             return True
             
         encoded_content = base64.b64encode(content).decode('ascii')
-        safe_site = self.safe_xml_escape(site_name)
         
-        # 🎯 ใช้ load.raw_start ฝังคำสั่ง d.custom1.set ไร้อาการหลุดรวนบนระบบ Shared
+        # 🎯 [BULLETPROOF INJECTION]: ยัดคำสั่งติดป้าย Label (d.custom1.set) พ่วงไปกับตัวไฟล์ตั้งแต่แรกแอดงาน
+        # วิธีนี้ร้อยทั้งร้อย rTorrent จะสร้างอ็อบเจกต์งานขึ้นมาพร้อมกับป้ายฉลากค่ายเว็บทันที ไม่ต้องกลัวดิสก์หน่วงแย่งสิทธิ์คำสั่ง
         xml_payload = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<methodCall>'
@@ -1179,24 +1181,21 @@ class RtorrentNode:
             '<params>'
             '<param><value><string></string></value></param>'
             '<param><value><base64>{}</base64></value></param>'
-            f'<param><value><string>d.custom1.set={safe_site}</string></value></param>' 
+            f'<param><value><string>d.custom1.set={safe_site}</string></value></param>' # 💎 ฝังติดป้ายเข้าไปที่นี่เลย!
             '</params>'
             '</methodCall>'
         ).format(encoded_content).encode('utf-8')
         
-        # 🔥 [เสริมเกราะป้องกันตาย]: ประกาศตัวแปรรอรับ Response ด้านนอกลูป
         r = None
         
-        # วนลูปให้โอกาสยิงแก้ตัวทั้งหมด 3 รอบ (รอบแรก + Retry 2 รอบ)
         for attempt in range(3):
             try:
-                # ลด timeout เหลือ 15 วินาทีต่อรอบ เพื่อให้บอทตัดใจมาลองรอบใหม่ได้เร็วขึ้น ไม่ค้างคาจนเธรดหลักหลุด
                 r = self.s.post(self.url, data=xml_payload, auth=self.auth, headers=self.headers, timeout=15, verify=False)
-                break  # ถ้ายิงผ่านและได้ Response กลับมาสำเร็จ ให้หลุดออกจากลูป Retry ทันที
+                break  
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
                 if attempt < 2:
                     print(f"🔄 [{self.name}] Network Timeout/Error ({net_err}) กำลังลองใหม่อีกครั้ง... (รอบที่ {attempt+1}/2)")
-                    time.sleep(1.5)  # นอนรอให้เน็ตเวิร์กหรือ I/O ของเซิร์ฟเวอร์แชร์เคลียร์ตัวเองสักครู่
+                    time.sleep(1.5)  
                 else:
                     print(f"❌ [{self.name}] Exception during upload หลังพยายามครบ 3 รอบ: {net_err}")
                     return False
@@ -1204,78 +1203,106 @@ class RtorrentNode:
                 print(f"❌ [{self.name}] Fatal Exception during upload: {e}")
                 return False
         
-        # ประมวลผลผลลัพธ์จากการโพสต์ (กระบวนการหลังจากหลุดลูป Retry)
         try:
             if r is None or r.status_code != 200 or "fault" in r.text.lower():
                 print(f"⚠️ [{self.name}] Load failed: {r.text[:50] if r else 'No Response'}")
                 return False
 
-            print(f"✅ [{self.name}] Added. Syncing with rTorrent...")
+            print(f"✅ [{self.name}] ส่งไฟล์เข้า rTorrent สำเร็จ -> เริ่มกระบวนการตรวจสอบสถานะระบบดิสก์...")
             
+            # วนลูปตรวจสอบว่างานเข้าระบบหรือยัง
             found = False
-            for i in range(20):  
-                if i < 5:      time.sleep(0.5)
-                elif i < 12:   time.sleep(1.0)
-                else:          time.sleep(2.0)
-                
-                if self._verify_torrent_in_client(info_hash):
+            for i in range(25):  
+                time.sleep(0.4)
+                if info_hash and self._verify_torrent_in_client(info_hash):
                     found = True
                     break
             
-            if not found:
-                print(f"⚠️ [{self.name}] Detection Delay: บอทตรวจไม่เจอแต่คาดว่าไฟล์กำลังจองดิสก์ ส่งคำสั่งเผื่อไว้...")
-                self._force_start_torrent(info_hash) 
-                return True 
+            # 🔥 [CENTRALIZED CONTROL COMBO]: ยิงชุดคอมโบสตาร์ทย้ำ และยิงถล่มป้ายซ้ำอีกรอบกันหลุด
+            if info_hash:
+                if not found:
+                    print(f"⚠️ [{self.name}] Detection Delay: บอทตรวจไม่เจอในตารางหลักทันที กำลังเจาะทะลวงระบบแชร์...")
+                
+                # สั่งยิงคอมโบจัดการรอบปกติ
+                self._force_start_torrent(info_hash, safe_site)
+                
+                # 🛡️ แผนกดย้ำกรณีดิสก์แชร์สล็อตทำงานดีเลย์
+                if not found:
+                    time.sleep(1.5)
+                    print(f"🔄 [{self.name}] Burst-Emphasize: กำลังยิงชุดคำสั่งจัดการย้ำรอบที่ 2 ป้องกันดิสก์ค้างช้า...")
+                    self._force_start_torrent(info_hash, safe_site)
 
-            print(f"🚀 [{self.name}] Torrent verified และติดป้าย Label เรียบร้อย")
             return True
 
         except Exception as e:
             print(f"❌ [{self.name}] Exception during response parsing: {e}")
             return False
 
-    def _force_start_torrent(self, info_hash):
-        """ส่งคำสั่งตรวจสอบและสั่งรันซ้ำเพื่อป้องกันเคสไฟล์ค้าง ตกหล่น"""
+    def _force_start_torrent(self, info_hash, safe_site=None):
+        """[SUPER UPGRADED]: ชุดคอมโบสั่งติดป้ายค่ายเว็บ + บังคับรัน + ดึงเพียร์ จบในที่เดียวแบบนิ่งสนิท"""
+        if not info_hash: return
         target_hash = info_hash.strip().lower()
-        sequence = ['d.open', 'd.start']
+        
+        # ปรับขยับเอาคำสั่งยัดทาสก์และเปิดเปิดดึงนำร่อง
+        sequence = ['view.add_task', 'd.open', 'd.custom1.set', 'd.start', 'd.tracker_announce']
+        
         for method in sequence:
-            xml_cmd = (
-                '<?xml version="1.0" encoding="UTF-8"?>'
-                '<methodCall><methodName>{}</methodName>'
-                '<params><param><value><string>{}</string></value></param></params>'
-                '</methodCall>'
-            ).format(method, target_hash).encode('utf-8')
             try:
-                self.s.post(self.url, data=xml_cmd, auth=self.auth, headers=self.headers, timeout=5, verify=False)
+                if method == 'd.custom1.set' and not safe_site:
+                    continue
+                    
+                if method == 'view.add_task':
+                    xml_cmd = (
+                        f'<?xml version="1.0"?><methodCall><methodName>view.add_task</methodName>'
+                        f'<params><param><value><string>main</string></value></param>'
+                        f'<param><value><string>{target_hash}</string></value></param></params></methodCall>'
+                    )
+                elif method == 'd.custom1.set':
+                    xml_cmd = (
+                        f'<?xml version="1.0"?><methodCall><methodName>d.custom1.set</methodName>'
+                        f'<params><param><value><string>{target_hash}</string></value></param>'
+                        f'<param><value><string>{safe_site}</string></value></param></params></methodCall>'
+                    )
+                else:
+                    xml_cmd = (
+                        '<?xml version="1.0" encoding="UTF-8"?>'
+                        '<methodCall><methodName>{}</methodName>'
+                        '<params><param><value><string>{}</string></value></param></params>'
+                        '</methodCall>'
+                    ).format(method, target_hash)
+
+                req_headers = {**getattr(self, 'headers', {}), 'Content-Type': 'text/xml'}
+                self.s.post(self.url, data=xml_cmd.encode('utf-8'), auth=self.auth, headers=req_headers, timeout=5, verify=False)
+                import time
                 time.sleep(0.1)
-            except:
-                pass
+            except Exception as e:
+                print(f"⚠️ [{self.name}] _force_start ({method}) failed: {e}")
 
     def _verify_torrent_in_client(self, info_hash):
+        """[UPGRADED]: เช็กการมีอยู่จริงของงานผ่าน XML-RPC เดี่ยว (d.name) เบาเครื่องและแม่นยำ 100%"""
+        if not info_hash: return False
         target_hash = info_hash.strip().lower() 
-        
+    
         xml_check = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<methodCall>'
-            '<methodName>d.multicall2</methodName>'
+            '<methodName>d.name</methodName>'
             '<params>'
-            '<param><value><string></string></value></param>'
             f'<param><value><string>{target_hash}</string></value></param>' 
-            '<param><value><string>d.name=</string></value></param>'
             '</params>'
             '</methodCall>'
         ).encode('utf-8')
     
         try:
-            headers = {**self.headers, 'Content-Type': 'text/xml; charset=utf-8'}
-            r = self.s.post(self.url, data=xml_check, auth=self.auth, headers=headers, timeout=6, verify=False)
+            req_headers = {**getattr(self, 'headers', {}), 'Content-Type': 'text/xml; charset=utf-8'}
+            r = self.s.post(self.url, data=xml_check, auth=self.auth, headers=req_headers, timeout=6, verify=False)
             
-            response_text_clean = r.text.lower()
-            if r.status_code == 200 and "fault" not in response_text_clean:
-                if "value" in response_text_clean and len(response_text_clean) > 150:
+            if r.status_code == 200 and "fault" not in r.text.lower():
+                if "value" in r.text.lower() and len(r.text) > 80:
                     return True
-        except:
-            pass
+        except Exception as e:
+            print(f"⚠️ [{self.name}] _verify_torrent_in_client เกิดข้อผิดพลาดเน็ตเวิร์ก: {e}")
+            
         return False
 
     def _sweeper_force_start(self):
@@ -1350,43 +1377,55 @@ class RtorrentNode:
         except: return False
         
     def get_stats_by_site(self):
-        if not self.is_connected: self.login()
+        if not self.is_connected: 
+            self.login()
+            
         try:
-            # 1. การสร้าง Proxy: หากเซิร์ฟเวอร์ใช้ Digest ให้ใช้ Requests เข้ามาช่วย (ตามที่เคยแนะนำ)
-            # แต่ถ้ามั่นใจว่าเป็น Basic Auth หรือรันใน Local Network ใช้แบบเดิมที่คุณทำได้เลยครับ
+            import xmlrpc.client
+            from urllib.parse import unquote
+
+            # 1. สร้าง Proxy เชื่อมต่อหลังบ้าน
             auth_url = self.url.replace("://", f"://{self.user}:{self.pw}@")
             proxy = xmlrpc.client.ServerProxy(auth_url)
 
-            # 2. ดึงข้อมูล: d.custom1 (Label), d.get_up_total (ยอดรวม), d.get_up_rate (ความเร็ว)
-            # ใช้ view "main" เพื่อความครอบคลุม
-            response = proxy.d.multicall2("", "main", "d.custom1=", "d.get_up_total=", "d.get_up_rate=")
+            # 2. 🛡️ [ULTIMATE CORE FIX]: เปลี่ยนเป็นคำสั่ง Standard rTorrent API สายตรงทั้งหมด 100%
+            # d.custom1=           (ดึง Label ชื่อเว็บ)
+            # d.up.total=          (ดึงยอดอัปโหลดรวมหน่วย Bytes)
+            # d.up.rate=           (ดึงความเร็วอัปโหลดปัจจุบัน Bytes/s) <- แก้ไขจาก d.get_up_rate=
+            # d.down.total=        (ดึงยอดดาวน์โหลดรวมหน่วย Bytes)
+            response = proxy.d.multicall2("", "main", "d.custom1=", "d.up.total=", "d.up.rate=", "d.down.total=")
 
             site_stats = {}
             for t in response:
-                # ล้างชื่อ Site ให้สะอาด
+                # ล้างชื่อ Site และปรับเป็นตัวพิมพ์ใหญ่ทั้งหมด (Upper Case)
                 raw_site = t[0] if t[0] else "Uncategorized"
-                site = unquote(raw_site).strip()
+                site = unquote(raw_site).strip().upper()
+                
+                # แมตช์ชื่อคีย์หลักให้ตรงกับระบบรายงานผล
+                if "BEARBIT" in site: site = "BEARBIT"
+                if "TORRENTDD" in site: site = "TORRENTDD"
             
-                # rTorrent ส่งค่าเป็น Bytes มาอยู่แล้ว
                 total_up = int(t[1])
-                up_speed = int(t[2])
+                up_speed = int(t[2])  # รับค่าจาก d.up.rate มาคำนวณสปีดปัจจุบัน
+                total_dl = int(t[3])
 
                 if site not in site_stats:
                     site_stats[site] = {
                         'total_up_bytes': 0, 
+                        'total_dl_bytes': 0,      
                         'current_speed_bytes': 0, 
                         'count': 0
                     }
         
                 site_stats[site]['total_up_bytes'] += total_up
+                site_stats[site]['total_dl_bytes'] += total_dl
                 site_stats[site]['current_speed_bytes'] += up_speed
                 site_stats[site]['count'] += 1
             
             return site_stats
         except Exception as e:
-            # หาก Proxy พัง ให้ลองสั่ง login ใหม่ในรอบถัดไป
             self.is_connected = False
-            # print(f"⚠️ [{self.name}] rTorrent Stats Error: {e}")
+            print(f"⚠️ [{self.name}] rTorrent Stats Error: {e}")
             return {}
 
 # ========================= UPDATE TRACKER =========================
@@ -1426,25 +1465,61 @@ class NodeCleaner:
         except Exception:
             return 100.0
 
+    def _hard_purge_sequence(self, t_hash, node_type):
+        """
+        🔥 [ANTI-GHOST SAFEGUARD SEQUENCE]
+        ขั้นตอนสับสวิตช์ทำลายไฟล์แบบ 3 สเต็ปปลอดภัยสูง:
+        1. อัพเดตแทรกเกอร์ (Re-announce) เพื่อบันทึก Ratio รอบสุดท้าย
+        2. Settle Down: สั่งหยุดงาน (Stop / Pause) เพื่อคลาย File Handle Lock จากระบบดิสก์
+        3. ยิงคำสั่งลบข้อมูลจริง (Delete) ออกจากดิสก์หลังบ้าน
+        """
+        try:
+            import time
+            if node_type == "qbit":
+                # 1. Update Tracker
+                self.node.s.post(f"{self.node.url}/api/v2/torrents/reannounce", data={"hashes": t_hash}, auth=self.node.auth, verify=False, timeout=5)
+                time.sleep(0.5) 
+                
+                # 2. Stop/Pause Torrent
+                self.node.s.post(f"{self.node.url}/api/v2/torrents/pause", data={"hashes": t_hash}, auth=self.node.auth, verify=False, timeout=5)
+                time.sleep(0.5) 
+                
+                # 3. ลบตัวทอร์เรนต์พร้อมเนื้อไฟล์จริงทั้งหมด
+                return self.node.delete_torrent(t_hash)
+
+            elif node_type == "rtorrent":
+                # 1. Update Tracker
+                xml_announce = f'<?xml version="1.0"?><methodCall><methodName>d.tracker_announce</methodName><params><param><value><string>{t_hash}</string></value></param></params></methodCall>'
+                self.node.s.post(self.node.url, data=xml_announce, auth=self.node.auth, verify=False, timeout=5)
+                time.sleep(0.5)
+                
+                # 2. Stop Torrent
+                xml_stop = f'<?xml version="1.0"?><methodCall><methodName>d.stop</methodName><params><param><value><string>{t_hash}</string></value></param></params></methodCall>'
+                self.node.s.post(self.node.url, data=xml_stop, auth=self.node.auth, verify=False, timeout=5)
+                time.sleep(0.5)
+                
+                # 3. ลบข้อมูลและตัวทอร์เรนต์
+                return self.node.delete_torrent(t_hash)
+                
+        except Exception as e:
+            print(f"⚠️ [{self.node.name}] ผิดพลาดในขั้นตอน Hard Purge Sequence: {e}")
+            try:
+                return self.node.delete_torrent(t_hash)
+            except Exception:
+                return False
+        return False
+
     def process(self, force_emergency=False):
-        # 🔄 [แก้ไขลอจิกสิทธิ์การทำงานใหม่]:
-        # ค้นหาค่าเปิด/ปิดระบบจาก Config ระดับโหนด (clean_settings)
         node_enable = self.node_cfg.get('enable', self.node_cfg.get('ENABLE', None))
-        
-        # ค้นหาค่าเปิด/ปิดระบบจาก Config ระดับ Global_clean
         global_enable = self.global_cfg.get('enable', self.global_cfg.get('ENABLE', False))
         
-        # 🎯 [ตรรกะตัดสิน]: ใช้ค่าของโหนดเป็นหลักถ้าเปิด แต่ถ้าโหนดปิดหรือไม่ได้ตั้ง ให้เช็กต่อว่า Global เปิดอยู่ไหม
         if node_enable is True:
             is_enabled = True
         elif node_enable is False:
-            # 💡 แม้โหนดใน clean_settings จะใส่ false แต่อยู่ในเกณฑ์ "ใช้ค่าโหนดเป็นหลักถ้าเปิด ถ้าปิดให้ใช้ค่า global"
             is_enabled = global_enable
         else:
-            # กรณีที่ในโหนดไม่ได้ระบุคีย์ enable ไว้เลย ให้ใช้สิทธิ์ของ Global เป็นหลัก
             is_enabled = global_enable
 
-        # 📡 Report สถานะการทำงานจริงออกคอนโซล
         print(f"⚙️ [Cleaner Engine] Node: {self.node.name} | Status: {'ACTIVE' if is_enabled else 'DISABLED'} (Node_Cfg: {node_enable}, Global_Cfg: {global_enable})")
 
         if not is_enabled:
@@ -1454,7 +1529,6 @@ class NodeCleaner:
         current_free = self._get_node_free_gb()
         is_emergency = force_emergency or (current_free < 10.0)
 
-        # === [1. สายงานฉุกเฉิน (Emergency Mode) - ยิง Bulk จบในตัว] ===
         if is_emergency:
             print(f"🚨 [EMERGENCY TRIGGERED] [{self.node.name}] พื้นที่วิกฤตเหลือ {current_free:.2f}GB -> ส่งต่อให้ระบบ Smart Reclaim ทวงคืนพื้นที่")
             class_name = self.node.__class__.__name__.lower()
@@ -1464,26 +1538,67 @@ class NodeCleaner:
             print(f"♻️ [Emergency Result] [{self.node.name}] จบรอบประมวลผล Smart Reclaim (Success: {success})")
             return
 
-        # === [2. สายงานปกติ (Normal Idle Mode) - ทยอยเก็บกวาดนุ่ม ๆ] ===
         print(f"🔍 Debug: [{self.node.name}] Starting cleanup process... (Normal Idle Mode | Free: {current_free:.2f}GB)")
         try:
-            removed_list = []
+            grouped_logs = {}
             class_name = self.node.__class__.__name__.lower()
             
             if "qbit" in class_name:
-                removed_list = self._clean_qbit()
+                grouped_logs = self._clean_qbit()
             elif "rtorrent" in class_name:
-                removed_list = self._clean_rtorrent()
+                grouped_logs = self._clean_rtorrent()
 
-            if removed_list:
+            if not isinstance(grouped_logs, dict):
+                grouped_logs = {}
+
+            has_removed_items = any(log_data.get("torrents") for log_data in grouped_logs.values() if isinstance(log_data, dict))
+
+            if grouped_logs and has_removed_items:
+                # 🖨️ 1. พ่น Log ลง Console คลีนสายตา ปรับอิโมจิหน้าชื่อไฟล์ให้แมตช์ตามกลุ่มสาเหตุ
+                for reason, log_data in grouped_logs.items():
+                    if not log_data.get("torrents"): 
+                        continue
+                        
+                    # แมตช์อิโมจิหลักประจำกลุ่มสาเหตุ
+                    if reason == "Max Time Exceeded":
+                        emoji = "🚨"
+                        print(f"{emoji} [{reason}] {log_data['header']}")
+                    elif reason == "Idle Dead":
+                        emoji = "💤"
+                        print(f"{emoji} [{reason}] {log_data['header']}")
+                    elif reason == "Target Reached":
+                        emoji = "💰"
+                        print(f"{emoji} [{reason}] {log_data['header']}")
+                    else:
+                        emoji = "🧹"
+                        print(f"{emoji} [{reason}] {log_data['header']}")
+                        
+                    # พ่นรายชื่อไฟล์ (สลับคัดลอกเอาตัวสัญลักษณ์ประจำกลุ่มแปะนำหน้าสลอตงาน)
+                    for t_line in log_data["torrents"]:
+                        print(f"  {emoji} {t_line}")
+
+                # 💬 2. จัดรูปแบบสำหรับส่งแจ้งเตือน Notify (Telegram/Discord)
+                notify_lines = []
+                for reason, log_data in grouped_logs.items():
+                    if not log_data.get("torrents"): 
+                        continue
+                    
+                    emoji = "🚨" if reason == "Max Time Exceeded" else "💤" if reason == "Idle Dead" else "💰" if reason == "Target Reached" else "🧹"
+                    notify_lines.append(f"{emoji} <b>[{reason}]</b> {log_data['header']}")
+                    
+                    for t_line in log_data["torrents"]:
+                        notify_lines.append(f"  {emoji} {t_line}")
+
                 status_title = "🧹 Cleanup Summary (Idle Only)"
-                msg = f"<b>{status_title}</b> [{self.node.name}]:\n" + "\n".join(removed_list)
+                msg = f"<b>{status_title}</b> [{self.node.name}]:\n" + "\n".join(notify_lines)
+                
                 if callable(globals().get('send_notify')):
                     send_notify(msg)
                 else:
                     print(f"📢 Notification (No send_notify func):\n{msg}")
             else:
                 print(f"✨ [{self.node.name}] ตรวจสอบเสร็จสิ้น: ไม่มีไฟล์ขยะที่ตรงตามเกณฑ์การลบปกติ")
+                
         except Exception as e:
             print(f"⚠️ [{self.node.name}] Clean Error: {e}")
 
@@ -1496,55 +1611,51 @@ class NodeCleaner:
             return self.global_cfg.get(key.lower(), self.global_cfg.get(key.upper(), default))
 
         min_ratio = float(get_cfg_value('min_ratio', 1.5))
-        min_time = float(get_cfg_value('min_time', 720)) / 60.0
-        max_time = float(get_cfg_value('max_time', 1440)) / 60.0
+        min_time = float(get_cfg_value('min_time', 720)) / 60.0  
+        max_time = float(get_cfg_value('max_time', 1440)) / 60.0 
         max_idle_hours = float(get_cfg_value('max_idle_hours', 6))
         
-        # 📡 [ปรับจุดที่ 1]: ปรับเพิ่มเกณฑ์สปีดขั้นต่ำเล็กน้อย (เช่น 5 KB/s) เพื่อป้องกันเศษสปีดแกว่งตอน Sync Tracker ดึงขาลอจิก
-        min_active_speed = 5.0 * 1024  # บังคับขั้นต่ำ 5 KB/s ถ้าน้อยกว่านี้ถือว่านิ่งสนิทจริง
+        min_active_speed = 5.0 * 1024  # 5 KB/s
         is_completely_idle = (up_speed < min_active_speed and leechers == 0)
 
-        # 👻 Ghost Torrent Safeguard
-        if age_hours > 720.0 or age_hours < 0:
-            return True
+        # 🔥 [HARDENED ANTIVIRUS LOCK]: ดัดหลังบั๊กค่าเวลาเอ๋อจากระบบ Shared
+        if age_hours < 0 or age_hours >= 9000.0:
+            return False
 
-        # ด่านที่ 1: ปกป้องไฟล์วิ่งแรง (ถ้าวิ่งเกิน 5 KB/s และมีคนดูด ห้ามลบ)
+        # 🛡️ เกราะป้องกันขั้นที่ 2: งานเก่าแก่อายุเกิน 30 วัน ของจริง
+        if age_hours > 720.0:
+            if is_completely_idle or ratio >= 1.0:
+                return "Legacy Expired", f"อายุเกิน 30 วัน -> ปล่อยพื้นที่คืนระบบ"
+            return False
+
+        # ถ้าน้องทอร์เรนต์กำลัง "เรซซิ่ง" ดึงสปีดเชื่อม Peer อยู่ -> ห้ามลบเด็ดขาด
         if not is_completely_idle:
             return False
 
-        # === หลังจากด่านนี้ แปลว่าไฟล์อยู่ในสถานะนิ่งสนิท (Idle) 100% แล้วเท่านั้น ===
-
-        # 🚨 [ด่านที่ 2]: เพดานเวลาสูงสุด (เซฟตี้ขยะค้างฟ้า - ชน 24 ชม. ปลิวทันทีไม่สนเกณฑ์ใดๆ)
+        # 🚨 [Max Time Exceeded] ค้างสล็อตจนชนเพดานสูงสุด
         if age_hours >= max_time:
-            print(f"🚨 [Max Time Exceeded] อายุ {age_hours:.1f}h ชนเพดานสูงสุด {max_time:.1f}h -> สั่งสับทิ้ง")
-            return True
+            return "Max Time Exceeded", f"อายุชนเพดานสูงสุด: {max_time:.1f}h -> สั่งสับทิ้ง"
 
-        # 💤 [ด่านที่ 3]: ดักจับขยะตายซาก (สลับขึ้นมาเหนือด่านเงื่อนไขคู่ เพื่อล้างบางพวกไร้วี่แววคนโหลด)
-        # ตราบใดที่อายุนิ่งเกินเกณฑ์ (6 ชม.) และ Ratio ต่ำติดดิน (< 0.1) สั่งสับทิ้งทันที ไม่ต้องให้อยู่จนแก่
+        # 💤 [Idle Dead] ขยะนอนนิ่งตั้งแต่ออกตัว
         if age_hours >= max_idle_hours and ratio < 0.1:
-            print(f"💤 [Idle Dead] ขยะนอนนิ่งตั้งแต่ออกตัว อายุ {age_hours:.1f}h (Ratio: {ratio:.2f}) -> สั่งลบ")
-            return True
+            return "Idle Dead", f"อายุขั้นต่ำ: {max_idle_hours:.1f}h + Ratio ต่ำกว่าเกณฑ์: 0.1 -> สั่งลบ"
 
-        # 🎯 [ด่านที่ 4]: เกณฑ์อัปเกรดใหม่ของพี่ (min_ratio + min_time = ลบ)
-        # ไฟล์ที่จะผ่านมาถึงด่านนี้ได้ แปลว่าต้องเป็นไฟล์ที่มีประโยชน์ (Ratio >= 0.1) เท่านั้น
+        # 💰 [Target Reached] เรโชชนเป้าคู่สำเร็จตามแผน
         if age_hours >= min_time:
             if ratio >= min_ratio:
-                print(f"💰 [Target Reached] อายุพ้นเกณฑ์ ({age_hours:.1f}h >= {min_time}h) + Ratio ({ratio:.2f} >= {min_ratio}) ชนเป้าคู่ -> เคลียร์พื้นที่")
-                return True
-            
-            # 💡 [Option เสริมค้ำประกันดิสก์]: ถ้าอายุเกิน min_time แล้วแต่ Ratio ยังไม่ถึงเป้า 1.5 
-            # บอทจะยังไม่ลบ เพื่อปล่อยให้อุ้มสี้ดทำกำไรต่อไปจนกว่าจะไปชนเพดาน max_time 24 ชม. ด้านบน
+                return "Target Reached", f"อายุพ้นเกณฑ์ ขั้นต่ำ: {min_time}h) + Ratio ขั้นต่ำ: {min_ratio} ชนเป้าคู่ -> เคลียร์พื้นที่"
             return False
 
         return False
 
     def _clean_qbit(self):
-        res = []
+        res_grouped = {}
         try:
+            import time
             headers = {"Accept-Encoding": "gzip, deflate", "Connection": "keep-alive"}
             r = self.node.s.get(f"{self.node.url}/api/v2/torrents/info", auth=self.node.auth, headers=headers, verify=False, timeout=15)
             if r.status_code != 200: 
-                return []
+                return {}
 
             torrents = r.json()
             now = time.time()
@@ -1561,24 +1672,30 @@ class NodeCleaner:
                 except (ValueError, TypeError):
                     continue
 
-                if self._should_remove(ratio, age_hours, up_speed, leechers):
-                    if self.node.delete_torrent(t['hash']):
+                remove_check = self._should_remove(ratio, age_hours, up_speed, leechers)
+                if remove_check:
+                    reason_key, header_msg = remove_check
+                    
+                    if self._hard_purge_sequence(t['hash'], node_type="qbit"):
                         raw_name = t.get('name', 'Unknown')
                         name_safeguard = raw_name[:27] + "..." if len(raw_name) > 27 else raw_name
-                        line = f"  💤 {name_safeguard} (R:{ratio:.2f}, {age_hours:.1f}h)"
-                        print(line)
-                        res.append(line)
+                        # 🛠️ [FIX]: ลบอิโมจิ 💤 ตรงนี้ออก ให้เหลือข้อมูลรายชื่อเพียว ๆ
+                        line = f"{name_safeguard} (R:{ratio:.2f}, {age_hours:.1f}h)"
+                        
+                        if reason_key not in res_grouped:
+                            res_grouped[reason_key] = {"header": header_msg, "torrents": []}
+                        res_grouped[reason_key]["torrents"].append(line)
+                        
         except Exception as e:
             print(f"⚠️ [{self.node.name}] qBittorrent Fetch Error: {e}")
-        return res
+        return res_grouped
 
     def _clean_rtorrent(self):
         if BeautifulSoup is None:
             print(f"❌ [{self.node.name}] rTorrent Clean Failed: bs4 (BeautifulSoup) is not installed.")
-            return []
+            return {}
 
-        res = []
-        # 🔄 XML มาตรฐานสำหรับดึงข้อมูล 6 คีย์หลัก
+        res_grouped = {}
         xml = (
             '<?xml version="1.0"?><methodCall><methodName>d.multicall2</methodName>'
             '<params><param><value><string></string></value></param>'
@@ -1593,17 +1710,16 @@ class NodeCleaner:
 
         soup = None
         try:
+            import time
             req_headers = getattr(self.node, 'headers', {}).copy()
             if "Connection" not in req_headers:
                 req_headers["Connection"] = "close" 
 
             r = self.node.s.post(self.node.url, data=xml, auth=self.node.auth, headers=req_headers, verify=False, timeout=15)
             if r.status_code != 200: 
-                return []
+                return {}
 
             soup = BeautifulSoup(r.text, "xml")
-            
-            # 🎯 เจาะเข้าหากลุ่มข้อมูลทอร์เรนต์รายตัว (ห่อหุ้มชั้นในสุดของ multicall2 response)
             items = soup.select("methodResponse > params > param > value > array > data > value")
             if not items:
                 items = soup.select("value > array > data > value")
@@ -1611,14 +1727,11 @@ class NodeCleaner:
             now = time.time()
 
             for item in items:
-                # 🎯 [แก้ไขจุดคอขวด]: เจาะลงไปที่แท็ก data ชั้นในสุดของแต่ละไอเทม เพื่อดึงข้อมูลพารามิเตอร์โดยตรง
                 t_data = item.find('data')
                 if not t_data:
-                    # มาตรการสำรองหากไม่มีแท็ก data ซ้อน
                     t_data = item.find('array') if item.find('array') else item
                     
                 val_nodes = t_data.find_all('value', recursive=False)
-                
                 vals = []
                 for v in val_nodes:
                     inner_data = v.find(['string', 'i4', 'int'])
@@ -1630,7 +1743,6 @@ class NodeCleaner:
                 if len(vals) < 6:
                     continue
 
-                # 🎯 แมตช์ตัวแปรตรงพิกัด 100%
                 t_hash, t_ratio_raw, t_finish, t_uprate, t_leechers_raw, t_name = vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]
 
                 if not t_finish: 
@@ -1639,25 +1751,27 @@ class NodeCleaner:
                 try:
                     ratio = int(t_ratio_raw) / 1000 if t_ratio_raw.isdigit() else 0.0
                     ts_val = int(t_finish)
-                    
-                    # ⏳ จัดการทอร์เรนต์ผี/ข้อมูลเอ๋อ
                     if ts_val <= 0:
                         age_hours = 9999.0  
                     else:
                         age_hours = (now - ts_val) / 3600
-                        
                     up_speed = int(t_uprate) if t_uprate.isdigit() else 0
                     leechers = int(t_leechers_raw) if t_leechers_raw.isdigit() else 0
                 except (ValueError, TypeError):
                     continue
 
-                # ยิงเข้าด่านวิเคราะห์ความเหมาะสมในการลบ
-                if self._should_remove(ratio, age_hours, up_speed, leechers):
-                    if self.node.delete_torrent(t_hash):
+                remove_check = self._should_remove(ratio, age_hours, up_speed, leechers)
+                if remove_check:
+                    reason_key, header_msg = remove_check
+                    
+                    if self._hard_purge_sequence(t_hash, node_type="rtorrent"):
                         name_safeguard = t_name[:27] + "..." if len(t_name) > 27 else t_name
-                        line = f"    🧹 เคลียร์: {name_safeguard} (R:{ratio:.2f}, {age_hours:.1f}h)"
-                        print(line)
-                        res.append(line)
+                        # 🛠️ [FIX]: ลบอิโมจิ 🧹 ตรงนี้ออก ให้ส่งกลับแค่สายอักขระข้อมูลดิบ
+                        line = f"{name_safeguard} (R:{ratio:.2f}, {age_hours:.1f}h)"
+                        
+                        if reason_key not in res_grouped:
+                            res_grouped[reason_key] = {"header": header_msg, "torrents": []}
+                        res_grouped[reason_key]["torrents"].append(line)
 
         except Exception as e:
             print(f"⚠️ [{self.node.name}] rTorrent Clean Error: {str(e)}")
@@ -1665,16 +1779,28 @@ class NodeCleaner:
             if soup is not None:
                 soup.decompose()
             
-        return res
+        return res_grouped
 
 # ========================= Smart Reclaim Space (Hardened Version) =========================
 
 def _bulk_delete_qbit(node, target_hashes):
-    """ ส่งคำสั่งลบแบบ Batch ของ qBittorrent ในครั้งเดียว """
+    """ 
+    ส่งคำสั่งลบแบบ Batch ของ qBittorrent ระดับ Hardened 
+    🔥 ลอจิก 3 สเต็ป: Re-announce -> Pause -> Bulk Delete
+    """
     try:
-        hashes_str = "|".join(target_hashes)
+        import time
+        # 1. Update Tracker (Re-announce) พร้อมกันทุกตัว
+        node.s.post(f"{node.url}/api/v2/torrents/reannounce", data={"hashes": "|".join(target_hashes)}, auth=node.auth, verify=False, timeout=5)
+        time.sleep(0.5) # รอเน็ตเวิร์กเคลียร์แพ็กเก็ต
+        
+        # 2. สั่งเบรกงานทั้งหมด (Pause) เพื่อคลาย File Handle Lock จาก SSD
+        node.s.post(f"{node.url}/api/v2/torrents/pause", data={"hashes": "|".join(target_hashes)}, auth=node.auth, verify=False, timeout=5)
+        time.sleep(0.5) # รอ Engine สั่งเคลียร์ RAM Cache ลงระบบดิสก์
+        
+        # 3. ยิงคำสั่งสังหารตัวงานพร้อมทลายเนื้อไฟล์จริงทิ้งในครั้งเดียว
         url = f"{node.url}/api/v2/torrents/delete"
-        r = node.s.post(url, data={"hashes": hashes_str, "deleteFiles": "true"}, auth=node.auth, timeout=15, verify=False)
+        r = node.s.post(url, data={"hashes": "|".join(target_hashes), "deleteFiles": "true"}, auth=node.auth, timeout=15, verify=False)
         return r.status_code == 200
     except Exception as e:
         print(f"❌ Bulk Delete qBit Error: {e}")
@@ -1683,29 +1809,52 @@ def _bulk_delete_qbit(node, target_hashes):
 def _bulk_delete_rtorrent(node, target_hashes):
     """ 
     ห่อหุ้มคำสั่งลบส่งแบบ XML-RPC ระดับ Hardened สำหรับ rTorrent 
-    🔥 อัปเกรด: สลับใช้คำสั่ง 'd.erase_data' หรือคอมโบสากลเพื่อสั่งทำลายข้อมูลบนดิสก์จริง ไม่ให้เกิดไฟล์ผีคาเครื่อง
+    🔥 ลอจิก 3 สเต็ป: d.tracker_announce -> d.stop -> d.erase_data (ยิงคอมโบมัลติคอล)
     """
     try:
-        xml_parts = ['<?xml version="1.0"?><methodCall><methodName>system.multicall</methodName><params><param><value><array><data>']
+        import time
+        # สเต็ปที่ 1: สั่ง Re-announce แทร็กเกอร์พร้อมกันเพื่อบันทึกสถิติรอบสุดท้าย
+        xml_announce_parts = ['<?xml version="1.0"?><methodCall><methodName>system.multicall</methodName><params><param><value><array><data>']
         for h in target_hashes:
-            # ใช้ d.erase_data (หรือ d.erase ร่วมกับการสั่งล้างพิกัดข้อมูลจริงบนเครื่องแชร์เพื่อป้องกัน Ghost Files)
-            # ในระบบ SeedboxCH หรือบอร์ดแชร์ความเร็วสูง การยิง d.erase_data จะการันตีการลบเนื้อไฟล์จาก storage จริง
-            xml_parts.append(
+            xml_announce_parts.append(
+                f'<value><struct>'
+                f'<member><name>methodName</name><value><string>d.tracker_announce</string></value></member>'
+                f'<member><name>params</name><value><array><data><value><string>{h}</string></value></data></array></value></member>'
+                f'</struct></value>'
+            )
+        xml_announce_parts.append('</data></array></value></param></params></methodCall>')
+        node.s.post(node.url, data="".join(xml_announce_parts), auth=node.auth, headers={"Connection": "close", "Content-Type": "text/xml"}, verify=False, timeout=10)
+        time.sleep(0.5)
+
+        # สเต็ปที่ 2: สั่งหยุดงาน (d.stop) ทั้งหมด เพื่อตัด File Lock จาก Engine บอร์ดแชร์
+        xml_stop_parts = ['<?xml version="1.0"?><methodCall><methodName>system.multicall</methodName><params><param><value><array><data>']
+        for h in target_hashes:
+            xml_stop_parts.append(
+                f'<value><struct>'
+                f'<member><name>methodName</name><value><string>d.stop</string></value></member>'
+                f'<member><name>params</name><value><array><data><value><string>{h}</string></value></data></array></value></member>'
+                f'</struct></value>'
+            )
+        xml_stop_parts.append('</data></array></value></param></params></methodCall>')
+        node.s.post(node.url, data="".join(xml_stop_parts), auth=node.auth, headers={"Connection": "close", "Content-Type": "text/xml"}, verify=False, timeout=10)
+        time.sleep(0.5)
+
+        # สเต็ปที่ 3: สั่งกวาดล้างไฟล์จาก storage จริงทั้งหมด (d.erase_data) คืนพื้นที่ 100%
+        xml_delete_parts = ['<?xml version="1.0"?><methodCall><methodName>system.multicall</methodName><params><param><value><array><data>']
+        for h in target_hashes:
+            xml_delete_parts.append(
                 f'<value><struct>'
                 f'<member><name>methodName</name><value><string>d.erase_data</string></value></member>'
                 f'<member><name>params</name><value><array><data><value><string>{h}</string></value></data></array></value></member>'
                 f'</struct></value>'
             )
-        xml_parts.append('</data></array></value></param></params></methodCall>')
-        xml_data = "".join(xml_parts)
+        xml_delete_parts.append('</data></array></value></param></params></methodCall>')
         
         req_headers = getattr(node, 'headers', {}).copy()
         req_headers["Connection"] = "close"
         req_headers["Content-Type"] = "text/xml"
         
-        r = node.s.post(node.url, data=xml_data, auth=node.auth, headers=req_headers, verify=False, timeout=15)
-        
-        # ถ้าระบบตอบกลับมาว่าผ่าน (Status 200) มั่นใจได้ว่า rTorrent ได้รับคำสั่งล้างข้อมูลจริงแล้ว
+        r = node.s.post(node.url, data="".join(xml_delete_parts), auth=node.auth, headers=req_headers, verify=False, timeout=15)
         return r.status_code == 200
     except Exception as e:
         print(f"❌ Bulk Delete rTorrent Error: {e}")
@@ -1713,9 +1862,8 @@ def _bulk_delete_rtorrent(node, target_hashes):
 
 def smart_reclaim_process(node, required_gb, is_emergency=False, node_type="qbit"):
     """
-    เวอร์ชัน Hardcoded Bypass + คืนค่า Log รายละเอียดสูง
-    - แสดงรายการไฟล์ที่ลบ: ชื่อไฟล์ + ขนาด (GB) + เรโช (Ratio) + เวลาปล่อยงาน (Seeded Time)
-    - บายพาสสิทธิ์คลาสย่อย เจาะตรงเข้าหา Web UI / XML-RPC บอร์ดแชร์ความเร็วสูง
+    เวอร์ชัน Hardcoded Bypass + คืนค่า Log รายละเอียดสูง 
+    [UPGRADED]: เสริมเกราะป้องกันลบงานแอดใหม่ (Safety Lock Age-Gate) ป้องกันอาการลบผิดพลาด 100%
     """
     try:
         node.refresh_status()
@@ -1744,13 +1892,14 @@ def smart_reclaim_process(node, required_gb, is_emergency=False, node_type="qbit
         
         else:
             try:
-                # ดึงฟิลด์ d.timestamp.finished (v[6]) เพื่อใช้วิเคราะห์เวลาปล่อยงานฝั่ง rTorrent
+                # เพิิ่มการดึง d.timestamp.init= (v[8]) และ d.creation_date= (v[9]) เผื่อมาพิจารณาร่วมกรณีสถิติ rTorrent รวน
                 xml = '''<?xml version="1.0"?><methodCall><methodName>d.multicall2</methodName><params>
                         <param><value><string></string></value></param><param><value><string>main</string></value></param>
                         <param><value><string>d.hash=</string></value></param><param><value><string>d.ratio=</string></value></param>
                         <param><value><string>d.complete=</string></value></param><param><value><string>d.name=</string></value></param>
                         <param><value><string>d.size_bytes=</string></value></param><param><value><string>d.left_bytes=</string></value></param>
                         <param><value><string>d.timestamp.finished=</string></value></param><param><value><string>d.state=</string></value></param>
+                        <param><value><string>d.timestamp.init=</string></value></param>
                         </params></methodCall>'''
                 req_headers = getattr(node, 'headers', {}).copy()
                 req_headers["Connection"] = "close"
@@ -1779,7 +1928,8 @@ def smart_reclaim_process(node, required_gb, is_emergency=False, node_type="qbit
                             'total_size': int(_fast_text(v[4])) if _fast_text(v[4]).isdigit() else 0,
                             'amount_left': int(_fast_text(v[5])) if _fast_text(v[5]).isdigit() else 0,
                             'ts_finished': int(_fast_text(v[6])) if _fast_text(v[6]).isdigit() else 0,
-                            'rt_state': _fast_text(v[7]) if len(v) > 7 else "1"
+                            'rt_state': _fast_text(v[7]) if len(v) > 7 else "1",
+                            'ts_init': int(_fast_text(v[8])) if len(v) > 8 and _fast_text(v[8]).isdigit() else 0
                         })
                     print(f"👁️ [{node.name}] Hardcoded-Bypass กวาดงานตรงจาก rTorrent สำเร็จ: {len(raw_torrents_data)} ตัว")
             except Exception as e:
@@ -1795,30 +1945,24 @@ def smart_reclaim_process(node, required_gb, is_emergency=False, node_type="qbit
 
         for t in raw_torrents_data:
             try:
-                # 1. สกัดชื่อและเรโช
                 t_name = t.get('name', 'Unknown')
                 raw_ratio = t.get('ratio', 0.0)
                 t_ratio = float(raw_ratio) if raw_ratio is not None else 0.0
                 if t_ratio < 0: t_ratio = 0.0
                 
-                # 2. สกัดสถานะและความก้าวหน้า
                 progress_val = float(t.get('progress', 1.0 if t.get('is_rt_complete') else 0.0))
                 state = str(t.get('state', t.get('status', 'seeding' if t.get('is_rt_complete') else 'downloading'))).lower()
                 amt_left = float(t.get('amount_left', 0 if t.get('is_rt_complete') else -1))
                 
-                # 3. ตรวจเช็กเวลาปล่อยงาน (Seeded Time) แยกตามประเภท Node
                 seeded_time_str = "N/A"
                 if node_type == "qbit":
-                    # ค้นหาฟิลด์เวลาปล่อยงานสะสมของ qBittorrent
                     seeding_time = t.get('seeding_time', t.get('time_active', 0))
                     if 'seeding_time' in t and seeding_time > 0:
                         hours = seeding_time / 3600
                         seeded_time_str = f"{hours:.1f}h" if hours < 24 else f"{hours/24:.1f}d"
                     else:
-                        # แผนสำรองถ้าไม่มีฟิลด์ตรงๆ
                         seeded_time_str = "Active"
                 else:
-                    # ของ rTorrent คำนวณจาก Timestamp ปัจจุบันลบด้วยเวลาที่ดาวน์โหลดเสร็จ
                     ts_fin = t.get('ts_finished', 0)
                     if ts_fin > 0 and current_ts > ts_fin:
                         diff_sec = current_ts - ts_fin
@@ -1827,7 +1971,6 @@ def smart_reclaim_process(node, required_gb, is_emergency=False, node_type="qbit
                     else:
                         seeded_time_str = "Stopped/No-Ts"
 
-                # 4. เช็กสถานะงานเสร็จสมบูรณ์ 3 ชั้น
                 is_completed = any(x in state for x in ['seed', 'upload', 'stalledup', 'completed']) or t.get('is_rt_complete') is True
                 if not is_completed:
                     is_completed = (0.99 <= progress_val <= 1.0) or (progress_val >= 99.0) or (amt_left == 0)
@@ -1835,17 +1978,33 @@ def smart_reclaim_process(node, required_gb, is_emergency=False, node_type="qbit
                     if progress_val >= 1.0 or progress_val >= 99.0 or amt_left == 0:
                         is_completed = True
 
-                # 5. คำนวณขนาด (GB)
                 size_bytes = float(t.get('total_size', t.get('size', t.get('size_bytes', 0))))
                 t_size_gb = size_bytes / (1024**3)
                 if t_size_gb == 0 and 'size' in t:
                     t_size_gb = float(t['size'])
 
-                # ผูก Metadata ทั้งหมดเก็บไว้เตรียมเขียนรายงานสังหาร
                 t['_calculated_size_gb'] = t_size_gb
                 t['_calculated_ratio'] = t_ratio
                 t['_calculated_seed_time'] = seeded_time_str
 
+                # 🔥 [🛡️ HARDENED SAFETY LOCK AGE-GATE]: เกราะป้องกันสอยงานแอดใหม่ด่วนพิเศษ
+                if node_type == "qbit":
+                    added_on = t.get('added_on', 0)
+                    seeding_time = t.get('seeding_time', 0)
+                    # ถ้าแอดเข้าเครื่องยังไม่ถึง 45 นาที (2700 วินาที) หรือ เริ่มปล่อยงานจริงยังไม่ถึง 5 นาที (300 วินาที) -> ข้ามทันที ห้ามแตะ!
+                    if (current_ts - added_on) < 2700 or (seeding_time > 0 and seeding_time < 300):
+                        continue
+                else:
+                    ts_fin = t.get('ts_finished', 0)
+                    ts_init = t.get('ts_init', 0)
+                    # ป้องกันกรณี rTorrent คืนค่าเป็น 0 ตอนแอดใหม่ หรือเวลาเช็กน้อยกว่า 45 นาที
+                    if ts_fin == 0 or (current_ts - ts_fin) < 2700:
+                        continue
+                    # ป้องกันงานแอดใหม่เอี่ยมที่ตัวแอปยังสลับสเตตัสไม่นิ่ง (เช็กอายุการสร้างก้อนงานในเครื่องขั้นต่ำ 45 นาที)
+                    if ts_init > 0 and (current_ts - ts_init) < 2700:
+                        continue
+
+                # สิ้นสุดส่วน Safe Guard (เงื่อนไขดั้งเดิมจะประมวลผลต่อด้านล่างอย่างปลอดภัย)
                 if is_completed:
                     if is_emergency:
                         if t_size_gb >= 1.0: scannable_torrents.append(t)
@@ -1867,7 +2026,6 @@ def smart_reclaim_process(node, required_gb, is_emergency=False, node_type="qbit
             print(f"⚠️ [{node.name}] ตรวจวิเคราะห์ข้อมูลตรงแล้ว ไม่พบไฟล์ตรงตามเงื่อนไขกู้ภัย")
             return False
 
-        # เรียงคิวเชือดตามความคุ้มค่าสูงสุด: ขนาดใหญ่สุด และเรโชต่ำที่สุดโดนก่อน
         scannable_torrents.sort(key=lambda x: (-x['_calculated_size_gb'], x['_calculated_ratio']))
 
         virtual_free_gb = current_free
@@ -1889,30 +2047,45 @@ def smart_reclaim_process(node, required_gb, is_emergency=False, node_type="qbit
 
         print(f"🧹 [{node.name}] บายพาสล็อกเป้าหมายเตรียมกวาดล้าง {len(targets_to_delete)} รายการ -> ยิงคำสั่งทำลายข้อมูลจริง")
         
+        # ยิงคำสั่งลบแบบกลุ่ม (Bulk 3-Step Sequence)
         bulk_success = False
         if node_type == "qbit":
             bulk_success = _bulk_delete_qbit(node, target_hashes)
         else:
             bulk_success = _bulk_delete_rtorrent(node, target_hashes)
 
-        # 🎯 ประกอบข้อความ Log แสดงผลแบบละเอียดสูงตามต้องการ
         if bulk_success:
             for t in targets_to_delete:
                 t_name = t.get('name', 'Unknown')
                 name_safeguard = t_name[:28] + "..." if len(t_name) > 28 else t_name
                 log_entry = f"  🔥 [Purged] {name_safeguard} | ขนาด: {t['_calculated_size_gb']:.2f}GB | เรโช: {t['_calculated_ratio']:.2f} | เวลาปล่อย: {t['_calculated_seed_time']}"
                 reclaimed_logs.append(log_entry)
-                print(log_entry) # พ่นออก Console Debug
+                print(log_entry)
         else:
-            print("⚠️ Bulk purge failed, falling back to sequential delete.")
+            print("⚠️ Bulk purge failed, falling back to sequential 3-step hardened delete.")
             for t in targets_to_delete:
-                if node.delete_torrent(t.get('hash')):
-                    t_name = t.get('name', 'Unknown')
-                    name_safeguard = t_name[:28] + "..." if len(t_name) > 28 else t_name
-                    log_entry = f"  ⚠️ [Fallback] {name_safeguard} | ขนาด: {t['_calculated_size_gb']:.2f}GB | เรโช: {t['_calculated_ratio']:.2f} | เวลาปล่อย: {t['_calculated_seed_time']}"
-                    reclaimed_logs.append(log_entry)
-                    print(log_entry)
-                    time.sleep(0.1)
+                h = t.get('hash')
+                try:
+                    if node_type == "qbit":
+                        node.s.post(f"{node.url}/api/v2/torrents/reannounce", data={"hashes": h}, auth=node.auth, verify=False, timeout=3)
+                        node.s.post(f"{node.url}/api/v2/torrents/pause", data={"hashes": h}, auth=node.auth, verify=False, timeout=3)
+                        time.sleep(0.2)
+                        deleted = node.delete_torrent(h)
+                    else:
+                        node.s.post(node.url, data=f'<?xml version="1.0"?><methodCall><methodName>d.tracker_announce</methodName><params><param><value><string>{h}</string></value></param></params></methodCall>', auth=node.auth, verify=False, timeout=3)
+                        node.s.post(node.url, data=f'<?xml version="1.0"?><methodCall><methodName>d.stop</methodName><params><param><value><string>{h}</string></value></param></params></methodCall>', auth=node.auth, verify=False, timeout=3)
+                        time.sleep(0.2)
+                        deleted = node.delete_torrent(h)
+                        
+                    if deleted:
+                        t_name = t.get('name', 'Unknown')
+                        name_safeguard = t_name[:28] + "..." if len(t_name) > 28 else t_name
+                        log_entry = f"  ⚠️ [Fallback-Seq] {name_safeguard} | ขนาด: {t['_calculated_size_gb']:.2f}GB | เรโช: {t['_calculated_ratio']:.2f} | เวลาปล่อย: {t['_calculated_seed_time']}"
+                        reclaimed_logs.append(log_entry)
+                        print(log_entry)
+                except Exception as seq_err:
+                    print(f"❌ Fallback ลบไฟล์เดี่ยวติดปัญหา: {seq_err}")
+                time.sleep(0.1)
 
         if reclaimed_logs and callable(globals().get('send_notify')):
             header_str = f"🚨 <b>[Emergency Bypass Smart Reclaim]</b> [{node.name}]\n" if is_emergency else f"🧹 <b>[Normal Smart Reclaim]</b> [{node.name}]\n"
@@ -2764,43 +2937,48 @@ def extract_torrent_data(row, base_url, dl_session=None, headers=None):
     }
 
 def format_site_stats_report(all_nodes):
+    # โครงสร้างใหม่: { 'Site_Name': { 'Node_Name': { 'up_gb': X, 'speed_mb': Y, 'count': Z } } }
     combined_stats = {}
     errors = []
-    total_speed = 0
-    total_upload = 0
-    total_files = 0
 
     for node in all_nodes:
+        node_name = getattr(node, 'name', 'Unknown Node').strip()
         try:
             node_data = node.get_stats_by_site()
-            if not node_data: continue
+            if not node_data: 
+                continue
 
             for site, data in node_data.items():
                 site_name = str(site).strip() if site else "Unknown"
-                # กรองพวก Category ขยะ (ถ้ามี)
+                # กรอง Category ขยะ
                 if site_name.lower() in ['', 'none', 'uncategorized', 'default']: 
                     site_name = "Other"
                 
+                # ตรวจสอบและประกาศ Dict รองรับชั้น Tracker
                 if site_name not in combined_stats:
-                    combined_stats[site_name] = {'up_gb': 0, 'speed_mb': 0, 'count': 0}
+                    combined_stats[site_name] = {}
                 
+                # แปลงหน่วยเก็บราย Node
                 up_gb = data.get('total_up_bytes', 0) / (1024**3)
                 speed_mb = data.get('current_speed_bytes', 0) / (1024**2)
                 file_count = data.get('count', 0)
 
-                combined_stats[site_name]['up_gb'] += up_gb
-                combined_stats[site_name]['speed_mb'] += speed_mb
-                combined_stats[site_name]['count'] += file_count
-                
-                # เก็บยอดรวมสะสม
-                total_speed += speed_mb
-                total_upload += up_gb
-                total_files += file_count
+                # ถ้า Node นี้เคยมีข้อมูลใน Tracker นี้แล้ว (เผื่อเคสซ้ำ) ให้บวกเพิ่ม
+                if node_name in combined_stats[site_name]:
+                    combined_stats[site_name][node_name]['up_gb'] += up_gb
+                    combined_stats[site_name][node_name]['speed_mb'] += speed_mb
+                    combined_stats[site_name][node_name]['count'] += file_count
+                else:
+                    combined_stats[site_name][node_name] = {
+                        'up_gb': up_gb,
+                        'speed_mb': speed_mb,
+                        'count': file_count
+                    }
 
         except Exception as e:
-            errors.append(f"{getattr(node, 'name', 'Node')}: {str(e)}")
+            errors.append(f"{node_name}: {str(e)}")
 
-    # สร้างข้อความ
+    # เริ่มสร้างข้อความหัวรายงาน
     current_time = datetime.now().strftime("%H:%M:%S")
     msg = f"📊 <b>Universal Auto-Pilot Stats</b>\n"
     msg += f"🕒 <i>Last Sync: {current_time} | 🛰 Nodes: {len(all_nodes)}</i>\n\n"
@@ -2808,30 +2986,61 @@ def format_site_stats_report(all_nodes):
     if not combined_stats:
         return msg + "⚠️ No active data from nodes."
 
-    # ตารางสถิติ
-    msg += "```bash\n"
-    msg += f"{'Tracker':<12} | {'Upload':<9} | {'Speed':<9}\n"
-    msg += "-" * 35 + "\n"
+    # วนลูปสร้างตารางแยกตาม Tracker (เรียงชื่อ Tracker ตามลำดับอักษร หรือปรับเปลี่ยนได้)
+    for site_name, nodes_data in sorted(combined_stats.items()):
+        
+        # กรองเอาเฉพาะ Node ที่มีไฟล์วิ่งอยู่ในเว็บนี้จริงๆ
+        active_nodes = {n: d for n, d in nodes_data.items() if d['count'] > 0}
+        if not active_nodes:
+            continue
 
-    # เรียงตาม Speed
-    sorted_sites = sorted(combined_stats.items(), key=lambda x: x[1]['speed_mb'], reverse=True)
+        # เปิดหัวข้อ Tracker
+        msg += f"Tracker: <b>{site_name.upper()}</b>\n"
+        msg += "```bash\n"
+        msg += f"{'Node':<10} | {'Upload':<10} | {'Speed':<10}\n"
+        msg += "-" * 37 + "\n"
 
-    for site, stat in sorted_sites:
-        if stat['count'] > 0:
-            # ปรับการแสดงผล Speed ถ้ามากกว่า 1024 MB/s ให้โชว์เป็น GB/s
-            speed_str = f"{stat['speed_mb']:>6.1f} M"
+        track_total_up = 0
+        track_total_speed = 0
+        node_count = len(active_nodes)
+
+        # วนลูปแสดงสถิติราย Node ภายใต้ Tracker นี้
+        for n_name, stat in active_nodes.items():
+            # ปรับหน่วยความเร็ว (ถ้าวิ่งเกิน 1024 MB/s ให้ตัดขึ้นเป็น GB/s)
             if stat['speed_mb'] >= 1024:
-                speed_str = f"{stat['speed_mb']/1024:>6.2f} G"
+                speed_str = f"{stat['speed_mb']/1024:>5.2f} GB/s"
+            else:
+                speed_str = f"{stat['speed_mb']:>5.1f} MB/s"
 
-            msg += f"{site[:12]:<12} | {stat['up_gb']:>6.1f}G | {speed_str}/s\n"
+            msg += f"{n_name[:10]:<10} | {stat['up_gb']:>5.1f} GB | {speed_str}\n"
+            
+            # สมทบยอดรวมใน Tracker นี้
+            track_total_up += stat['up_gb']
+            track_total_speed += stat['speed_mb']
 
-    msg += "-" * 35 + "\n"
-    # บรรทัดสรุปยอดรวม
-    msg += f"{'TOTAL':<12} | {total_upload:>6.1f}G | {total_speed/1024 if total_speed >= 1024 else total_speed:>6.1f} {'GB/s' if total_speed >= 1024 else 'MB/s'}\n"
-    msg += "```"
+        msg += "-" * 37 + "\n"
+        
+        # คำนวณยอดรวม (TOTAL) ของ Tracker นี้
+        if track_total_speed >= 1024:
+            total_speed_str = f"{track_total_speed/1024:>5.2f} GB/s"
+        else:
+            total_speed_str = f"{track_total_speed:>5.1f} MB/s"
+        msg += f"{'TOTAL':<10} | {track_total_up:>5.1f} GB | {total_speed_str}\n"
 
+        # คำนวณค่าเฉลี่ย (AVG) ต่อ Node ของ Tracker นี้
+        avg_up = track_total_up / node_count if node_count > 0 else 0
+        avg_speed = track_total_speed / node_count if node_count > 0 else 0
+        if avg_speed >= 1024:
+            avg_speed_str = f"{avg_speed/1024:>5.2f} GB/s"
+        else:
+            avg_speed_str = f"{avg_speed:>5.1f} MB/s"
+        msg += f"{'AVG':<10} | {avg_up:>5.1f} GB | {avg_speed_str}\n"
+        
+        msg += "```\n"
+
+    # แสดงผล Error ด้านล่างสุด (ถ้ามี)
     if errors:
-        msg += f"\n❌ <b>Errors ({len(errors)}):</b> <code>{errors[0][:40]}...</code>"
+        msg += f"❌ <b>Errors ({len(errors)}):</b> <code>{errors[0][:40]}...</code>"
 
     return msg
     
