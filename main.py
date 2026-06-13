@@ -1,4 +1,6 @@
+from fake_useragent import UserAgent
 import random
+import cloudscraper
 import threading
 import chardet
 import gzip
@@ -7,19 +9,27 @@ import os
 import re
 import hashlib
 import json
+import bencodepy
 import requests
 import urllib3
+import ssl
 import base64
 import signal
 import sys
 import platform
 import shutil
+from requests.adapters import HTTPAdapter
+from urllib3.poolmanager import PoolManager
+from pyvirtualdisplay import Display
+import asyncio
+import nodriver as uc
+from nodriver import cdp, Config
 import pytz
+from contextlib import asynccontextmanager
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
 import ddddocr
 import io
 from xml.sax.saxutils import escape
@@ -28,25 +38,51 @@ print = functools.partial(print, flush=True)
 
 ocr = ddddocr.DdddOcr(show_ad=False)
 
-def handle_exit(sig, frame):
-    reasons = {
-        signal.SIGINT: "User Interrupted (Ctrl+C)",
-        signal.SIGHUP: "Terminal Closed (SIGHUP)",
-        signal.SIGTERM: "Process Killed (SIGTERM)"
-    }
-    reason = reasons.get(sig, f"Signal {sig}")
-    stop_msg = f"🛑 Universal Auto-Pilot : Stopped\nReason: {reason}"
-    print(f"\n{stop_msg}")
-    try: send_notify(stop_msg)
-    except: pass
-    os._exit(0)
+stop_event = asyncio.Event()
 
-signal.signal(signal.SIGINT, handle_exit)
-signal.signal(signal.SIGTERM, handle_exit)
-if sys.platform != "win32":
-    signal.signal(signal.SIGHUP, handle_exit)
-    import codecs
-    sys.stdout = codecs.getwriter("utf-8")(sys.stdout.buffer)
+async def handle_exit(sig):
+    if stop_event.is_set(): return
+    stop_event.set()
+    
+    print(f"\n🛑 ได้รับสัญญาณ {sig}, กำลังสั่งปิดระบบแบบเร่งด่วน...")
+
+    # 1. ปิด Browser และ Xvfb ไปพร้อมกัน (ไม่รอทีละขั้นตอน)
+    async def fast_close_browser():
+        global browser_instance
+        if browser_instance:
+            print("⏳ [Step 1/3] กำลังหยุด Browser...")
+            try:
+                if hasattr(browser_instance, 'stop'):
+                    await asyncio.wait_for(browser_instance.stop(), timeout=3)
+            except: pass
+            kill_specific_browser()
+            await cleanup_profile()
+            browser_instance = None
+            print("✅ [Step 1/3] Browser ปิดเรียบร้อย")
+
+    # สั่งงานปิด Browser และ Xvfb แบบคู่ขนาน
+    cleanup_tasks = [
+        asyncio.create_task(fast_close_browser()),
+        asyncio.create_task(asyncio.to_thread(kill_xvfb)) 
+    ]
+
+    # 2. ยกเลิก Task อื่นๆ ในระบบทันที
+    print("⏳ [Step 2/3] กำลังเคลียร์ Task ค้าง...")
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and t not in cleanup_tasks]
+    for task in tasks:
+        task.cancel()
+    
+    # 3. แจ้งเตือน (ทำไปพร้อมกับการปิดของ)
+    print("⏳ [Step 3/3] กำลังส่งข้อความแจ้งเตือน...")
+    try:
+        await safe_send_notify(f"🛑 Universal Auto-Pilot : Stopped\nReason: Signal {sig}")
+    except: pass
+
+    # รอให้ทุกอย่างจบลงอย่างสมบูรณ์
+    await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+    
+    print("👋 ระบบปิดตัวสมบูรณ์")
+    os._exit(0)
 
 urllib3.disable_warnings()
 
@@ -66,69 +102,79 @@ def load_full_config():
     with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
         return json.load(f)
 
-def send_notify(msg, raw_data=None):
+async def safe_send_notify(msg, *args, **kwargs):
+    try:
+        # เรียก send_notify ตรงๆ ไม่ต้องผ่าน globals()
+        # ตรวจสอบก่อนว่ามันเป็น coroutine หรือไม่
+        if asyncio.iscoroutinefunction(send_notify):
+            await send_notify(msg, *args, **kwargs)
+        else:
+            await asyncio.to_thread(send_notify, msg, *args, **kwargs)
+    except Exception as e:
+        print(f"🚨 [SafeNotify System Error]: {e}")
+        # สำคัญ: ต้องคืนค่าเสมอ เพื่อไม่ให้ await ต่อไปพัง
+        return False 
+    return True
+
+async def send_notify(msg, raw_data=None):
     """
-    ส่งแจ้งเตือนผ่าน Messaging API, Telegram และ Discord DM
+    Async wrapper สำหรับการส่งแจ้งเตือน แบบปลอดภัยและไม่บล็อก Loop
     """
-    cfg = load_full_config()
-    msg = msg.strip()
+    try:
+        # ใช้ to_thread ซึ่งจัดการเรื่อง thread pool ให้อัตโนมัติและเสถียรกว่า
+        await asyncio.to_thread(_send_notify_sync, msg)
+    except Exception as e:
+        with open("bot_error.log", "a", encoding="utf-8") as f:
+            f.write(f"{datetime.datetime.now()} - Error: {e}\n")
+        print(f"⚠️ [Notification Error] รายละเอียดถูกบันทึกลง log แล้ว: {e}")
 
-    # เตรียมข้อความ
-    discord_msg = msg.replace('<b>', '**').replace('</b>', '**')
-    line_clean_msg = msg.replace('<b>', '').replace('</b>', '')
+def _send_notify_sync(msg):
+    try:
+        cfg = load_full_config()
+        msg = msg.strip()
+        discord_msg = msg.replace('<b>', '**').replace('</b>', '**')
+        line_clean_msg = msg.replace('<b>', '').replace('</b>', '')
 
-    # 1. LINE Messaging API (คงเดิม)
-    line_cfg = cfg.get('LINE_CONFIG', {})
-    if line_cfg.get('enable') and line_cfg.get('access_token'):
-        url = "https://api.line.me/v2/bot/message/push"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {line_cfg.get('access_token')}"
-        }
-        payload = {
-            "to": line_cfg.get('user_id'),
-            "messages": [{"type": "text", "text": line_clean_msg}]
-        }
-        try: requests.post(url, json=payload, headers=headers, timeout=10)
-        except: pass
+        # 1. LINE
+        line_cfg = cfg.get('LINE_CONFIG', {})
+        if line_cfg.get('enable') and line_cfg.get('access_token'):
+            try:
+                requests.post("https://api.line.me/v2/bot/message/push", 
+                              json={"to": line_cfg.get('user_id'), "messages": [{"type": "text", "text": line_clean_msg}]},
+                              headers={"Authorization": f"Bearer {line_cfg.get('access_token')}"}, timeout=10)
+            except Exception as e:
+                print(f"LINE Error: {e}")
 
-    # 2. Telegram Bot (คงเดิม)
-    tele_cfg = cfg.get('TELEGRAM_CONFIG', {})
-    if tele_cfg.get('notify_enable') and tele_cfg.get('main_bot_token'):
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{tele_cfg.get('main_bot_token')}/sendMessage",
-                json={'chat_id': tele_cfg.get('chat_id'), 'text': msg, 'parse_mode': 'HTML'},
-                timeout=10
-            )
-        except: pass
+        # 2. Telegram
+        tele_cfg = cfg.get('TELEGRAM_CONFIG', {})
+        if tele_cfg.get('notify_enable') and tele_cfg.get('main_bot_token'):
+            try:
+                requests.post(f"https://api.telegram.org/bot{tele_cfg.get('main_bot_token')}/sendMessage",
+                              json={'chat_id': tele_cfg.get('chat_id'), 'text': msg, 'parse_mode': 'HTML'}, timeout=10)
+            except Exception as e:
+                print(f"Telegram Error: {e}")
 
-    # 3. Discord DM (ปรับปรุงใหม่)
-    disc_cfg = cfg.get('DISCORD_CONFIG', {})
-    bot_token = disc_cfg.get('remote_bot_token') # ใช้ Token เดียวกับบอทรีโมท
-    admin_id = disc_cfg.get('admin_id')
-
-    if disc_cfg.get('notify_enable') and bot_token and admin_id:
-        try:
-            # ขั้นตอนที่ 1: สร้าง DM Channel กับ Admin
-            create_dm_url = "https://discord.com/api/v10/users/@me/channels"
-            headers = {
-                "Authorization": f"Bot {bot_token}",
-                "Content-Type": "application/json"
-            }
-            # ส่ง recipient_id (Admin ID) เพื่อขอเปิดห้องแชท
-            dm_channel_res = requests.post(create_dm_url, json={"recipient_id": str(admin_id)}, headers=headers, timeout=10)
-
-            if dm_channel_res.status_code == 200:
-                channel_id = dm_channel_res.json().get('id')
-                # ขั้นตอนที่ 2: ส่งข้อความเข้าไปใน Channel ID ที่ได้มา
-                send_msg_url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
-                payload = {
-                    "content": f"🔔 **[Universal Notification]**\n{discord_msg}"
-                }
-                requests.post(send_msg_url, json=payload, headers=headers, timeout=10)
-        except Exception as e:
-            print(f"⚠️ Discord DM Notify Error: {e}")
+        # 3. Discord
+        disc_cfg = cfg.get('DISCORD_CONFIG', {})
+        bot_token = disc_cfg.get('remote_bot_token')
+        admin_id = disc_cfg.get('admin_id')
+        if disc_cfg.get('notify_enable') and bot_token and admin_id:
+            try:
+                headers = {"Authorization": f"Bot {bot_token}", "Content-Type": "application/json"}
+                res = requests.post("https://discord.com/api/v10/users/@me/channels", 
+                                    json={"recipient_id": str(admin_id)}, headers=headers, timeout=10)
+                if res.status_code == 200:
+                    channel_id = res.json().get('id')
+                    requests.post(f"https://discord.com/api/v10/channels/{channel_id}/messages",
+                                  json={"content": f"🔔 **[Universal Notification]**\n{discord_msg}"}, headers=headers, timeout=10)
+            except Exception as e:
+                print(f"Discord Error: {e}")
+        
+        return True # <--- สำคัญมาก: ให้ฟังก์ชันส่งค่ากลับเสมอ
+        
+    except Exception as e:
+        print(f"Critical _send_notify_sync Error: {e}")
+        return False # <--- คืนค่า False เมื่อเกิดความผิดพลาด
 
 # กำหนด Timezone ไทย
 tz = pytz.timezone('Asia/Bangkok')
@@ -142,20 +188,24 @@ def load_data(path):
     with open(path, "r", encoding='utf-8') as f: return set(x.strip().lower() for x in f if x.strip())
 
 def get_auth_file(site_key):
-    """ส่งกลับชื่อไฟล์ auth แยกตามเว็บ เช่น auth_UNLIMITZ.json"""
+    """ส่งกลับชื่อไฟล์ auth แยกตามเว็บ เช่น auth_BEARBIT.json"""
     try:
-        # สร้างโฟลเดอร์สำหรับเก็บประวัติถ้ายังไม่มี
+        # ใช้ os.path.dirname เพื่อให้แน่ใจว่าเก็บในโฟลเดอร์เดียวกับสคริปต์
+        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
         auth_dir = os.path.join(BASE_DIR, "auth")
-        if not os.path.exists(auth_dir):
-            os.makedirs(auth_dir, exist_ok=True) # ใช้ exist_ok=True เพื่อป้องกัน Error กรณี Race Condition
-            
-        # ทำความสะอาด site_key ป้องกันอักขระพิเศษที่มีผลกับชื่อไฟล์
-        clean_key = "".join(c for c in site_key if c.isalnum() or c in (' ', '.', '_')).rstrip()
-        filename = f"auth_{clean_key.upper()}.json"
         
+        # สร้างโฟลเดอร์
+        os.makedirs(auth_dir, exist_ok=True)
+            
+        # ทำความสะอาด site_key ให้เป็นตัวพิมพ์ใหญ่และเปลี่ยนช่องว่างเป็น _
+        clean_key = "".join(c for c in site_key if c.isalnum() or c in (' ', '.', '_'))
+        clean_key = clean_key.strip().replace(' ', '_').upper()
+        
+        filename = f"auth_{clean_key}.json"
         return os.path.join(auth_dir, filename)
+        
     except Exception as e:
-        print(f"❌ เกิดข้อผิดพลาดในการสร้างเส้นทางไฟล์: {e}")
+        print(f"❌ [Auth] เกิดข้อผิดพลาดในการสร้างเส้นทางไฟล์: {e}")
         return None
 
 def get_seen_file(site_key):
@@ -212,10 +262,23 @@ def save_data(path, data):
 
 def extract_info_hash(torrent_content):
     try:
-        start = torrent_content.find(b'4:info') + 6
-        if start < 6: return None
-        return hashlib.sha1(torrent_content[start:-1]).hexdigest().lower()
-    except: return None
+        # ใช้ bencodepy ในการ decode ไฟล์ .torrent
+        # ข้อมูลที่ได้จะเป็น OrderedDict หรือ dict ที่ key เป็น bytes
+        metadata = bencodepy.decode(torrent_content)
+        
+        # เข้าถึงคีย์ 'info' ด้วย byte string b'info'
+        info_data = metadata[b'info']
+        
+        # เข้ารหัสส่วน info กลับเป็น bencode เพื่อคำนวณ hash
+        info_encoded = bencodepy.encode(info_data)
+        
+        # คำนวณ SHA1 Hash
+        return hashlib.sha1(info_encoded).hexdigest().lower()
+        
+    except Exception as e:
+        # หาก decode ไม่สำเร็จ แสดงว่าไฟล์อาจไม่ใช่ torrent หรือ corrupted
+        print(f"DEBUG: ไม่สามารถสกัด Hash ได้: {e}")
+        return None
 
 def parse_size(size_str):
     """แปลง Text สถิติจากหน้าเว็บ (TB, GB, MB) ให้เป็นตัวเลขหน่วย GB"""
@@ -296,18 +359,19 @@ def check_freeload_status(row):
 
     return 0
 
-def check_pending_status(session, details_url):
+async def check_pending_status(session, details_url):
     """
     ตรวจสอบสถานะ (รอการอนุมัติ) โดยเข้าหน้ารายละเอียดโดยตรง
     """
     try:
-        # ใช้ details_url ที่รับมาได้เลย
-        r = session.get(details_url, timeout=10, verify=False)
-        if r.status_code == 200:
+        # 1. ต้องใช้ await เพราะเมธอด get ของ BrowserSessionWrapper เป็น async
+        r = await session.get(details_url, timeout=10)
+        
+        # 2. ตรวจสอบว่า r ไม่ใช่ None (เผื่อกรณี get แล้วพัง)
+        if r and hasattr(r, 'status_code') and r.status_code == 200:
             soup = BeautifulSoup(r.text, 'html.parser')
             page_text = soup.get_text()
             
-            # เช็ค Keyword สำหรับ TorrentDD และเว็บทั่วไป
             if "(รอการอนุมัติ)" in page_text or "รอการอนุมัติ" in page_text:
                 return True
         return False
@@ -317,55 +381,244 @@ def check_pending_status(session, details_url):
 
 # ========================= BROWSER ENGINE =========================
 
-def get_universal_browser():
+def get_universal_browser_path():
+    """ค้นหาตำแหน่งการติดตั้งเบราว์เซอร์ตระกูล Chromium ภายในเครื่องอย่างละเอียด"""
     current_os = platform.system().lower()
+    
     if current_os == "windows":
-        search_map = {
-            "chromium": [os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"), os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe")],
-            "firefox": [os.path.expandvars(r"%ProgramFiles%\Mozilla Firefox\firefox.exe")]
-        }
-    else:
-        search_map = {
-            "chromium": ["/usr/bin/google-chrome-stable", "/usr/bin/google-chrome", "/usr/bin/chromium-browser"],
-            "firefox": ["/usr/bin/firefox", "/usr/bin/firefox-esr"]
-        }
-    for path in search_map["chromium"]:
-        if os.path.exists(path): return {"type": "chromium", "path": path}
-    for path in search_map["firefox"]:
-        if os.path.exists(path): return {"type": "firefox", "path": path}
+        # ดึง Environment Variables ที่จำเป็นแบบปลอดภัย
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        local_app_data = os.environ.get("LOCALAPPDATA", os.path.expanduser(r"~\AppData\Local"))
+        
+        search_paths = [
+            # Google Chrome
+            os.path.join(program_files, "Google", "Application", "chrome.exe"),
+            os.path.join(program_files_x86, "Google", "Application", "chrome.exe"),
+            os.path.join(local_app_data, "Google", "Chrome", "Application", "chrome.exe"),
+            # Microsoft Edge
+            os.path.join(program_files, "Microsoft", "Edge", "Application", "msedge.exe"),
+            os.path.join(program_files_x86, "Microsoft", "Edge", "Application", "msedge.exe"),
+            # Brave Browser
+            os.path.join(program_files, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+            os.path.join(local_app_data, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+        ]
+        
+        for path in search_paths:
+            if os.path.exists(path):
+                return path
+
+    else: # Linux (Ubuntu, Debian, Mint, etc.)
+        # 1. ลองหาผ่านระบบ PATH ของ OS ก่อน (ยืดหยุ่นที่สุด)
+        executables = ["google-chrome-stable", "google-chrome", "chromium-browser", "chromium", "brave-browser"]
+        for exe in executables:
+            path = shutil.which(exe)
+            if path:
+                # ใช้ realpath เพื่อตาม Link ไปยังไฟล์ Binary จริงๆ
+                real_path = os.path.realpath(path)
+                if os.access(real_path, os.X_OK):
+                    return real_path
+        
+        # 2. Fallback เผื่อไว้ในกรณีที่ PATH ไม่ครอบคลุม
+        fallback_paths = [
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/brave-browser",
+            "/snap/bin/chromium", # เผื่อเป็น Ubuntu Snap pack
+        ]
+        for path in fallback_paths:
+            if os.path.exists(path):
+                return path
+                
     return None
 
-def launch_any_browser(p):
-    info = get_universal_browser()
-    
-    # เพิ่ม Argument สำหรับ Google DNS และลดภาระระบบ
-    common_args = [
-        "--no-sandbox", 
-        "--disable-gpu", 
-        "--mute-audio",
-        # --- บังคับใช้ Google DNS ผ่าน DoH ---
-        "--dns-over-https-urls=https://dns.google/dns-query",
-        "--ignore-certificate-errors"
-    ]
-    
-    if not info: 
-        return p.chromium.launch(headless=True, args=common_args), "Default Playwright"
-    
-    if info["type"] == "chromium":
-        # เพิ่ม --disable-dev-shm-usage เพื่อป้องกัน Crash บน Docker/VPS
-        return p.chromium.launch(
-            executable_path=info["path"], 
-            headless=True, 
-            args=common_args + ["--disable-dev-shm-usage"]
-        ), info["path"]
-    else:
-        # สำหรับ Firefox จะใช้ config ต่างกันเล็กน้อย (ถ้าจำเป็น)
-        return p.firefox.launch(
-            executable_path=info["path"], 
-            headless=True, 
-            args=common_args
-        ), info["path"]
+_global_display = None
+_active_browser_instance = None #ตัวแปรเพื่อติดตาม instance
+_current_profile_path = None #ตัวแปรเก็บ pathpath
 
+async def launch_any_browser(custom_args=None):
+    global _global_display, _active_browser_instance, _current_profile_path
+    
+    # 1. เคลียร์ Instance เก่า (เพิ่มการหน่วงเวลาเพื่อความเสถียร)
+    if _active_browser_instance:
+        try:
+            await _active_browser_instance.stop()
+            await asyncio.sleep(3) # รอให้ระบบเคลียร์ Process เก่า
+        except:
+            pass
+        _active_browser_instance = None
+
+    # 2. Xvfb Setup
+    xvfb_exists = shutil.which("Xvfb") is not None
+    if xvfb_exists and _global_display is None:
+        print("🖥️ [System] กำลังเปิด Display เสมือน")
+        _global_display = Display(visible=0, size=(1920, 1080))
+        _global_display.start()
+        await asyncio.sleep(2)
+
+    # 3. ใช้ Config ของ nodriver
+    browser_path = get_universal_browser_path()
+    
+    # กำหนด path ใหม่ทุกครั้งที่เปิด
+    _current_profile_path = f"./uc_profile_{random.randint(100, 999)}"
+    
+    config = Config(
+        browser_executable_path=browser_path,
+        user_data_dir=_current_profile_path,
+        headless=False
+    )
+
+    config.sandbox = False 
+    config.no_sandbox = True # เพิ่มตัวนี้เพื่อกัน Error connect
+    config.add_argument("--disable-dev-shm-usage")
+    config.add_argument("--disable-gpu")
+    
+    if isinstance(custom_args, list):
+        for arg in custom_args:
+            config.add_argument(arg)
+
+    # 4. รัน Browser
+    try:
+        _active_browser_instance = await uc.start(config=config)
+        
+        # ตั้งค่า Download Behavior
+        await _active_browser_instance.send(
+            uc.cdp.browser.set_download_behavior(
+                behavior="deny",
+                download_path="/dev/null"
+            )
+        )
+        print(f"🚀 [System] Browser รันสำเร็จ")
+        return _active_browser_instance
+
+    except Exception as e:
+        print(f"❌ [Critical] Browser Start Error: {e}")
+        # ล้างการเชื่อมต่อทั้งหมดหากเปิดไม่สำเร็จ
+        _active_browser_instance = None
+        # ปิด Display หากค้าง
+        if _global_display:
+            try:
+                _global_display.stop()
+            except:
+                pass
+            _global_display = None
+        raise e
+
+def kill_specific_browser():
+    global _active_browser_instance
+    if _active_browser_instance and hasattr(_active_browser_instance, 'browser_pid'):
+        pid = _active_browser_instance.browser_pid
+        try:
+            print(f"🔪 [System] กำลังตรวจสอบและฆ่า Browser PID: {pid}")
+            
+            if sys.platform == "win32":
+                # Windows ใช้ taskkill สั่งฆ่าทั้ง Tree
+                os.system(f"taskkill /F /PID {pid} /T")
+            else:
+                # Linux/Unix: เช็คก่อนว่า process ยังอยู่ไหม
+                try:
+                    os.kill(pid, 0) # ส่ง signal 0 เพื่อเช็คว่า pid ยังมีชีวิตอยู่
+                    pgid = os.getpgid(pid)
+                    os.killpg(pgid, signal.SIGKILL)
+                    print(f"✅ [System] ฆ่า Browser PID {pid} และลูกหลานเรียบร้อย")
+                except ProcessLookupError:
+                    print(f"ℹ️ PID {pid} ไม่พบในระบบ (อาจปิดไปแล้ว)")
+                    
+        except Exception as e:
+            print(f"⚠️ ไม่สามารถฆ่า PID {pid}: {e}")
+        finally:
+            # ไม่ว่าจะฆ่าสำเร็จหรือไม่ ต้องเคลียร์ตัวแปรทิ้งเสมอ
+            _active_browser_instance = None
+
+async def cleanup_profile():
+    global _current_profile_path
+    if _current_profile_path and os.path.exists(_current_profile_path):
+        try:
+            # 1. ใส่ await ให้กับ asyncio.sleep
+            await asyncio.sleep(2) 
+            
+            # 2. ใช้ shutil.rmtree
+            shutil.rmtree(_current_profile_path, ignore_errors=False)
+            print(f"🧹 [System] ลบ Profile สำเร็จ: {_current_profile_path}")
+        except Exception as e:
+            print(f"⚠️ ลบ Profile ไม่ได้ในรอบนี้ (อาจติด Lock): {e}")
+        finally:
+            _current_profile_path = None
+
+def kill_xvfb():
+    global _global_display
+    if _global_display and hasattr(_global_display, 'pid'):
+        pid = _global_display.pid
+        try:
+            print(f"🖥️ [System] กำลังปิด Xvfb (PID: {pid})...")
+            # ฆ่าตาม PID ที่เก็บไว้
+            os.kill(pid, signal.SIGKILL)
+        except Exception as e:
+            print(f"⚠️ ไม่สามารถปิด Xvfb (PID {pid}): {e}")
+        finally:
+            _global_display = None
+    else:
+        # กรณีไม่มี PID ใน object ให้ลองสั่ง pkill ทั่วไป (เผื่อกรณีค้าง)
+        os.system("pkill -9 -f Xvfb")
+
+async def load_cookies_to_browser(tab, site_cfg):
+    auth_path = get_auth_file(site_cfg['name'])
+    if not auth_path or not os.path.exists(auth_path):
+        return
+        
+    with open(auth_path, "r") as f:
+        cookies = json.load(f)
+    
+    for cookie in cookies:
+        try:
+            # ใช้พารามิเตอร์ที่ครบถ้วนและปลอดภัย
+            await tab.send(uc.cdp.network.set_cookie(
+                name=cookie.get('name'),
+                value=cookie.get('value'),
+                domain=cookie.get('domain'),
+                path=cookie.get('path', '/'),
+                secure=cookie.get('secure', False), # เปลี่ยนเป็น False กรณีเข้าผ่าน HTTP
+                http_only=cookie.get('httpOnly', False)
+            ))
+        except Exception as e:
+            # บางครั้งคุกกี้ที่พังๆ ไม่ควรหยุดทั้งการทำงาน
+            continue
+    print(f"✅ [Auth] โหลด Cookie เข้า Browser สำเร็จ")
+
+def create_robust_scraper():
+    # 1. สร้าง scraper ปกติ
+    scraper = cloudscraper.create_scraper(
+        browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
+    )
+    
+    # 2. สร้าง SSL Context แบบไม่เช็คอะไรเลย
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    
+    # 3. สร้าง Adapter โดยใช้ PoolManager ที่มี ssl_context
+    class SSLAdapter(HTTPAdapter):
+        def __init__(self, ssl_context=None, **kwargs):
+            self.ssl_context = ssl_context
+            super().__init__(**kwargs)
+
+        def init_poolmanager(self, connections, maxsize, block=False):
+            self.poolmanager = PoolManager(
+                num_pools=connections, maxsize=maxsize, block=block,
+                ssl_context=self.ssl_context
+            )
+
+    # 4. ใช้ SSLAdapter ที่เตรียมไว้
+    adapter = SSLAdapter(ssl_context=ctx)
+    
+    # การ mount ต้องระวัง: การ mount ทับ 'https://' จะแทนที่ adapter เดิมของ cloudscraper
+    # วิธีที่ปลอดภัยกว่าคือการให้ cloudscraper จัดการตัวมันเอง 
+    # แต่ถ้าจำเป็นต้องใช้ SSLAdapter เพื่อข้าม SSL ปัญหา ก็ต้อง mount แบบนี้ครับ
+    scraper.mount('https://', adapter)
+    
+    return scraper
+    
 # ========================= NODE CLASSES =========================
 
 class QbitNode:
@@ -1005,7 +1258,6 @@ class RtorrentNode:
             if r.status_code != 200: return []
 
             import xml.etree.ElementTree as ET
-            import time
             root = ET.fromstring(r.text)
             data = root.findall(".//value/array/data/value/array/data")
 
@@ -1273,7 +1525,6 @@ class RtorrentNode:
 
                 req_headers = {**getattr(self, 'headers', {}), 'Content-Type': 'text/xml'}
                 self.s.post(self.url, data=xml_cmd.encode('utf-8'), auth=self.auth, headers=req_headers, timeout=5, verify=False)
-                import time
                 time.sleep(0.1)
             except Exception as e:
                 print(f"⚠️ [{self.name}] _force_start ({method}) failed: {e}")
@@ -1450,6 +1701,18 @@ def update_trackers(node):
         print(f"  ⚠️ [{node.name}] Update trackers failed: {e}")
     return False
 
+# ========================= ADD TORRENT =========================
+
+def safe_add_torrent(node, content, site):
+    # ตรวจสอบก่อนว่ามันเป็น callable หรือไม่
+    if hasattr(node, 'add') and callable(node.add):
+        return node.add(content, site_name=site)
+    else:
+        # ถ้ามันถูกเขียนทับเป็น bool เราจะลบมันทิ้งและพยายามเรียกจาก class 
+        # หรือแจ้งเตือนให้ชัดเจน
+        print(f"🚨 ALERT: {node.name}.add ถูกเขียนทับด้วย {type(node.add)}")
+        return False
+        
 # ========================= AUTO CLEAN =========================
 
 class NodeCleaner:
@@ -1474,7 +1737,6 @@ class NodeCleaner:
         3. ยิงคำสั่งลบข้อมูลจริง (Delete) ออกจากดิสก์หลังบ้าน
         """
         try:
-            import time
             if node_type == "qbit":
                 # 1. Update Tracker
                 self.node.s.post(f"{self.node.url}/api/v2/torrents/reannounce", data={"hashes": t_hash}, auth=self.node.auth, verify=False, timeout=5)
@@ -1593,7 +1855,7 @@ class NodeCleaner:
                 msg = f"<b>{status_title}</b> [{self.node.name}]:\n" + "\n".join(notify_lines)
                 
                 if callable(globals().get('send_notify')):
-                    send_notify(msg)
+                    asyncio.create_task(send_notify(msg))
                 else:
                     print(f"📢 Notification (No send_notify func):\n{msg}")
             else:
@@ -1651,7 +1913,6 @@ class NodeCleaner:
     def _clean_qbit(self):
         res_grouped = {}
         try:
-            import time
             headers = {"Accept-Encoding": "gzip, deflate", "Connection": "keep-alive"}
             r = self.node.s.get(f"{self.node.url}/api/v2/torrents/info", auth=self.node.auth, headers=headers, verify=False, timeout=15)
             if r.status_code != 200: 
@@ -1710,7 +1971,6 @@ class NodeCleaner:
 
         soup = None
         try:
-            import time
             req_headers = getattr(self.node, 'headers', {}).copy()
             if "Connection" not in req_headers:
                 req_headers["Connection"] = "close" 
@@ -1789,7 +2049,6 @@ def _bulk_delete_qbit(node, target_hashes):
     🔥 ลอจิก 3 สเต็ป: Re-announce -> Pause -> Bulk Delete
     """
     try:
-        import time
         # 1. Update Tracker (Re-announce) พร้อมกันทุกตัว
         node.s.post(f"{node.url}/api/v2/torrents/reannounce", data={"hashes": "|".join(target_hashes)}, auth=node.auth, verify=False, timeout=5)
         time.sleep(0.5) # รอเน็ตเวิร์กเคลียร์แพ็กเก็ต
@@ -1812,7 +2071,6 @@ def _bulk_delete_rtorrent(node, target_hashes):
     🔥 ลอจิก 3 สเต็ป: d.tracker_announce -> d.stop -> d.erase_data (ยิงคอมโบมัลติคอล)
     """
     try:
-        import time
         # สเต็ปที่ 1: สั่ง Re-announce แทร็กเกอร์พร้อมกันเพื่อบันทึกสถิติรอบสุดท้าย
         xml_announce_parts = ['<?xml version="1.0"?><methodCall><methodName>system.multicall</methodName><params><param><value><array><data>']
         for h in target_hashes:
@@ -1876,7 +2134,6 @@ def smart_reclaim_process(node, required_gb, is_emergency=False, node_type="qbit
             return True
 
         raw_torrents_data = []
-        import time
         current_ts = int(time.time())
         
         if node_type == "qbit":
@@ -2089,7 +2346,7 @@ def smart_reclaim_process(node, required_gb, is_emergency=False, node_type="qbit
 
         if reclaimed_logs and callable(globals().get('send_notify')):
             header_str = f"🚨 <b>[Emergency Bypass Smart Reclaim]</b> [{node.name}]\n" if is_emergency else f"🧹 <b>[Normal Smart Reclaim]</b> [{node.name}]\n"
-            send_notify(header_str + "ระบบทำการกวาดล้างและทวงคืนพื้นที่ดิสก์เสร็จสิ้น รายละเอียดไฟล์:\n" + "\n".join(reclaimed_logs))
+            asyncio.create_task(safe_send_notify(header_str + "ระบบทำการกวาดล้างและทวงคืนพื้นที่ดิสก์เสร็จสิ้น รายละเอียดไฟล์:\n" + "\n".join(reclaimed_logs)))
 
         print(f"⏳ [{node.name}] รอฮาร์ดแวร์จัดสรรบล็อกดิสก์คืน...")
         for attempt in range(20): 
@@ -2123,26 +2380,15 @@ stealth_args = {
     }
 }
 
-def apply_stealth(page):
-    page.add_init_script("""
-        # แก้ทางระบบดีเทค Automation
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        
-        # เพิ่มความเนียนของ Chrome พร็อพเพอร์ตี้
-        window.chrome = { runtime: {} };
-        
-        # หลอกเรื่องภาษาและคุกกี้
-        Object.defineProperty(navigator, 'languages', { get: () => ['th-TH', 'th', 'en-US', 'en'] });
-        
-        # ป้องกันการเช็คผ่านสแต็กของการเรียกฟังก์ชัน (สำคัญ!)
-        const newProto = Navigator.prototype;
-        delete newProto.webdriver;
-        Object.setPrototypeOf(navigator, newProto);
-    """)
-
-def sync_playwright_cookies(context, session):
-    for cookie in context.cookies():
-        session.cookies.set(cookie['name'], cookie['value'], domain=cookie['domain'])
+async def safe_await(coro, context_name="Unknown"):
+    try:
+        result = await coro
+        if result is None:
+            print(f"⚠️ Warning: {context_name} returned NoneType")
+        return result
+    except Exception as e:
+        print(f"🚨 Critical inside {context_name}: {e}")
+        return None
         
 def safe_goto(page, url, retries=3, **kwargs):
     # กำหนดค่าเริ่มต้นถ้าไม่ได้ส่งมาใน kwargs
@@ -2187,70 +2433,74 @@ def clear_and_fill(page, selector, text):
     # รอจังหวะให้ระบบหมุนตรวจสอบแป๊บหนึ่ง
     page.wait_for_timeout(1000)
 
-def ensure_site_logged_in(page, site_cfg):
+async def ensure_site_logged_in(page: uc.Tab, site_cfg: dict) -> bool:
     site_key = site_cfg['name']
+    base_url = site_cfg.get('base_url', '').rstrip('/')
     target_list = site_cfg.get('target_urls', [])
     
-    check_url = ""
-    if target_list:
-        # สุ่มเลือกมา 1 Item
-        chosen_item = random.choice(target_list)
-        
-        # ตรวจสอบว่า item ที่สุ่มมาเป็น Dictionary หรือ String
-        if isinstance(chosen_item, dict):
-            # ถ้าเป็น dict ให้ดึง key 'url' ออกมา (ปรับชื่อ key ให้ตรงกับ JSON ของคุณ)
-            check_url = chosen_item.get('url', chosen_item.get('link', ''))
-        else:
-            # ถ้าเป็น string อยู่แล้วก็ใช้ได้เลย
-            check_url = chosen_item
-            
-    # Fallback ถ้าหา URL ไม่ได้
-    if not check_url or not isinstance(check_url, str):
-        base_url = site_cfg.get('base_url', '').rstrip('/')
-        check_url = f"{base_url}"
+    # 1. การเลือก URL อย่างปลอดภัย (เหมือนเดิม)
+    chosen_item = random.choice(target_list) if target_list else ""
+    check_url = chosen_item.get('url', chosen_item.get('link', '')) if isinstance(chosen_item, dict) else str(chosen_item)
+    final_url = check_url if check_url.startswith('http') else f"{base_url}/{check_url.lstrip('/')}"
 
-    print(f"🔍 [{site_key}] สุ่มตรวจสอบ Session ที่: {check_url}")
+    print(f"🔍 [{site_key}] กำลังตรวจสอบ Session ที่: {final_url}")
     
     try:
-        # ป้องกัน Error .startswith ถ้า check_url หลุดเป็น None
-        final_url = check_url if check_url.startswith('http') else f"{site_cfg.get('base_url').rstrip('/')}/{check_url.lstrip('/')}"
+        await load_cookies_to_browser(page, site_cfg)
+        await page.get(final_url)
+        # รอให้ Body โหลด (หรืออย่างน้อยให้ Cloudflare ตัดสินใจว่าจะขึ้น Challenge ไหม)
+        await asyncio.sleep(3)
         
-        page.goto(final_url, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(2000) 
-        
-        content = page.content()
-        
-        # 3. ตรวจสอบสถานะการล็อกอิน
-        # เช็คชื่อ User หรือคำว่า logout ในหน้าเว็บ
-        is_logged_in = (
-            (site_cfg['username'] in content) or 
-            ("logout.php" in content.lower())
-        )
-        # เช็คว่าหน้าปัจจุบันไม่ใช่หน้า Login (ไม่มีช่องกรอก Password)
-        is_login_page = any(k in content for k in ['type="password"', 'name="password"'])
-
-        if is_logged_in and not is_login_page:
-            print(f"✅ [{site_key}] Session ยัง OK (สุ่มผ่าน)")
-            return True
+        # --- [PASSIVE WAITING LOGIC] ---
+        # วนลูปเช็คว่าหน้าเว็บยังเป็นหน้า Cloudflare Challenge อยู่ไหม
+        for attempt in range(10): # รอสูงสุด 50 วินาที (10 * 5s)
+            content = await page.get_content()
+            content_lower = content.lower()
             
-        print(f"🔑 [{site_key}] พบว่า Session หลุด -> กำลังส่งไป universal_login")
-        return universal_login(page, site_cfg)
+            # เช็คคำที่มักปรากฏบนหน้า Cloudflare
+            is_cf = any(k in content_lower for k in ["just a moment", "กำลังทำการตรวจสอบความปลอดภัย", "cf-chl-widget"])
+            
+            if is_cf:
+                print(f"🛡️ [{site_key}] ตรวจพบ Cloudflare... รอ (Passive Waiting) รอบที่ {attempt+1}...")
+                await page.send(
+                    uc.cdp.input_.dispatch_mouse_event(
+                        type_='mouseMoved',
+                        x=random.randint(100, 500),
+                        y=random.randint(100, 500)
+                    )
+                )
+                await asyncio.sleep(5)
+            else:
+                break # หลุดจากด่านแล้ว ไปเช็ค Session ต่อ
+        # -------------------------------
+        
+        # หลังจากรอผ่านด่านแล้ว จึงค่อยเช็ค Session ตามปกติ
+        content = await page.get_content()
+        
+        has_logout_link = False
+        if "logout.php" in content or "/user/account/logout" in content:
+            has_logout_link = True
+
+        is_logged_in = (site_cfg['username'].lower() in content.lower()) or has_logout_link
+        
+        if is_logged_in and len(content) > 1000:
+            print(f"✅ [{site_key}] Session ยังคงใช้งานได้อยู่")
+            return True
+
+        print(f"🔑 [{site_key}] ไม่พบ Session ที่ถูกต้อง -> เริ่มกระบวนการ Login")
+        return await universal_login(page, site_cfg)
 
     except Exception as e:
-        print(f"⚠️ [{site_key}] เข้าหน้าเช็คไม่สำเร็จ: {str(e)} -> ลอง Login ใหม่")
-        return universal_login(page, site_cfg)
+        print(f"⚠️ Error เช็คหน้าเว็บ ({site_key}): {e}")
+        await page.reload()
+        await asyncio.sleep(5)
+        return await universal_login(page, site_cfg)
 
-def universal_login(page, site_cfg):
-    # 1. ดึงชื่อ Site และข้อมูลเบื้องต้นจาก Object โดยตรง
+async def universal_login(page: uc.Tab, site_cfg: dict) -> bool:
     site_key = site_cfg['name']
+    base_url = site_cfg.get('base_url', '').rstrip('/')
     
-    # --- [Stealth Injection] ---
-    page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    """)
-
-    base_url = site_cfg.get('base_url').rstrip('/')
-    # ปรับ Logic URL ให้ยืดหยุ่นขึ้น
+    # 1. จัดการเลือก Login URL
     login_url = site_cfg.get('login_url')
     if not login_url:
         if "bitsuse" in base_url.lower():
@@ -2261,233 +2511,207 @@ def universal_login(page, site_cfg):
             login_url = f"{base_url}/login.php"
 
     try:
-        print(f"🔐 [{site_key}] กำลังเข้าหน้า Login...")
-        if not safe_goto(page, login_url, wait_until="networkidle", timeout=45000):
-            return False
+        print(f"🔐 [{site_key}] กำลังเข้าหน้า Login...: {login_url}")
+        await page.get(login_url)
+        await asyncio.sleep(4.5)  # รอโครงสร้างเครือข่ายและ DOM ตั้งหลัก
         
-        page.wait_for_load_state("domcontentloaded")
-        page.wait_for_timeout(5000) # เผื่อเวลาให้สคริปต์หน้าเว็บ Render ชื่อ User
-        page_content = page.content() 
+        # ดึง Content ล่าสุดมาเช็กสถานะการคงอยู่ของเซสชัน
+        page_content = await page.get_content()
         
-        is_logged_in = (
-            (site_cfg['username'] in page_content) or 
-            (page.locator('a[href*="logout.php"], a[href*="/user/account/logout"]').count() > 0)
-        )
+        # 🎯 ตรวจสอบปุ่ม Logout สไตล์ nodriver (ค้นหาคำดิบในซอร์สโค้ด ปลอดภัยและเร็วกว่าพึ่ง Selector)
+        has_logout_link = False
+        if "logout.php" in page_content or "/user/account/logout" in page_content:
+            has_logout_link = True
+
+        is_logged_in = (site_cfg['username'].lower() in page_content.lower()) or has_logout_link
         
         if is_logged_in and len(page_content) > 1000:
-            print(f"✅ [{site_key}] ยืนยันสถานะ: ล็อกอินอยู่แล้ว (Skip Login)")
+            print(f"✅ [{site_key}] ยืนยันสถานะ: ล็อกอินอยู่แล้ว (Skip Login) ✨")
             return True
             
-        # ถ้าหน้าขาวเกินไป ให้ลอง Reload (ป้องกันเคส image_da63b3.png)
+        # ดักจับเคสหน้าขาว/อินเทอร์เน็ตหลุดชั่วคราว
         if len(page_content) < 500:
-            page.screenshot(path=f"debug_{site_key}_blank.png")
-            print(f"⚠️ [{site_key}] ตรวจพบหน้าว่าง (Blank Page) -> บันทึกรูป debug แล้ว -> กำลังลอง Reload...")
-            page.wait_for_timeout(10000)
-            page.reload(wait_until="networkidle")
-            page.wait_for_timeout(10000)
+            print(f"⚠️ [{site_key}] ตรวจพบหน้าว่าง ({len(page_content)} บิต) -> กำลังลอง Reload...")
+            await asyncio.sleep(5)
+            await page.reload()
+            await asyncio.sleep(5)
+            page_content = await page.get_content()
             
-        print(f"🔑 [{site_key}] ตรวจพบว่ายังไม่ได้ล็อกอิน หรือ Session หลุด -> เริ่มกรอกข้อมูล")
+        print(f"🔑 [{site_key}] สถานะ: ยังไม่ได้ล็อกอิน หรือ Session หลุด -> เริ่มกระบวนการกรอกฟอร์ม")
 
+        # 2. เริ่มต้นลูปพยายามล็อกอิน (สูงสุด 10 รอบ)
         for attempt in range(10):
-            print(f"🔎 [{site_key}] รอบที่ {attempt+1}...")
+            print(f"🔎 [{site_key}] กำลังพยายามล็อกอิน รอบที่ {attempt+1}/10...")
             
-            # 1. ปรับ Selector ให้เจาะจงที่ฟอร์มที่มี action="takelogin.php" 
-            # ซึ่งเป็นมาตรฐานของ BEARBIT/TB Source
             target_form = 'form[action*="takelogin"],form[action*="/user/account/login/"]'
             u_sel = 'input[name="username"], input[name="user"], input#username'
             p_sel = 'input[name="password"], input[name="pass"], input#password'
             
             try:
-                # 1. รอจนกว่าช่อง Username จะปรากฏ
-                u_input = page.locator(u_sel).first
-                p_input = page.locator(p_sel).first
+                # ค้นหาอีเลเมนต์กล่องข้อมูล (ใช้คู่กับคำสั่งดักจับ Exception ของ nodriver เผื่อหาไม่เจอ)
+                u_input = await page.select(u_sel)
+                p_input = await page.select(p_sel)
                 
-                u_input.wait_for(state="visible", timeout=10000)
+                if not u_input or not p_input:
+                    raise ValueError("หาช่องกรอกข้อมูลไม่พบในโครงสร้าง DOM")
+                
+                # ✍️ จำลองพิมพ์ Username
+                await u_input.click()
+                await page.evaluate(f"try {{ document.querySelector('{u_sel}').value = ''; }} catch(e) {{}}")
+                await u_input.send_keys(site_cfg['username'])
+                await asyncio.sleep(random.uniform(0.4, 0.7))
 
-                # 2. ใช้วิธี "คลิกแล้วพิมพ์" (Simulator) แทนการ Fill
-                u_input.click(delay=random.randint(100, 200))
-                page.keyboard.press("Control+A")
-                page.keyboard.press("Backspace")
-                # พิมพ์ชื่อผู้ใช้ช้าๆ เหมือนคน
-                page.keyboard.type(site_cfg['username'], delay=random.randint(50, 150))
+                # ✍️ จำลองพิมพ์ Password
+                await p_input.click()
+                await page.evaluate(f"try {{ document.querySelector('{p_sel}').value = ''; }} catch(e) {{}}")
+                await p_input.send_keys(site_cfg['password'])
+                await asyncio.sleep(random.uniform(0.4, 0.7))
                 
-                page.wait_for_timeout(random.randint(300, 600))
-
-                # 3. ใช้ Tab เพื่อเลื่อนไปช่อง Password (สำคัญมากสำหรับ BEARBIT)
-                page.keyboard.press("Tab")
-                page.wait_for_timeout(200)
-                page.keyboard.type(site_cfg['password'], delay=random.randint(50, 150))
-                
-                # 4. กด Enter เพื่อ Login
-                page.keyboard.press("Enter")
-                
-                print(f"🚀 [{site_key}] ส่งข้อมูล Login ผ่าน Keyboard Emulator แล้ว")
+                print(f"🚀 [{site_key}] กรอกข้อมูลสิทธิ์ผู้ใช้งานผ่าน Emulator สำเร็จ")
 
             except Exception as e:
-                print(f"❌ [{site_key}] กรอกข้อมูลไม่สำเร็จ: {str(e)}")
-                # แผนสำรอง: ถ้าหาแบบเจาะจงไม่เจอ ให้ลองหาแบบกว้าง (Legacy Mode)
+                print(f"❌ [{site_key}] กรอกแบบจำลองไม่สำเร็จ: {e} -> สลับไปใช้แผนสำรอง Legacy JS")
                 try:
-                    page.locator('input[name="username"]').first.fill(site_cfg['username'])
-                    page.locator('input[name="password"]').first.fill(site_cfg['password'])
-                except: continue
+                    await page.evaluate(f"""
+                        const u = document.querySelector('{u_sel}');
+                        const p = document.querySelector('{p_sel}');
+                        if(u) u.value = '{site_cfg['username']}';
+                        if(p) p.value = '{site_cfg['password']}';
+                    """)
+                except Exception as js_err:
+                    print(f"❌ Legacy JS พังเช่นกัน: {js_err}")
+                    continue
 
-            # --- ส่วนจัดการ Captcha (ปรับให้ข้ามได้ถ้าไม่มี) ---
-            captcha_img = page.locator('img.cimage, img[src*="captcha"], #captcha_img').first
-            captcha_input = page.locator('input[name="captcha"], #captcha').first
+            # --- 🛡️ ส่วนจัดการ Captcha สไตล์ nodriver ---
+            captcha_img = None
+            captcha_input = None
+            try:
+                # ค้นหาภาพสัญลักษณ์และกล่องส่งรหัสแคปชา
+                captcha_img = await page.select('img.cimage, img[src*="captcha"], #captcha_img')
+                captcha_input = await page.select('input[name="captcha"], #captcha')
+            except:
+                pass  # ค่ายไหนไม่มี Captcha ปล่อยไหลผ่าน
 
-            if captcha_img.is_visible(timeout=3000) and captcha_input.is_visible():
-                img_bytes = captcha_img.screenshot()
-                raw_text = ocr.classification(img_bytes)
-                captcha_text = re.sub(r'[^a-zA-Z0-9]', '', raw_text).upper()
-                
-                print(f"🤖 AI Solve: {captcha_text} (รอยืนยัน ✅)")
-                captcha_input.fill(captcha_text)
-
-                # --- [เพิ่มส่วนนี้: สุ่มคลิกที่ว่างเพื่อ Trigger ระบบตรวจสอบ] ---
-                page.wait_for_timeout(random.randint(500, 1000))
-                
-                # วิธีที่ 1: คลิกที่พื้นที่ว่าง (สุ่มพิกัดเล็กน้อยที่ไม่โดนปุ่มอื่น)
-                # เลือกจุดที่มักจะว่าง เช่น แถวๆ ขอบซ้ายหรือขวาของฟอร์ม
-                page.mouse.click(random.randint(10, 50), random.randint(10, 50)) 
-                
-                # วิธีที่ 2: กด Tab เพื่อออกจากช่อง (มักจะได้ผลดีกับระบบตรวจ Checkmark)
-                # page.keyboard.press("Tab") 
-                
-                # วิธีที่ 3: บังคับให้ช่อง Captcha หลุด Focus (Blur) ผ่าน JS
-                page.evaluate("() => document.activeElement.blur()")
-                
-                page.wait_for_timeout(2000) # รอให้ระบบ Verify สักครู่
-                # -------------------------------------------------------
-                # ตรวจสอบ Checkmark (เฉพาะ Unlimitz)
+            if captcha_img and captcha_input:
                 try:
-                    page.wait_for_selector('img[src*="ValidGreen.png"]', state="visible", timeout=4000)
-                    print(f"✅ [{site_key}] Captcha ถูกต้อง")
-                except:
-                    print(f"🔄 [{site_key}] Captcha ไม่ผ่าน -> กำลังกด Refresh")
+                    # 📸 บันทึกภาพลงดิสก์ชั่วคราวก่อนส่งให้ OCR แกะ (เนื่องจากเซฟเป็นไบต์ตรงๆ บน nodriver มีปัญหาโครงสร้างภายใน)
+                    tmp_captcha_path = f"tmp_captcha_{site_key}.png"
+                    await captcha_img.save_screenshot(tmp_captcha_path)
                     
-                    # --- [แก้ไขจุดนี้] ---
-                    # แผน A: คลิกที่ปุ่ม Refresh (หาจาก title หรือ src ของรูป)
-                    refresh_btn = page.locator('a[title="refresh"], a[onclick*="refreshimg"], img[src*="Refresh.png"]').first
+                    if os.path.exists(tmp_captcha_path):
+                        with open(tmp_captcha_path, 'rb') as f:
+                            img_bytes = f.read()
+                        
+                        raw_text = ocr.classification(img_bytes)
+                        captcha_text = re.sub(r'[^a-zA-Z0-9]', '', raw_text).upper()
+                        print(f"🤖 AI Solve [{site_key}]: {captcha_text} (รอยืนยันผล...)")
+                        
+                        await captcha_input.click()
+                        await captcha_input.send_keys(captcha_text)
+                        await asyncio.sleep(1.0)
+                        
+                        # ลบไฟล์ภาพชั่วคราวออกเพื่อสุขอนามัยของระบบ
+                        try: os.remove(tmp_captcha_path)
+                        except: pass
                     
-                    if refresh_btn.is_visible():
-                        refresh_btn.click()
-                    else:
-                        # แผน B: ถ้าหาปุ่มไม่เจอ ให้สั่งรันฟังก์ชัน JavaScript refreshimg() โดยตรง
-                        page.evaluate("() => { if(typeof refreshimg === 'function') refreshimg(); }")
-                    
-                    page.wait_for_timeout(2000) # รอให้รูปใหม่โหลด
-                    continue 
+                    # ตรวจสอบการผ่านด่านเบื้องต้น (ValidGreen)
+                    try:
+                        valid_green = await page.select('img[src*="ValidGreen.png"]')
+                        if valid_green:
+                            print(f"✅ [{site_key}] ระบบตรวจสอบ Captcha เบื้องต้นผ่านฉลุย")
+                    except:
+                        print(f"🔄 [{site_key}] Captcha ไม่ตรงล็อก -> กำลังสั่ง Refresh ภาพรหัสใหม่...")
+                        try:
+                            refresh_btn = await page.select('a[title="refresh"], a[onclick*="refreshimg"], img[src*="Refresh.png"]')
+                            await refresh_btn.click()
+                        except:
+                            await page.evaluate("if(typeof refreshimg === 'function') refreshimg();")
+                        
+                        await asyncio.sleep(2.5)
+                        continue  # วนลูปเริ่มกรอกใหม่ในรอบถัดไป
+                        
+                except Exception as captcha_err:
+                    print(f"⚠️ บั๊กระบบ Captcha ย่อย: {captcha_err}")
 
-            # --- การส่งฟอร์ม (ปรับให้รองรับ ID ฟอร์มของ TL) ---
-            page.evaluate(f"""
-                () => {{
+            # --- 🛫 การส่งฟอร์มล็อกอิน (Submit) ---
+            await page.evaluate(f"""
+                (() => {{
                     const form = document.querySelector('{target_form}');
                     if (form) {{
-                        // พยายามเรียก submit ตรงๆ
                         HTMLFormElement.prototype.submit.call(form);
                     }} else {{
-                        // ถ้าหาฟอร์มไม่เจอ ให้กด Enter ที่ช่อง Password
-                        const passInput = document.querySelector('input[name="password"]');
+                        const passInput = document.querySelector('{p_sel}');
                         if (passInput) passInput.dispatchEvent(new KeyboardEvent('keydown', {{'key': 'Enter'}}));
                     }}
-                }}
+                }})()
             """)
 
-            # ตรวจสอบผลลัพธ์
-            page.wait_for_timeout(8000) 
-            curr_content = page.content().lower()
-            if "logout" in curr_content or "login" not in page.url.lower():
-                print(f"🎉 [{site_key}] Login Success!") 
-                page.context.storage_state(path=get_auth_file(site_key))
+            await asyncio.sleep(8.5) # รอเซิร์ฟเวอร์บิทประมวลผลเซสชันและพาวาร์ปหน้าเว็บ
+            
+            # 🏁 ตรวจสอบผลลัพธ์หลังส่งข้อมูล
+            curr_content = await page.get_content()
+            curr_url = page.url.lower()
+            
+            if "logout" in curr_content.lower() or "login" not in curr_url:
+                print(f"🎉 [{site_key}] ล็อกอินเข้าสู่ระบบสำเร็จเรียบร้อยแล้ว!")
+                # หมายเหตุ: ไม่ต้องเซฟไฟล์ storage_state แล้ว เพราะ nodriver บันทึกเซสชันลง User Data Dir ให้เองแบบถาวรครับ
                 return True
 
+        return False
+        
+    except Exception as global_login_err:
+        print(f"❌ [{site_key}] กระบวนการ Universal Login เกิดข้อผิดพลาดรุนแรง: {global_login_err}")
         return False
 
     except Exception as e:
         print(f"❌ [{site_key}] Login Error: {str(e)}")
         return False
 
-def auto_click_thanks(page, details_url):
-    """
-    ตรวจจับและกดปุ่มขอบคุณอัตโนมัติ โดยวิ่งเข้าหา details_url โดยตรง
-    รองรับ UnlimitZ, BearBit และ Tracker ทั่วไป
-    """
+async def auto_click_thanks(page, details_url: str) -> bool:
     if not details_url:
         return False
 
-    print(f"🔍 กำลังเข้าสู่หน้ารายละเอียดเพื่อเช็คปุ่มขอบคุณ... \n🔗 {details_url}")
+    print(f"🔍 [nodriver] เข้าสู่หน้า: {details_url}")
     
     try:
-        # 1. สั่งให้ Page เดินทางไปยัง URL ที่ได้รับมา
-        # wait_until="domcontentloaded" เพื่อความรวดเร็ว ไม่ต้องรอโหลดรูปภาพจนเสร็จ
-        page.goto(details_url, timeout=15000, wait_until="domcontentloaded")
-        
-        # 2. นิยาม Selector แบบกลุ่ม
-        selectors = [
-            'form[action="thanks.php"] input[type="submit"]', 
-            'td#saythanks img', 
-            'a[onclick*="action=say_thanks"]',
-            'input[id="say_thanks_button"]',
-            '#saythanks > a' # เพิ่มเติมสำหรับบางเวอร์ชั่น
-        ]
-        combined_selector = ", ".join(selectors)
-        
-        # 3. ค้นหา Element
-        thanks_btn = page.locator(combined_selector).first
-        
-        # ตรวจสอบเบื้องต้นว่าพบปุ่มหรือไม่
-        if thanks_btn.count() > 0:
-            # --- ตรวจสอบว่าปุ่มกดได้หรือไม่ (Disabled Check) ---
-            if not thanks_btn.is_enabled():
-                print("⏭️ ปุ่มขอบคุณถูกปิดใช้งาน (Disabled) -> น่าจะเคยกดไปแล้ว")
-                return False
+        await page.get(details_url)
+        # รอสักครู่เพื่อให้หน้าเว็บโหลด DOM ที่เปลี่ยนไปหลังจากกดขอบคุณเสร็จแล้ว
+        await asyncio.sleep(2) 
 
-            if thanks_btn.is_visible(timeout=3000):
-                print(f"💖 พบปุ่มขอบคุณ! กำลังดำเนินการกด...")
-                thanks_btn.scroll_into_view_if_needed()
-                page.wait_for_timeout(500) # ให้เวลา UI เซตตัวนิดนึง
-                
-                # ใช้ force=True เพื่อแก้ปัญหาโดน Element อื่นบัง
-                thanks_btn.click(timeout=5000, force=True) 
-                
-                print("✅ กดขอบคุณเรียบร้อยแล้ว")
-                return True
-        
-        # 4. [แผนสำรอง] หากวิธีปกติไม่ได้ผล ให้ใช้ JavaScript (จัดการพวก AJAX หรือรูปภาพใน BearBit)
-        executed = page.evaluate("""() => {
-            const btn = document.querySelector('a[onclick*="say_thanks"]') || 
-                        document.querySelector('form[action="thanks.php"] input[type="submit"]') ||
-                        document.querySelector('td#saythanks img') ||
-                        document.querySelector('input[id="say_thanks_button"]');
-            if (btn) {
-                // เช็คสถานะ Disabled ของปุ่มที่เป็น Input
-                if (btn.tagName === 'INPUT' && btn.disabled) return "already_pressed";
-                
-                // เช็คว่าเคยกดไปแล้วหรือยัง (บางเว็บจะเปลี่ยนข้อความเป็น "ขอบคุณแล้ว")
-                if (btn.innerText && btn.innerText.includes("ขอบคุณแล้ว")) return "already_pressed";
-                
-                btn.click();
-                return "success";
+        js_code = """
+        (() => {
+            // ค้นหา container
+            const td = document.querySelector('td#saythanks');
+            if (!td) return "container_not_found"; // ถ้าไม่มี td นี้เลย
+            
+            // ค้นหาปุ่มภายใน
+            const btn = td.querySelector('a[onclick*="sndReq"]');
+            
+            if (!btn) {
+                // ถ้าไม่เจอ a[onclick] อาจเป็นเพราะกดไปแล้ว หรือเปลี่ยนสถานะไปแล้ว
+                return "already_thanked_or_no_button";
             }
-            return "not_found";
-        }""")
+            
+            // ถ้าเจอ ให้คลิก
+            btn.click();
+            return "clicked";
+        })()
+        """
         
-        if executed == "success":
-            print("🚀 กดขอบคุณผ่าน JavaScript สำเร็จ (แผนสำรอง)")
-            return True
-        elif executed == "already_pressed":
-            print("⏭️ ระบบ JS แจ้งว่าเคยกดไปแล้ว -> ข้าม")
-            return False
+        status = await page.evaluate(js_code)
 
-        print("ℹ️ ไม่พบปุ่มขอบคุณในหน้านี้ (อาจจะไม่มี หรือกดไปแล้ว)")
-        return False
+        if status == "clicked":
+            print("✅ กดขอบคุณสำเร็จ")
+            return True
+        elif status == "already_thanked_or_no_button":
+            print("⏭️ ไม่พบปุ่ม (อาจจะเคยกดไปแล้ว หรือสถานะการขอบคุณปิดอยู่)")
+            return False
+        else:
+            print("⚠️ ไม่พบส่วนประกอบการขอบคุณในหน้าเว็บ")
+            return False
             
     except Exception as e:
-        # ดักจับเคสที่กดแล้วหน้า Refresh/Redirect ทันที (Navigation Error)
-        if any(msg in str(e).lower() for msg in ["context was destroyed", "navigation", "load"]):
-            print("⏩ กดสำเร็จแล้วและหน้ากำลังเปลี่ยนไป...")
-            return True
-        print(f"❌ เกิดข้อผิดพลาดที่หน้าขอบคุณ: {e}")
+        print(f"❌ Error: {e}")
         return False
 
 def format_size(size_gb):
@@ -2508,45 +2732,76 @@ def format_size(size_gb):
     return f"{current_size:.2f} {units[unit_index]}"
 
 def save_hourly_snapshot(site_name, current_data):
-    """บันทึกข้อมูลแบบแยกระบบ Site และเก็บเป็นตัวเลข (Parsed)"""
+    """
+    บันทึกข้อมูลแบบแยกระบบ Site และเก็บเป็นตัวเลข (Parsed)
+    - [Data Integrity] เพิ่มระบบดักจับและเปลี่ยนประเภทข้อมูล (Cast Type) เป็นตัวเลขที่แท้จริงก่อนลงดิสก์
+    - [Retention Fix] ปรับปรุงการคำนวณขอบเขตลบข้อมูล 31 วัน (744 ชั่วโมง) ป้องกันประวัติหายจากบอทรันซ้ำในชั่วโมงเดิม
+    """
     try:
         all_history = {}
+        
+        # 1. โหลดข้อมูลเดิมอย่างปลอดภัย
         if os.path.exists(STATS_HISTORY_FILE):
             with open(STATS_HISTORY_FILE, 'r', encoding='utf-8') as f:
                 try:
                     all_history = json.load(f)
-                except: all_history = {}
+                except Exception: 
+                    all_history = {}
 
         if site_name not in all_history:
             all_history[site_name] = {}
         
         now = get_now()
-        # ใช้ Key ที่เรียงลำดับตามเวลาได้ง่าย
         timestamp_key = now.strftime("%Y-%m-%d %H:00")
         
-        # สำคัญ: ต้อง parse ค่าให้เป็นตัวเลขก่อนบันทึก
+        # 2. 🛡️ Data Type Safeguard: แปลงค่าให้แน่ใจว่าเป็นตัวเลขก่อนบันทึกลง JSON
+        # ป้องกันกรณีต้นทางส่งมาเป็น string เช่น "1,500" หรือติดคอมมามา
+        def clean_float(val):
+            if isinstance(val, (int, float)):
+                return float(val)
+            try:
+                return float(str(val).replace(',', '').strip())
+            except (ValueError, TypeError):
+                return 0.0
+
+        # บันทึกข้อมูล Snapshot ประจำชั่วโมง
         all_history[site_name][timestamp_key] = {
             'username': current_data.get('username', 'N/A'),
-            'ratio': current_data.get('ratio', 0),
-            'up': current_data.get('up', 0),
-            'dl': current_data.get('dl', 0),
-            'bonus': current_data.get('bonus', 0),
+            'ratio': clean_float(current_data.get('ratio', 0)),
+            'up': clean_float(current_data.get('up', 0)),
+            'dl': clean_float(current_data.get('dl', 0)),
+            'bonus': clean_float(current_data.get('bonus', 0)),
             'raw_time': now.strftime("%Y-%m-%d %H:%M:%S")
         }
 
-        # จำกัดจำนวนข้อมูล (31 วัน)
+        # 3. ⏱️ ปรับปรุงระบบ Retention (จำกัดความยาวประวัติ 31 วัน)
+        # โพซิชันเดิม site_keys[:-744] หากคีย์มีน้อยกว่า 744 ตัว มันจะส่งลิสต์เปล่าออกมา ซึ่งปลอดภัย
+        # แต่เปลี่ยนใช้ลูปจำกัดจำนวนแบบตรงไปตรงมา เพื่อความแม่นยำในการคัดทิ้งคีย์ที่เก่าที่สุด
         site_keys = sorted(all_history[site_name].keys())
-        if len(site_keys) > 744:
-            for k in site_keys[:-744]:
-                del all_history[site_name][k]
+        while len(site_keys) > 744:
+            oldest_key = site_keys.pop(0)  # ดึงคีย์ที่เก่าที่สุดออกทีละตัว
+            del all_history[site_name][oldest_key]
 
-        # Save แบบ Atomic
-        with open(STATS_HISTORY_FILE + ".tmp", 'w', encoding='utf-8') as f:
-            json.dump(all_history, f, indent=4)
-        os.replace(STATS_HISTORY_FILE + ".tmp", STATS_HISTORY_FILE)
+        # 4. Save แบบ Atomic ป้องกันไฟล์พังเมื่อบอทโดนตัดการทำงาน
+        tmp_file = STATS_HISTORY_FILE + ".tmp"
+        with open(tmp_file, 'w', encoding='utf-8') as f:
+            json.dump(all_history, f, indent=4, ensure_ascii=False)
+            
+        # ตรวจสอบขนาดไฟล์ชั่วคราวก่อนแทนที่ เพื่อความชัวร์ว่าข้อมูลไม่ว่างเปล่า
+        if os.path.getsize(tmp_file) > 0:
+            os.replace(tmp_file, STATS_HISTORY_FILE)
+        else:
+            raise ValueError("สร้างไฟล์ชั่วคราวสำเร็จแต่ขนาดไฟล์เป็น 0 KB (ระงับการ Replace เพื่อเซฟไฟล์หลัก)")
 
     except Exception as e:
         print(f"❌ Snapshot Error [{site_name}]: {e}")
+        # เคลียร์ไฟล์ขยะเผื่อค้างคา
+        if os.path.exists(STATS_HISTORY_FILE + ".tmp"):
+            try: os.remove(STATS_HISTORY_FILE + ".tmp")
+            except: pass
+
+async def async_get_stats_diff(site_name, current_data):
+    return await asyncio.to_thread(get_stats_diff, site_name, current_data)
 
 def get_stats_diff(site_name, current_data):
     """
@@ -2622,67 +2877,76 @@ def get_stats_diff(site_name, current_data):
 
     return diff_msg
 
-def ensure_dedbit_logged_in(page):
+async def ensure_dedbit_logged_in(page):
     # 1. ดึง Config
     site_cfg = next((s for s in CFG.get('SITE', []) if s['name'] in ["DEDBIT", "BITSUSE"]), None)
     if not site_cfg: return False
 
-    # 2. เช็คว่าอยู่ที่หน้า DEDBIT หรือยัง ถ้าไม่ใช่ให้ไปหน้าแรก
+    # 2. เช็ค URL โดยใช้ page.url (nodriver เก็บเป็น property)
     target_url = "https://www.dedbit.com/index.php"
     if "dedbit.com" not in page.url:
         print("🔗 [System] กำลังไปหน้าแรก DEDBIT...")
-        page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+        await page.get(target_url)
+        await asyncio.sleep(2) 
     
     # 3. เช็คสถานะการ Login
+    # nodriver ใช้ .find() ในการหา element แทน .locator()
     my_user = site_cfg.get('username')
-    # เช็คจาก Link Logout หรือ ชื่อ User (ทนทานกว่า)
-    is_logged_in = page.locator('a[href*="logout.php"]').count() > 0 or \
-                   page.locator(f"text={my_user}").count() > 0
+    
+    # ใช้ xpath หรือ css selector เพื่อหา element
+    logout_btn = await page.find('a[href*="logout.php"]', timeout=3)
+    user_text = await page.find(my_user, timeout=3)
+    
+    is_logged_in = logout_btn is not None or user_text is not None
 
     if not is_logged_in:
         print(f"🔑 [DEDBIT] พบว่า Session หลุด -> เริ่มการล็อกอินใหม่ที่หน้าแรก")
         temp_cfg = site_cfg.copy()
         temp_cfg['login_url'] = target_url
-        return universal_login(page, temp_cfg)
+        return await universal_login(page, temp_cfg)
 
-    # --- ลบบรรทัด page.wait_for_selector("td:has-text('Uploaded')") ออกไปเลย ---
     print(f"✅ [DEDBIT] ล็อกอินเรียบร้อยแล้ว")
     return True
 
-def get_site_stats(page, site_cfg):
+async def get_site_stats(page: uc.Tab, site_cfg: dict) -> str:
     """
-    เวอร์ชัน Universal (List-based): รองรับโครงสร้าง JSON ใหม่
-    - [Flow Re-Ordered] ย้ายจุดสร้าง index_soup ไปไว้หลังจากการเคลียร์แจ้งเตือน/โหวตเสร็จสิ้น เพื่อให้ดึงสถานะไอเทมได้แม่นยำ 100%
-    - [Session Guard] อัปเดตโครงสร้างดักจับ user_tag ของค่าย DEDBIT หลัง Re-Login ป้องกันการดีดหลุดโดยใช่เหตุ
-    - [Resilient] เพิ่มการคุมจังหวะหน้าเว็บด้วยระบบตรวจสอบเส้นทาง URL ปลายทางอย่างมั่นคง
+    เวอร์ชัน Universal (List-based): ปลอดภัยสูงสุดจากการสะดุดของฟังก์ชันย่อย
     """
     site = site_cfg['name'] 
     
     try:
-        # กำหนด Base URL ของแต่ละค่าย
         if site in ["DEDBIT", "BITSUSE"]:
             base_url = "https://www.dedbit.com"
         else:
             base_url = site_cfg.get('base_url', "https://bearbit.org").rstrip('/')
 
         # -------------------------------------------------------------------------
-        # 🎯 1. ทำภารกิจกวาดล้าง (Clear Notifications & Auto-Vote) ให้เรียบร้อยก่อน
+        # 🎯 1. ทำภารกิจกวาดล้าง (Clear Notifications & Auto-Vote) ครอบสิทธิ์เซฟตี้แยกส่วน
         # -------------------------------------------------------------------------
         if 'bearbit' in site.lower():
-            # รันระบบล้างกล่องข้อความสีเขียวและระเบิดโหวตทอร์เรนต์ผ่านสคริปต์ Master Engine
-            clear_bearbit_notifications(page, base_url, site_name=site)
-            auto_vote_snatched(page, base_url, site_name=site)
-            
-            # ⚡ [Crucial Fix] บังคับให้บอทกลับมาตั้งหลักที่หน้าแรกสุดหลังจากทำภารกิจข้างบนเสร็จสิ้น
+            try:
+                # 🛡️ ครอบ Safety แยกต่างหาก ไม่ว่าสองฟังก์ชันนี้จะส่ง None หรือระเบิด บอทหลักจะไม่พัง!
+                if 'clear_bearbit_notifications' in globals():
+                    await clear_bearbit_notifications(page, base_url, site_name=site)
+            except Exception as notif_sub_err:
+                print(f"⚠️ [{site}] ระบบเคลียร์แจ้งเตือนขัดข้องชั่วคราว: {notif_sub_err}")
+
+            try:
+                if 'auto_vote_snatched' in globals():
+                    await auto_vote_snatched(page, base_url, site_name=site)
+            except Exception as vote_sub_err:
+                print(f"⚠️ [{site}] ระบบ Auto-Vote ขัดข้องชั่วคราว: {vote_sub_err}")
+                
+            # ⚡ กลับมาตั้งหลักที่หน้าแรกสุดเสมอ
             index_url = f"{base_url}/index.php" if not base_url.endswith('/') else f"{base_url}index.php"
-            page.goto(index_url, timeout=20000, wait_until="domcontentloaded")
+            await page.get(index_url)
+            await asyncio.sleep(2)
 
         # -------------------------------------------------------------------------
         # 🎯 2. สแกนสดหา User ID ณ วินาทีปัจจุบัน (True Fresh Soup)
         # -------------------------------------------------------------------------
-        soup = BeautifulSoup(page.content(), 'html.parser')
-        
-        # เก็บ Soup หน้าแรกที่อัปเดตล่าสุดไว้สำหรับแกะสเตตัสไอเทมซานต้าตอนท้าย
+        page_source = await page.get_content()
+        soup = BeautifulSoup(page_source, 'html.parser')
         index_soup = soup 
         
         if site in ["DEDBIT", "BITSUSE"]:
@@ -2691,9 +2955,11 @@ def get_site_stats(page, site_cfg):
             
             if not user_tag or "dedbit.com" not in current_url:
                 print(f"🔄 [{site}] เซสชันมีปัญหา กำลังตรวจสอบสิทธิ์และเข้าสู่ระบบ DEDBIT ใหม่...")
-                ensure_dedbit_logged_in(page) 
+                await ensure_dedbit_logged_in(page) 
+                
                 # ดึงตารางโครงสร้างใหม่หลังจากล็อกอินสำเร็จ
-                soup = BeautifulSoup(page.content(), 'html.parser')
+                page_source = await page.get_content()
+                soup = BeautifulSoup(page_source, 'html.parser')
                 index_soup = soup
                 # ⚡ [Bug Fixed] ต้องหาตำแหน่งไอดีผู้ใช้ซ้ำอีกรอบในตารางที่โหลดมาใหม่
                 user_tag = soup.find("a", href=re.compile(r"userdetails\.php\?id=\d+"))
@@ -2712,14 +2978,14 @@ def get_site_stats(page, site_cfg):
         # -------------------------------------------------------------------------
         # 🎯 3. เข้าหน้าโปรไฟล์เพื่อคว้าสถิติเชิงลึก
         # -------------------------------------------------------------------------
-        if not safe_goto(page, profile_url, wait_until="domcontentloaded", timeout=30000):
-            return f"❌ [{site}] เข้าหน้าโปรไฟล์ไม่สำเร็จ (โครงข่ายหน่วง)"
-
-        page.wait_for_timeout(2000)
-        soup = BeautifulSoup(page.content(), 'html.parser')
+        # ปรับมาใช้คำสั่งเดินทางของ nodriver ตรงๆ (หรือใช้ safe_goto ที่ปรับปรุงเป็น async แล้ว)
+        await page.get(profile_url)
+        await asyncio.sleep(2) # แทนที่ page.wait_for_timeout(2000)
+        
+        page_source = await page.get_content()
+        soup = BeautifulSoup(page_source, 'html.parser')
         
         # 🎯 [เกราะป้องกันชั้นที่ 1]: สกัดแกะไอเทมทันที ณ วินาทีนี้ เก็บใส่ตัวแปรไว้ก่อนเลย!
-        # ป้องกันไม่ให้ฟังก์ชัน Diff หรือฟังก์ชัน Snapshot ด้านล่างแอบมาโยกหน้าเว็บหนี
         bearbit_item_cache = "NONE"
         if 'bearbit' in site.lower():
             bearbit_item_cache = get_bearbit_item_status(soup)
@@ -2750,15 +3016,19 @@ def get_site_stats(page, site_cfg):
         # -------------------------------------------------------------------------
         # 🎯 4. บันทึก Snapshot และประวัติความเปลี่ยนแปลง (Diff History)
         # -------------------------------------------------------------------------
-        diff_text = get_stats_diff(site, curr_data)
-        
-        save_hourly_snapshot(site, {
-            'username': username,
-            'ratio': float(curr_data['ratio'].replace(',', '')),
-            'up': parse_size(curr_data['up']), 
-            'dl': parse_size(curr_data['dl']), 
-            'bonus': float(curr_data['bonus'].replace(',', ''))
-        })
+        try:
+            diff_text = await async_get_stats_diff(site, curr_data)
+            snapshot_data = {
+                'username': username,
+                'ratio': float(curr_data['ratio'].replace(',', '')),
+                'up': parse_size(curr_data['up']), 
+                'dl': parse_size(curr_data['dl']), 
+                'bonus': float(curr_data['bonus'].replace(',', ''))
+            }
+            await asyncio.to_thread(save_hourly_snapshot, site, snapshot_data)
+        except Exception as save_err:
+            print(f"⚠️ [{site}] ระบบบันทึกประวัติขัดข้อง: {save_err}")
+            diff_text = "No changes" # กำหนดค่าปลอดภัยไว้ถ้าบันทึกไม่สำเร็จ
 
         # -------------------------------------------------------------------------
         # 🎯 5. ประกอบร่างรายงานสรุปผล
@@ -2798,144 +3068,133 @@ def extract_digit(tag):
     except:
         return 0
 
-def extract_torrent_data(row, base_url, dl_session=None, headers=None):
+async def extract_torrent_data(row, base_url, dl_session=None, headers=None):
     if row is None: return None
     
-    row_str = str(row)
-    row_text = row.get_text(separator=' ', strip=True)
-    all_tds = row.find_all("td")
-    
     # --- 1. สกัด ID & Title ---
-    title_tag = row.find("a", href=re.compile(r"details(?:new)?\.php\?id=(\d+)", re.I))
+    title_tag = row.find("a", href=re.compile(r"details\.php\?id=(\d+)", re.I))
     t_id, title, details_url = None, "Unknown File", None
     if title_tag:
         title = title_tag.get_text(strip=True)
-        href = title_tag.get('href', '')
-        match = re.search(r"id=(\d+)", href)
-        if match:
-            t_id = match.group(1)
-            details_url = f"{base_url.rstrip('/')}/details.php?id={t_id}"
+        t_id = re.search(r"id=(\d+)", title_tag.get('href', '')).group(1)
+        details_url = f"{base_url.rstrip('/')}/details.php?id={t_id}"
 
-    # --- 2. สถานะ Locked/Sticky ---
-    is_hard_locked = any(x in row_str for x in ['Locked !!', 'fa-ban'])
-    is_sticky = any(x in row_str for x in ['📌', 'sticky', 'Auto Sticky:'])
+    # --- 2. สกัดข้อมูล (รองรับโครงสร้างตาราง Bearbit) ---
+    all_tds = row.find_all("td")
+    s, l, c = 0, 0, 0
+    t_size_str, raw_date_str = "0 GB", ""
 
-    # --- 3. 🔥 กลยุทธ์สแกนข้อมูล (มุ่งเป้าคอลัมน์วันลงระบบจริง) ---
-    l, s, c = 0, 0, 0
-    t_size_str = "0 GB"
-    raw_date_str = ""
+    # Bearbit Index:
+    # [7]: Date, [8]: Size, [9]: Completed, [10]: Seeders, [11]: Leechers
+    if len(all_tds) >= 11:
+        raw_date_str = all_tds[7].get_text(separator=' ', strip=True)
+        t_size_str = all_tds[8].get_text(separator=' ', strip=True)
+        c = extract_digit(all_tds[9])
+        s = extract_digit(all_tds[10])
+        l = extract_digit(all_tds[11])
 
-    for td in all_tds:
-        td_class = str(td.get('class', []))
-        if 'dp-show' in td_class:
-            continue
-            
-        txt = td.get_text(separator=' ', strip=True)
-        
-        # 1. สกัด Size: มองหาหน่วยวัด
-        if t_size_str == "0 GB":
-            size_match = re.search(r'(\d+(?:\.\d+)?)\s*(GB|MB|TB|KB)', txt, re.I)
-            if size_match:
-                t_size_str = f"{size_match.group(1)} {size_match.group(2).upper()}"
-        
-        # 2. สกัด Date จากระบบตารางเว็บจริง
-        # กฎเหล็ก: ข้ามช่องที่มีความยาวตัวอักษรเยอะเกิน 30 ตัว (เพราะนั่นคือช่องชื่อไฟล์ชัวร์ๆ ป้องกันวันที่ปลอม)
-        if len(txt) < 30:
-            date_match = re.search(r'(\d{2,4}[-/]\d{2}[-/]\d{2,4})', txt)
-            if date_match:
-                time_match = re.search(r'(\d{2}:\d{2}:\d{2})', txt)
-                # ดึงวันลงระบบจริงที่มาพร้อมเวลาคั่นสากล
-                raw_date_str = f"{date_match.group(1)} {time_match.group(1) if time_match else '00:00:00'}"
-
-    # --- 4. สกัด Peers (Seeders/Leechers) ---
-    try:
-        clean_tds = [td for td in all_tds if 'dp-show' not in str(td.get('class', []))]
-        if len(clean_tds) >= 8:
-            s = extract_digit(clean_tds[-3]) 
-            l = extract_digit(clean_tds[-2]) 
-            c = extract_digit(clean_tds[-4]) 
-            
-        if l > 10000: l = 0 
-            
-    except Exception as e:
-        print(f"⚠️ Error parsing Peers: {e}")
-
-    # --- 5. ค้นหาลิงก์ดาวน์โหลด ---
+    # 3. สกัดลิงก์ดาวน์โหลด (ฉบับคัดกรอง)
     download_url = None
-    dl_pattern = re.compile(rf"(download(?:new)?|d)\.php\?.*(id|keyalert1)={t_id or ''}", re.I)
-    btn_dl = row.find("a", href=dl_pattern)
     
-    if not btn_dl:
-        btn_dl = row.find("button", onclick=re.compile(rf"download\.php/{t_id or ''}", re.I))
+    # ดึงจากส่วน Action บนหน้าหลัก
+    action_div = row.find("div", class_="bb-file-actions")
+    if action_div:
+        # Regex ตัวเดียวจบ ครอบคลุมทั้ง download.php และ downloadnew.php
+        btn_dl = action_div.find("a", href=re.compile(r"download(new)?\.php|nDonatedN\.php", re.I))
+        if btn_dl:
+            path = btn_dl.get('href', '')
+            download_url = path if path.startswith('http') else f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
-    if btn_dl:
-        if btn_dl.name == "button":
-            onclick_str = btn_dl.get('onclick', '')
-            url_match = re.search(r"'(.*?)'", onclick_str)
-            path = url_match.group(1).lstrip('/') if url_match else ""
-        else:
-            path = btn_dl.get('href', '').lstrip('/')
-            
-        if path:
-            download_url = f"{base_url.rstrip('/')}/{path}"
+    # Fallback ถ้าไม่เจอใน div action
+    if not download_url:
+        btn_dl = row.find("a", href=re.compile(r"download(new)?\.php\?id=" + str(t_id), re.I))
+        if btn_dl:
+            download_url = f"{base_url.rstrip('/')}/{btn_dl.get('href', '').lstrip('/')}"
 
-    # STEP B: Deep Scan
+    # [จุดสำคัญ] กรองลิงก์ VIP/Donate ทิ้งทันที
+    if download_url and any(bad in download_url.lower() for bad in ['ndonatedn', 'vip', 'donate']):
+        #print(f"⚠️ [{t_id}] ตรวจพบลิงก์หน้า VIP, บังคับทำ Deep Scan เพื่อหาลิงก์จริง...")
+        download_url = None # บังคับให้ข้ามไปทำ Deep Scan ในข้อ 4
+
+    # --- 4. Deep Scan (ฉบับอัปเกรด) ---
     if not download_url and details_url and dl_session:
+        #print(f"🔍 [{t_id}] ไม่พบลิงก์หน้าหลัก ทำ Deep Scan...")
         try:
             local_headers = headers.copy() if headers else {}
-            local_headers['Accept-Encoding'] = 'gzip, deflate'
-            local_headers['Referer'] = base_url
+            local_headers['Referer'] = details_url
             
-            resp = dl_session.get(details_url, headers=local_headers, timeout=15)
-            if resp.status_code == 200:
-                raw_c = resp.content
-                if raw_c.startswith(b'\x1f\x8b'):
-                    try: raw_c = gzip.decompress(raw_c)
-                    except: pass
+            # ดึงข้อมูลผ่าน session
+            resp = await dl_session.get(details_url, headers=local_headers, timeout=20)
+            
+            if resp and resp.status_code == 200:
+                soup_details = BeautifulSoup(resp.content, 'html.parser')
                 
-                det = chardet.detect(raw_c)
-                enc = det.get('encoding') or 'tis-620'
-                try: decoded_html = raw_c.decode(enc, errors='replace')
-                except: decoded_html = raw_c.decode('tis-620', errors='replace')
-
-                soup_details = BeautifulSoup(decoded_html, 'html.parser')
-                dl_tag = soup_details.find("a", href=dl_pattern) or \
-                         soup_details.find("button", onclick=re.compile(rf"download\.php/{t_id}", re.I))
+                if is_cloudflare(soup_details):
+                    return {"id": t_id, "status": "cf_blocked"}
                 
-                if not dl_tag:
-                    dl_tag = soup_details.find("a", class_=re.compile(r"bb-dl-btn|index", re.I)) or \
-                             soup_details.find("a", href=re.compile(rf"\.torrent.*{t_id}", re.I))
-
+                # [แก้ไข] ค้นหาลิงก์ดาวน์โหลดที่รองรับทั้ง download.php และ downloadnew.php
+                # และหลีกเลี่ยงลิงก์ที่เป็น VIP/Donate
+                dl_tag = soup_details.find("a", href=re.compile(r"download(new)?\.php\?.*id=" + str(t_id), re.I))
+                
                 if dl_tag:
-                    action_url = ""
-                    if dl_tag.name == "button":
-                        onclick_str = dl_tag.get('onclick', '')
-                        url_match = re.search(r"'(.*?)'", onclick_str)
-                        if url_match: action_url = url_match.group(1).strip()
+                    action_url = dl_tag.get('href', '').strip()
+                    # ตรวจสอบลิงก์ที่ได้ว่าไม่ใช่หน้า VIP
+                    if any(bad in action_url.lower() for bad in ['ndonatedn', 'vip', 'donate']):
+                        print(f"🚩 [{t_id}] ตรวจพบลิงก์ VIP/Donate, ข้าม...")
                     else:
-                        action_url = dl_tag.get('href', '').strip()
-
-                    if action_url:
-                        action_url = action_url.lstrip('/')
-                        download_url = action_url if action_url.startswith('http') else f"{base_url.rstrip('/')}/{action_url}"
+                        download_url = action_url if action_url.startswith('http') else f"{base_url.rstrip('/')}/{action_url.lstrip('/')}"
+        
         except Exception as e:
-            print(f"⚠️ [{t_id}] Error scanning Details: {e}")
+            print(f"⚠️ [{t_id}] Error ในการ Deep Scan: {e}")
 
     return {
-        "id": t_id,
-        "title": title,
-        "is_locked": is_hard_locked,
-        "is_sticky": is_sticky,
-        "seeders": s,
-        "leechers": l,
-        "completed": c,
-        "size_str": t_size_str,
-        "raw_date": raw_date_str,
-        "download_url": download_url,
-        "details_url": details_url,
-        "raw_text": row_text
+        "id": t_id, "title": title, "seeders": s, "leechers": l,
+        "completed": c, "size_str": t_size_str, "raw_date": raw_date_str,
+        "download_url": download_url, "details_url": details_url
     }
 
+class ResponseWrapper:
+    def __init__(self, status, content, url):
+        self.status_code = status # ปรับชื่อให้ตรงกับที่คุณใช้
+        self.content = content
+        self.url = url
+        self.headers = {} # ถ้าต้องใช้ headers ให้ดึงมาใส่ด้วย
+
+async def download_torrent_via_browser(tab, details_url, download_url):
+    # 1. ไปหน้า details เพื่อให้ Browser สร้าง Session/Cookie ให้สมบูรณ์
+    await tab.get(details_url)
+    await tab.wait(2) # รอแค่แป๊บเดียวพอ
+    
+    # 2. ดึงคุกกี้จาก Browser ผ่าน JS
+    cookie_str = await tab.evaluate("document.cookie")
+    cookies_dict = {}
+    if isinstance(cookie_str, str):
+        for item in cookie_str.split("; "):
+            if '=' in item:
+                key, val = item.split("=", 1)
+                cookies_dict[key.strip()] = val.strip()
+
+    # 3. ใช้ download_url ที่ได้รับมา (แทนที่จะไปกดปุ่ม)
+    # เราใช้ download_url ที่บอทส่งมาให้ในตัวแปร details_url หรือพารามิเตอร์อื่น
+    # ตรงนี้สมมติว่า download_url คือ URL ของปุ่มโหลดที่คุณมีอยู่แล้ว
+    # หากยังไม่มี ต้องดึงออกมาจาก details_url หรือระบุเข้ามา
+    
+    print(f"🚀 เริ่มดาวน์โหลดตรงจาก URL: {download_url}") # ใช้ download_url ที่คุณมี
+
+    import aiohttp
+    async with aiohttp.ClientSession(cookies=cookies_dict) as session:
+        headers = {
+            'Referer': details_url,
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/120.0.0.0'
+        }
+        async with session.get(download_url, headers=headers) as resp:
+            if resp.status == 200:
+                return await resp.read()
+            else:
+                print(f"❌ ดาวน์โหลดตรงล้มเหลว Status: {resp.status}")
+    
+    return None
+                
 def format_site_stats_report(all_nodes):
     # โครงสร้างใหม่: { 'Site_Name': { 'Node_Name': { 'up_gb': X, 'speed_mb': Y, 'count': Z } } }
     combined_stats = {}
@@ -3046,16 +3305,16 @@ def format_site_stats_report(all_nodes):
     
 # ========================= BearBit STATUS =========================
 
-def clear_bearbit_notifications(page, base_url, site_name="BEARBIT"):
+async def clear_bearbit_notifications(page: uc.Tab, base_url: str, site_name: str = "BEARBIT") -> bool:
     """
     ฟังก์ชันสำหรับลูปกวาดกล่องข้อความแจ้งเตือนสีเขียว (inbox.php?type=ตัวเลขใดๆ) ของ BEARBIT จนกว่าจะหมด
-    - [Strict Filter] มองข้ามปุ่มเมนูหลักของระบบตั้งแต่ระดับ Selector มั่นใจได้ว่าบอทจับเฉพาะแถบแจ้งเตือนจริงเท่านั้น
-    - [AJAX Loop Engine] เปลี่ยนมาใช้สถาปัตยกรรมไม่รีโหลดหน้าเว็บ (No-Reload) กวาดล้างข้อความได้เร็วขึ้นสูงสุด 5 เท่า
-    - [Detached Safeguard] ใช้ .wait_for(state="detached") มั่นใจได้ว่าปุ่มเดิมถูกทำลายไปแล้วก่อนขยับลูปถัดไป
-    - [Hybrid Fallback] มีระบบ Goto สำรองอัตโนมัติ หากเกิดอาการเครือข่ายหน่วงและปุ่มไม่ยอมหายไปใน 3 วินาที
+    - [Strict Filter] คัดกรองชื่อเมนูคงที่ออกด้วย Regex มั่นใจได้ว่าบอทจับเฉพาะแถบแจ้งเตือนจริงเท่านั้น
+    - [AJAX Loop Engine] ปรับปรุงสถาปัตยกรรมเข้าหา nodriver เพื่อประมวลผลด่วนแบบไม่ต้องรีโหลดหน้าเว็บ
+    - [Detached Safeguard] ใช้ JavaScript ตรวจเช็กการสลายตัวของ Element ใน DOM ก่อนขยับลูปถัดไป
+    - [Hybrid Fallback] มีระบบสำรองอัตโนมัติ หากเกิดอาการเครือข่ายหน่วงและปุ่มไม่ยอมหายไปใน 3 วินาที
     - [Full-Report Edition] ส่งรายงานผลลัพธ์เข้า Discord แยกเคสเคลียร์สำเร็จ และเคสกล่องสะอาดเรียบร้อยดี
     """
-    print(f"📥 [{site_name}] เริ่มระบบ Auto-Clear Notification (High-Speed AJAX Engine)...")
+    print(f"📥 [{site_name}] เริ่มระบบ Auto-Clear Notification (High-Speed AJAX Engine via nodriver)...")
     
     cleared_messages = []
     loop_count = 0
@@ -3069,25 +3328,53 @@ def clear_bearbit_notifications(page, base_url, site_name="BEARBIT"):
     try:
         # เช็กหน้าปัจจุบันก่อน ถ้าอยู่ที่หน้าหลักอยู่แล้วไม่ต้องสั่งโหลดซ้ำ
         if page.url != index_url:
-            page.goto(index_url, timeout=20000, wait_until="domcontentloaded")
+            await page.get(index_url)
+            await asyncio.sleep(2)
     except Exception as e:
         print(f"⚠️ [{site_name}] ไม่สามารถโหลดหน้าแรกได้: {e}")
         return False
 
+    # Regex สำหรับกรองเมนูคงที่ที่ไม่ใช่ข้อความแจ้งเตือนจริง
+    static_menu_pattern = re.compile(r"^(?:กล่องข้อความ|Inbox|ข้อความส่วนตัว|My Inbox|Messages)$", re.I)
+
     while loop_count < max_loops:
         try:
-            # 🎯 ดักจับลิงก์แจ้งเตือนในตาราง #pms หรือ td โดยคัดกรองชื่อเมนูคงที่ออกจากการสแกน
-            noti_locator = page.locator('table[id="pms"] a[href*="inbox.php?type="], td a[href*="inbox.php?type="]').filter(
-                has_not_text=re.compile(r"^(?:กล่องข้อความ|Inbox|ข้อความส่วนตัว|My Inbox|Messages)$", re.I)
-            )
+            # 🎯 ดักจับลิงก์แจ้งเตือนทั้งหมดในตาราง #pms หรือ td ด้วย CSS Selector
+            all_links = await page.select('table[id="pms"] a[href*="inbox.php?type="], td a[href*="inbox.php?type="]')
             
-            # ชี้เป้าไปที่อิลิเมนต์ตัวแรกเสมอ (เพราะเมื่อตัวแรกหาย ตัวถัดไปจะขยับขึ้นมาเป็น .first แทน)
-            current_noti = noti_locator.first
+            # กรอง Element หาตัวแรกที่แมตช์เงื่อนไขแจ้งเตือนจริง (ไม่ใช่ปุ่มเมนูสเตติก)
+            current_noti = None
+            clean_text = ""
+            target_href = ""
             
-            try:
-                # รอดูปุ่มแจ้งเตือนระบบแสดงผลจริง 2 วินาที (ถ้าไม่มีแล้วจะดีดออกเพื่อจบลูป)
-                current_noti.wait_for(state="visible", timeout=2000)
-            except:
+            if all_links:
+                # ดึงมาเป็นลิสต์ในกรณีที่เจอหลายตัว
+                if not isinstance(all_links, list):
+                    all_links = [all_links]
+                    
+                for link in all_links:
+                    text_val = link.text.strip() if link.text else ""
+    
+                    if text_val and not static_menu_pattern.match(text_val):
+                        current_noti = link
+                        clean_text = text_val
+        
+                        # [FIX] วิธีเข้าถึง attribute ที่ปลอดภัยที่สุดใน nodriver
+                        # บางครั้ง attributes ถูกเก็บเป็น property หรือ method
+                        try:
+                            # พยายามดึงผ่าน dictionary ถ้ามี
+                            if hasattr(link, 'attributes') and isinstance(link.attributes, dict):
+                                target_href = link.attributes.get('href', '')
+                            else:
+                                # ถ้าไม่มี ให้ใช้ .get_attribute ซึ่งเป็นวิธีมาตรฐานของโพรโตคอล
+                                target_href = await link.get_attribute('href') or ''
+                        except Exception:
+                            target_href = ''
+            
+                        break
+
+            # 🛑 ประเมินจุดจบของลูป: ถ้าไม่เจอแจ้งเตือนใหม่แล้วให้เบรกออกจากลูปทันที
+            if not current_noti:
                 if loop_count == 0:
                     print(f"✨ [{site_name}] Inbox คลีน! ไม่มีข้อความแจ้งเตือนค้างอยู่")
                     is_clean_at_start = True
@@ -3096,17 +3383,7 @@ def clear_bearbit_notifications(page, base_url, site_name="BEARBIT"):
                     is_clean_at_start = False
                 break
             
-            # ดึงเนื้อหาข้อความมาวิเคราะห์
-            noti_text = current_noti.text_content()
-            clean_text = noti_text.strip() if noti_text else ""
-            
-            # [Safety Guard] สกัดกั้นเผื่อกรณีเมนูหลักหลุดรอดมา
-            if clean_text in ["กล่องข้อความ", "Inbox", "ข้อความส่วนตัว", "My Inbox", "Messages"] or not clean_text:
-                print(f"🛑 [{site_name}] ตัวกรองตรวจพบเมนูสเตติกหลุดรอด ({clean_text or 'Empty'}) -> ปิดลูปเพื่อความปลอดภัย")
-                break
-            
-            # สกัดค่า Type จาก Attribute href
-            target_href = current_noti.get_attribute("href") or ""
+            # สกัดค่า Type จาก Attribute href เพื่อพิมพ์ Log บันทึกประวัติ
             type_match = re.search(r"type=(\d+)", target_href)
             noti_type = type_match.group(1) if type_match else "Unknown"
             
@@ -3114,22 +3391,35 @@ def clear_bearbit_notifications(page, base_url, site_name="BEARBIT"):
             cleared_messages.append(f"• รอบที่ {loop_count + 1} (Type {noti_type}): {clean_text}")
             
             # ⚡ สั่งคลิกอ่านเพื่อเคลียร์แจ้งเตือน (ส่งสัญญาณ AJAX ไปยังเซิร์ฟเวอร์)
-            current_noti.click(timeout=10000)
+            await current_noti.click()
             loop_count += 1
             is_clean_at_start = False  # มีการเคลียร์ แปลว่าหน้าเว็บไม่ได้คลีนตั้งแต่แรก
             
-            # 🎯 [AJAX Optimization] รอให้อิลิเมนต์เดิมถูกถอดถอนออกจากหน้าจอ (หายไปจาก DOM)
-            try:
-                # ระบบ AJAX ที่ดีจะลบแท็กทิ้งทันที รอตรวจจับภายใน 3 วินาที
-                current_noti.wait_for(state="detached", timeout=3000)
-                # หน่วงสั้นๆ เพื่อให้ DOM เรียงตัวใหม่เสร็จสิ้น (ไม่ต้องรีโหลดหน้าเว็บ)
-                page.wait_for_timeout(300)
-            except:
-                # 🔄 [Fallback Safeguard] หากปุ่มไม่ยอมหายไปใน 3 วินาที (AJAX หน่วงหรือค้าง) 
-                # ให้สั่งรีโหลดหน้าแรกเพื่อแก้เกมและอัปเดตสเตตัสสดทันที
+            # 🎯 [AJAX Optimization] จำลองพฤติกรรม wait_for(state="detached") ใน nodriver
+            # โดยดักเช็กว่าตัวแปรอิลิเมนต์นี้ได้ถูกถอดถอน (Remove) ออกจากหน้าเว็บไปแล้วหรือยัง
+            is_detached = False
+            for _ in range(15):  # ลูปเช็กย่อยรอบละ 0.2 วินาที (รวมเป็น 3 วินาทีสูงสุด)
+                await asyncio.sleep(0.2)
+                try:
+                    # ถ้าระบบ AJAX ทำงานเสร็จสิ้น ปุ่มนี้จะหายไปจาก DOM สั่งเช็กผ่าน JavaScript
+                    # (ใช้การเปรียบเทียบในฝั่งเพจว่าอิลิเมนต์ตัวนี้หลุดออกจากโครงสร้างหน้าหลักหรือยัง)
+                    still_connected = await page.evaluate(
+                        f"document.body.contains(document.querySelector('a[href=\"{target_href}\"]'))"
+                    )
+                    if not still_connected:
+                        is_detached = True
+                        break
+                except:
+                    is_detached = True
+                    break
+            
+            if is_detached:
+                await asyncio.sleep(0.3)  # หน่วงสั้นๆ เพื่อให้ DOM เรียงตัวใหม่เสร็จสิ้น
+            else:
+                # 🔄 [Fallback Safeguard] หากปุ่มไม่ยอมหายไปใน 3 วินาที (AJAX หน่วงหรือค้าง)
                 print(f"🔄 [{site_name}] AJAX ตอบสนองช้า สั่งรีโหลดหน้าแรกเพื่ออัปเดตแผงควบคุม...")
-                page.goto(index_url, timeout=15000, wait_until="domcontentloaded")
-                page.wait_for_timeout(1000)
+                await page.get(index_url)
+                await asyncio.sleep(2)
                 
         except Exception as e:
             print(f"⚠️ [{site_name}] เกิดข้อผิดพลาดในลูปเคลียร์แจ้งเตือน: {e}")
@@ -3140,7 +3430,9 @@ def clear_bearbit_notifications(page, base_url, site_name="BEARBIT"):
     # -------------------------------------------------------------------------
     has_notify_func = False
     try:
-        if callable(globals().get('send_notify')) or callable(locals().get('send_notify')):
+        # ดึงฟังก์ชันเช็กจาก Global scope ทั่วไป
+        notify_fn = globals().get('send_notify')
+        if notify_fn and callable(notify_fn):
             has_notify_func = True
     except:
         pass
@@ -3153,11 +3445,20 @@ def clear_bearbit_notifications(page, base_url, site_name="BEARBIT"):
             report_msg.extend(cleared_messages[:10]) 
             if len(cleared_messages) > 10:
                 report_msg.append(f"<i>... และรายการอื่น ๆ อีก {len(cleared_messages) - 10} ฉบับ</i>")
-            send_notify("\n".join(report_msg))
             
+            # ตรวจสอบว่าเป็นโค้ดแบบ Async หรือไม่
+            if asyncio.iscoroutinefunction(notify_fn):
+                await notify_fn("\n".join(report_msg))
+            else:
+                notify_fn("\n".join(report_msg))
+                
         elif is_clean_at_start:
             # ✨ เคสที่ 2: ไม่มีแจ้งเตือนใดๆ ค้างตั้งแต่แรก
-            send_notify(f"📥 <b>[{site_name}]</b> ตรวจสอบแล้ว <u>ไม่มีข้อความแจ้งเตือนใหม่</u> กล่องข้อความสะอาดเรียบร้อยดี")
+            msg = f"📥 <b>[{site_name}]</b> ตรวจสอบแล้ว <u>ไม่มีข้อความแจ้งเตือนใหม่</u> กล่องข้อความสะอาดเรียบร้อยดี"
+            if asyncio.iscoroutinefunction(notify_fn):
+                await notify_fn(msg)
+            else:
+                notify_fn(msg)
     else:
         print(f"📢 [{site_name}] เสร็จสิ้นกระบวนการเคลียร์แจ้งเตือน (ไม่ได้ส่งรายงาน Discord เนื่องจากไม่พบฟังก์ชัน send_notify)")
         
@@ -3190,65 +3491,72 @@ def get_bearbit_item_status(soup):
     try:
         active_item = "NONE"
         display_exp = "N/A"
-
-        # ⚡ ขั้นเด็ดขาด: หา Element ใดๆ ก็ตามที่มีคำว่า Item Status หรือ สถานะไอเทม อยู่ข้างใน
-        # วิธีนี้จะครอบคลุมทุกแท็ก ไม่ว่าจะเป็น td, b, font, span หรือ tr
-        target_element = soup.find(string=RE_ITEM_ROW)
         
+        # 1. ค้นหาเนื้อหาแบบจำกัดขอบเขต
+        target_element = soup.find(string=RE_ITEM_ROW)
+        clean_text = ""
+        
+        # ค้นหาภาพไอเทมในขอบเขตเดียวกัน
+        img_src = ""
         if target_element:
-            # วิ่งหาแท็กบรรพบุรุษที่ใกล้ที่สุดเพื่อกวาดเนื้อหาในบล็อกตารางรอบข้างทั้งหมดมาวิเคราะห์
-            # ป้องกันปัญหา find_next('td') แล้วเจอช่องว่างหรือเจอแท็กคั่น
-            parent_context = target_element.find_parent(["tr", "table"])
-            if parent_context:
-                full_text = parent_context.get_text(" ", strip=True).replace("\xa0", " ")
-                clean_text = " ".join(full_text.split())
-            else:
-                # กรณีหาแท็กครอบไม่เจอ ให้ดึง Text จากจุดนั้นยาวลงไปด้านล่าง 300 ตัวอักษรดักไว้เลย
-                full_text = target_element.find_next().get_text(" ", strip=True)
-                clean_text = " ".join(full_text.split())
+            parent = target_element.find_parent(["tr", "table"])
+            if parent:
+                clean_text = " ".join(parent.get_text(" ", strip=True).split())
+                # ค้นหารูปภาพภายใน parent นั้น
+                img_tag = parent.find("img", src=re.compile(r"pic/item/item\d+\.gif", re.I))
+                if img_tag:
+                    img_src = img_tag.get('src', '')
+
+        # 2. ถ้าไม่เจอค่อยใช้ Fallback (ตรวจสอบภาพในทั้งหน้า)
+        if not img_src:
+            img_tag = soup.find("img", src=re.compile(r"pic/item/item\d+\.gif", re.I))
+            if img_tag:
+                img_src = img_tag.get('src', '')
+
+        # 3. ลอจิกไอเทม (รวมทั้ง Keyword และ Image Path)
+        # ตรวจสอบจาก img_src ก่อน ถ้าเจอให้ข้ามไปเลย
+        if "item1.gif" in img_src:
+            active_item = "FREELOAD_100"
+        elif "item3.gif" in img_src:
+            active_item = "FREELOAD_50"
+        elif "item5.gif" in img_src:
+            active_item = "FREELOAD_10"
+        elif "item6.gif" in img_src:
+            active_item = "FREELOAD_15"
         else:
-            # 🛡️ เกราะสำรองชั้นสุดท้าย: ถ้าหาจาก Element ไม่เจอ ให้สแกนดึงจาก text รวมของ soup เลย
-            full_text = soup.get_text(" ", strip=True).replace("\xa0", " ")
-            clean_text = " ".join(full_text.split())
+            # ถ้าไม่เจอจากรูป ให้เช็คจาก Keyword (Fallback)
+            item_map = {
+                "FREELOAD_100": ["ซานตาคลอส", "100%", "Santa Claus"],
+                "FREELOAD_50": ["ตุ๊กตาซานต้า", "50%", "Santa Doll"], 
+                "FREELOAD_15": ["หยินหยาง", "15%", "Yin Yang"],
+                "FREELOAD_10": ["แหวนครองพิภพ", "10%", "One Ring"]
+            }
+            for key, keywords in item_map.items():
+                if any(k.lower() in clean_text.lower() for k in keywords):
+                    active_item = key
+                    break
 
-        # 🎯 ลอจิกการจับคู่ไอเทม (เพิ่มความทนทาน ค้นหาในกลุ่มข้อความที่กวาดมาได้กว้างขึ้น)
-        item_map = {
-            "FREELOAD_100": ["ซานตาคลอส", "100%", "Santa Claus"],
-            "FREELOAD_50": ["ตุ๊กตาซานต้า", "50%", "Santa Doll"], 
-            "FREELOAD_15": ["หยินหยาง", "15%", "Yin Yang"],
-            "FREELOAD_10": ["แหวนครองพิภพ", "10%", "One Ring"]
-        }
-
-        # สแกนหาไอเทมที่ทำงานอยู่
-        for key, keywords in item_map.items():
-            if any(k in clean_text for k in keywords):
-                active_item = key
-                break
-
-        # ดึงวันเวลาหมดอายุด้วย Regex
+        # 4. ดึงวันหมดอายุ (คงเดิม)
         exp_match = RE_EXP_DATE.search(clean_text)
         if exp_match:
             display_exp = exp_match.group(1).replace("/", "-")
-            
             try:
                 if 'check_item_urgency' in globals() and check_item_urgency(display_exp):
-                    display_exp += " ⚠️ ใกล้หมดอายุ!"
-            except Exception as time_err:
-                display_exp += " (Time Check Error)"
+                    display_exp += " ⚠️"
+            except Exception: pass
 
-        # ส่งสัญญาณไปอัปเดตคอนฟิกบอทหลัก
-        if active_item != "NONE":
-            if 'update_bot_config' in globals():
-                try:
-                    update_bot_config(active_item)
-                except Exception as cfg_err:
-                    print(f"⚠️ [Config Update Warning] {cfg_err}")
-            
-            return f"{active_item} ({display_exp})"
-            
-        return "NONE"
+        # 5. อัปเดต Bot Config (คงเดิม)
+        if active_item != "NONE" and 'update_bot_config' in globals():
+            try:
+                update_bot_config(active_item)
+            except Exception as e:
+                print(f"⚠️ [Config Update Warning] {e}")
+
+        return f"{active_item} ({display_exp})"
+
     except Exception as e:
-        return f"ERROR ({str(e)[:20]})"
+        print(f"❌ [Critical Error in Parser] {e}")
+        return "NONE"
 
 def update_bot_config(active_item):
     global CFG
@@ -3295,136 +3603,90 @@ def update_bot_config(active_item):
             CFG['SETTING']['CURRENT_DISCOUNT'] = 0
             print(f"❌ Error reloading config: {e} | Switching to Emergency Safety Mode")
 
-def auto_vote_snatched(page, base_url, site_name="BEARBIT"):
+async def auto_vote_snatched(page: uc.Tab, base_url: str, site_name: str = "BEARBIT") -> bool:
     """
     ฟังก์ชันช่วยโหวตทอร์เรนต์ที่ดาวน์โหลดไปแล้ว (snatchdown.php)
-    - [Unique Row Tracker] กวาดข้อมูลระดับแถว (TR) ดักจับ Torrent ID ป้องกันการกดซ้ำซ้อนกรณีงานซ้ำกัน
-    - [High-Speed AJAX Engine] คลิกรัวผ่านระบบสตรีมมิ่ง คุมลูปโดยไม่ต้องรีโหลดหน้าเว็บ
-    - [Safe Callback & Latency Resilient] ปรับการรับส่ง Request และระบบเปลี่ยนหน้าให้ทนทานต่อเน็ตเวิร์กหน่วง
+    - [Direct Element Targeting] กวาดดึงปุ่มรูปภาพโหวตยอดเยี่ยมโดยตรง ไม่ต้องผ่านลูป TR ป้องกันปัญหา Nested Table
+    - [DOM Parent Navigation] ใช้ JavaScript ช่วยสกัด Torrent ID ย้อนกลับขึ้นมาจากตำแหน่งปุ่ม
     """
     try:
         max_p = 5
         total_voted = 0
-        last_page_url = ""  # ตัวแปรสำหรับดักจับดัชนี URL ป้องกันการโหลดหน้าซ้ำซ้อน
         
-        # ประกอบ URL จาก base_url หลัก
         if not base_url.endswith('/'):
             base_url += '/'
         snatch_url = f"{base_url}snatchdown.php"
         
         print(f"🗳️ [{site_name}] เริ่มระบบ Auto-Vote (สแกนสูงสุด {max_p} หน้า ผ่านระบบกรองงานซ้ำ)...")
+        await page.get(snatch_url)
         
-        # โหลดหน้าแรกเพื่อตั้งหลัก
-        page.goto(snatch_url, timeout=25000, wait_until="domcontentloaded")
-        
-        # คอนฟิก Selector
-        vote_img_selector = 'img[title="ยอดเยี่ยม"], img[src*="v5.1.1.png"]'
-        # เจาะจงแถวที่มีข้อมูลทอร์เรนต์ (มักจะมีลิงก์รายละเอียด details.php?id=...)
-        row_selector = 'tr:has(a[href*="details.php"])'
+        # 🎯 ตัวเลือก Selector สำหรับรูปภาพปุ่มโหวต "ยอดเยี่ยม" ตรงตาม HTML หน้าเว็บเป๊ะๆ
+        # ค้นหาภาพที่มี src เป็น v5.1.1.png หรือมี title คำว่า ยอดเยี่ยม
+        vote_img_selector = 'img[src*="v5.1.1.png"], img[title="ยอดเยี่ยม"]'
         
         for p_idx in range(1, max_p + 1):
-            current_url = page.url
-            if current_url == last_page_url:
-                print(f"🏁 [{site_name}] ตรวจพบอาการ URL ซ้ำซ้อน (หน้าสุดท้ายจริง) สั่งจบลูปทำงานอย่างปลอดภัย")
+            print(f"📖 [{site_name}] กำลังสแกนหน้า {p_idx}...")
+            await asyncio.sleep(2.0)
+            
+            # 1. กวาดปุ่มโหวต
+            all_vote_btns = await page.select_all(vote_img_selector)
+            
+            # [Smart Break] ถ้าหน้านี้ไม่มีงานค้างเลย สั่งหยุดทันที (สะอาดแล้ว)
+            if not all_vote_btns:
+                print(f"✅ [{site_name}] หน้า {p_idx} สะอาดเรียบร้อย ไม่พบรายการค้างโหวต สั่งหยุดระบบ!")
                 break
-            last_page_url = current_url
-            
-            print(f"📖 [{site_name}] กำลังสแกนตรวจสอบรายการในหน้าทำงานที่ {p_idx}...")
-            page.wait_for_timeout(1500) # รอหน้าเว็บและโครงสร้างตารางเรนเดอร์เสร็จสมบูรณ์
-            
-            # ดึงแถวข้อมูลทั้งหมดในหน้าปัจจุบัน ณ วินาทีนี้
-            rows = page.locator(row_selector)
-            row_count = rows.count()
-            
-            if row_count == 0:
-                print(f"✨ [{site_name}] ไม่พบแถวรายการข้อมูลในหน้า {p_idx}")
-            else:
-                voted_in_page = 0
-                seen_torrent_ids = set() # เก็บ Torrent ID ที่พบในหน้านี้เพื่อกรองตัวซ้ำ
                 
-                for r_idx in range(row_count):
-                    current_row = rows.nth(r_idx)
-                    
-                    # 🔍 1. สกัดหา Torrent ID จาก Tag <a> ในแถวนั้นเพื่อใช้เป็นเครื่องมือคัดกรองความซ้ำซ้อน
-                    link_element = current_row.locator('a[href*="details.php"]').first
-                    if link_element.count() == 0:
-                        continue
-                        
-                    href = link_element.get_attribute("href") or ""
-                    # ใช้ Regex ตัดดึงเอาเฉพาะตัวเลข ID ลิงก์ย้อนหลัง (เช่น details.php?id=12345 -> 12345)
-                    id_match = re.search(r"id=(\d+)", href)
-                    torrent_id = id_match.group(1) if id_match else href
-                    
-                    # 🛑 [CORE LOGIC] เช็กด่วนว่างานนี้เคยเจอตัวแรกไปหรือยัง?
-                    if torrent_id in seen_torrent_ids:
-                        # ถ้ายับยั้งไว้ได้สำเร็จ แปลว่าเป็นตัวซ้ำ -> ปล่อยข้ามทันทีตามเงื่อนไขที่ต้องการ
-                        continue
-                    
-                    # เพิ่มเข้าคลังความจำว่าคัดกรองงาน ID นี้ไปแล้ว (ตัวถัดไปที่ซ้ำกันจะโดน Skip ทันที)
-                    seen_torrent_ids.add(torrent_id)
-                    
-                    # 🔍 2. ตรวจสอบว่าแถวนี้มีปุ่มให้กดโหวตหรือไม่
-                    vote_btn = current_row.locator(vote_img_selector).first
-                    if vote_btn.count() == 0:
-                        continue # ถ้าไม่มีปุ่มโหวต (อาจจะโหวตไปแล้วในอดีต) ให้ข้ามไปแถวถัดไป
-                        
-                    try:
-                        # เลื่อนจอและโฟกัสพิกัดปุ่มในแถว
-                        vote_btn.scroll_into_view_if_needed()
-                        page.wait_for_timeout(100)
-                        
-                        # 🚀 ยิงคำสั่งคลิกโหวตผ่านระบบ AJAX ของเว็บบิท
-                        vote_btn.click(timeout=4000)
-                        total_voted += 1
-                        voted_in_page += 1
-                        print(f"    🔹 [{site_name}] กดโหวตตัวแรกสำเร็จ (ID: {torrent_id}) [ยอดสะสมรวม: {total_voted}]")
-                        
-                        # รอให้ปุ่มในแถวนั้นจางหายไป (Detached)
-                        try:
-                            vote_btn.wait_for(state="detached", timeout=1500)
-                        except:
-                            page.wait_for_timeout(300)
-                            
-                        # หน่วงเวลาสุ่มเสมือนมนุษย์จริง ป้องกัน Rate Limit จาก Firewall
-                        page.wait_for_timeout(int(random.uniform(600, 1200)))
-                        
-                    except Exception as click_err:
-                        print(f"    ⚠️ [{site_name}] พลาดจังหวะคลิกในแถวที่ {r_idx} (จะลองใหม่รอบถัดไป): {click_err}")
-                        page.wait_for_timeout(500)
-                
-                if voted_in_page > 0:
-                    print(f"🧹 [{site_name}] เคลียร์การโหวตในหน้า {p_idx} เสร็จสิ้น (โหวตตัวไม่ซ้ำไป {voted_in_page} รายการ)")
+            voted_in_page = 0
+            print(f"🔍 [{site_name}] พบ {len(all_vote_btns)} รายการที่ต้องโหวต")
             
-            # 🎯 [Page Transition Fix] ขยับหน้าถัดไป
-            if p_idx < max_p:
-                next_btn = page.locator('img[src*="nextpage.gif"]').first
+            # 2. ทำการโหวต
+            for btn_idx, vote_btn in enumerate(all_vote_btns):
                 try:
-                    next_btn.wait_for(state="visible", timeout=1500)
-                    print(f"➡️ [{site_name}] กำลังเปลี่ยนไปหน้าถัดไป (หน้า {p_idx + 1})...")
-                    next_btn.click(timeout=5000)
-                    page.wait_for_load_state("domcontentloaded")
-                except:
-                    print(f"🏁 [{site_name}] ไม่พบปุ่ม Next Page ในหน้าปัจจุบัน สั่งจบลูปทำงานอย่างสมบูรณ์")
-                    break
-            else:
-                print(f"🏁 [{site_name}] สแกนครบตามโควตาหน้าสูงสุด ({max_p} หน้า) เรียบร้อยแล้ว")
+                    await vote_btn.click()
+                    total_voted += 1
+                    voted_in_page += 1
+                    await asyncio.sleep(random.uniform(0.5, 0.9))
+                except Exception:
+                    continue
+            
+            # 3. ตรวจสอบปุ่ม Next Page อย่างระมัดระวัง
+            next_btn = await page.select('img[src*="nextpage.gif"]')
+            if not next_btn:
+                print(f"🏁 [{site_name}] ถึงหน้าสุดท้ายแล้ว (ไม่พบปุ่ม Next) สั่งหยุดระบบ")
                 break
+            
+            # ถ้ายังมีหน้าถัดไป
+            if p_idx < max_p:
+                print(f"➡️ [{site_name}] กำลังไปหน้า {p_idx + 1}...")
                 
+                # ตรวจสอบว่าปุ่ม clickable หรือไม่ก่อนคลิก
+                if isinstance(next_btn, list): next_btn = next_btn[0]
+                await next_btn.click()
+                await asyncio.sleep(3.5) # รอ AJAX Render
+            else:
+                print(f"🛑 [{site_name}] ถึงโควตาหน้าสูงสุด ({max_p}) สั่งหยุดเพื่อความปลอดภัย")
+                break        
         # -------------------------------------------------------------------------
         # 🎯 ระบบสรุปยอดรายงานผลส่งเข้า Discord
         # -------------------------------------------------------------------------
         has_notify_func = False
         try:
-            if callable(globals().get('send_notify')) or callable(locals().get('send_notify')):
+            notify_fn = globals().get('send_notify')
+            if notify_fn and callable(notify_fn):
                 has_notify_func = True
         except:
             pass
 
         if has_notify_func:
             if total_voted > 0:
-                send_notify(f"🗳️ <b>[{site_name}]</b> ทำการ Auto-Vote ทอร์เรนต์สำเร็จ (กรองงานซ้ำแล้ว) รวม <b>{total_voted}</b> รายการ")
+                msg = f"🗳️ <b>[{site_name}]</b> ทำการ Auto-Vote ทอร์เรนต์สำเร็จรวม <b>{total_voted}</b> รายการ (หน้า 1-{p_idx})"
             else:
-                send_notify(f"🗳️ <b>[{site_name}]</b> ตรวจสอบแล้ว ไม่มีทอร์เรนต์ค้างโหวต ระบบสะอาดเรียบร้อย")
+                msg = f"🗳️ <b>[{site_name}]</b> ตรวจสอบหน้าดาวน์โหลดแล้ว ไม่มีทอร์เรนต์ค้างโหวต ระบบสะอาดเรียบร้อย ✨"
+                
+            if asyncio.iscoroutinefunction(notify_fn):
+                await notify_fn(msg)
+            else:
+                notify_fn(msg)
         else:
             print(f"📢 [{site_name}] เสร็จสิ้นภารกิจ Auto-Vote รวมทั้งสิ้น {total_voted} รายการ")
             
@@ -3659,12 +3921,136 @@ def generate_main_status(config, site_name=""):
     
     return f"⚙️ เงื่อนไข: ขนาด {min_gb:.1f}-{max_gb:.1f}GB | ฟรีโหลด {status_text}{freeload_info}"
     
-def main():
-    startup_msg = "🚀 Universal Auto-Pilot : Started"
-    print(startup_msg); send_notify(startup_msg)
+async def get_valid_tab(browser):
+    try:
+        # พยายามปิด Tab เก่าทิ้งก่อนสร้างใหม่เสมอ
+        return await browser.get('about:blank')
+    except Exception:
+        return None
+
+async def ensure_active_page(browser, page, site_cfg):
+    """ ปรับปรุงให้ทนทานต่อสถานะ Page ที่พังไปแล้ว """
     
-    while True:
+    # ถ้าตัวแปร page พังไปแล้วหรือเป็น None ต้องสร้างใหม่ทันที
+    if page is None:
+        return await browser.get("about:blank", new_tab=True)
+    
+    try:
+        # ใช้การทดสอบเบาที่สุด: เช็คว่า page มีการตอบสนองไหม
+        # ถ้า page พัง มันจะโยน error ออกมาให้เราจับใน except ทันที
+        await page.evaluate("document.title") 
+        return page
+    except:
+        # ถ้าเข้าตรงนี้ แปลว่า page พังแน่นอนแล้ว
+        print(f"⚠️ [{site_cfg['name']}] ตรวจพบ Tab พัง กำลังคืนค่า None เพื่อให้ลูปสร้างใหม่...")
+        return None
+
+def get_val(obj, key, default=None):
+    """ฟังก์ชันช่วยดึงค่าจากทั้ง Dictionary และ Object"""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+def is_cloudflare(soup):
+    # 1. เช็ค Title (ครอบคลุมกรณี "Just a moment..." หรือ "Attention Required!")
+    title = soup.title.string.strip() if soup.title else ""
+    if any(text in title for text in ["Just a moment", "Attention Required"]):
+        return True
+        
+    # 2. เช็คจาก Selector ที่ Cloudflare ใช้เรียก Challenge
+    # เพิ่ม 'cf-wrapper' หรือ 'challenge-running' ซึ่งมักจะติดมาด้วย
+    if soup.find(id="cf-content") or soup.find("div", {"class": ["cf-browser-verification", "cf-wrapper"]}):
+        return True
+        
+    # 3. เช็คจากข้อความใน Body (เน้นคำสำคัญ)
+    body_text = soup.get_text(" ", strip=True).lower()
+    cloudflare_keywords = ["cloudflare", "checking if the site connection is secure"]
+    if all(keyword in body_text for keyword in cloudflare_keywords):
+        return True
+    
+    # 4. เช็คความผิดปกติ (หน้าเว็บว่างเปล่าแต่มี meta robots noindex, nofollow)
+    # หน้า Cloudflare มักใส่ tag นี้ไว้เพื่อไม่ให้ Google Index หน้า Challenge
+    if soup.find("meta", attrs={"name": "robots", "content": "noindex,nofollow"}):
+        # ถ้าเจอ meta นี้ร่วมกับความยาว body ที่สั้นผิดปกติ ให้สงสัยไว้ก่อนว่าเป็น CF
+        if len(body_text) < 500:
+            return True
+            
+    return False
+
+class BrowserSessionWrapper:
+    def __init__(self, browser_instance):
+        self.browser = browser_instance
+        
+    async def get_cookies(self):
         try:
+            # ดึงคุกกี้ทั้งหมดจาก Browser Instance
+            return await self.browser.get_cookies()
+        except Exception:
+            return []
+    class MockResponse:
+                def __init__(self, raw_bytes):
+                    self.content = raw_bytes
+                    self.text = raw_bytes.decode('utf-8', errors='ignore')
+                    self.status_code = 200
+
+    async def get(self, url, headers=None, timeout=15):
+        try:
+            if not url:
+                return None
+
+            tab = self.browser.main_tab
+        
+            # 1. ใช้ handler ดัก Request ขาออกเพื่อแทรก Headers
+            # วิธีนี้ปลอดภัยที่สุดเพราะไม่ต้องเรียกใช้ cdp.network ที่มีปัญหา
+            async def add_headers(event: uc.cdp.network.RequestWillBeSent):
+                if headers:
+                    event.request.headers.update(headers)
+        
+            # ลงทะเบียน Handler (ทำก่อนสั่ง get)
+            tab.add_handler(uc.cdp.network.RequestWillBeSent, add_headers)
+
+            # 2. โหลด URL
+            await tab.get(url)
+            await tab.wait(timeout)
+        
+            # 3. ดึง Content
+            content = await tab.get_content()
+        
+            if not content:
+                return None
+            
+            return self.MockResponse(content.encode('utf-8', errors='ignore'))
+
+        except Exception as e:
+            print(f"❌ Error ในการดึงข้อมูล: {e}")
+            return None
+
+async def safe_timeout(coro, timeout_sec):
+    if sys.version_info >= (3, 11):
+        # ถ้าเป็น Python 3.11+ ใช้ syntax ใหม่ที่ดูสวยกว่า
+        async with asyncio.timeout(timeout_sec):
+            return await coro
+    else:
+        # ถ้าเป็นเวอร์ชันเก่า ใช้ wait_for
+        return await asyncio.wait_for(coro, timeout=timeout_sec)
+
+async def main():
+    global browser_instance
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(handle_exit(s)))
+        
+    startup_msg = "🚀 Universal Auto-Pilot (nodriver Edition) : Started"
+    print(startup_msg)
+    
+    asyncio.create_task(safe_send_notify(startup_msg))
+    browser_instance = None
+    resp = None
+    consecutive_errors = 0
+    
+    while not stop_event.is_set():
+        try:
+            if stop_event.is_set(): break
             global CFG
             CFG = load_full_config()
             SET = CFG.get('SETTING', {})
@@ -3672,45 +4058,41 @@ def main():
             active_nodes = []
             node_status_buffer = []
 
-            # 1. Node Section (Checking & Cleanup & Update Trackers)
+            # =================================================================
+            # 1. NODE SECTION (Checking & Cleanup & Update Trackers)
+            # =================================================================
             print("\n🔌 NODE STATUS CHECKING...")
             for n_cfg in CFG['NODES']:
-                if not n_cfg.get('enable'): continue
+                if stop_event.is_set(): break
+                if not n_cfg.get('enable'): 
+                    continue
                 
-                # สร้าง Object ตามประเภทของ Node
                 node = RtorrentNode(n_cfg) if n_cfg.get("type") == "rtorrent" else QbitNode(n_cfg)
 
                 if node.login():
-                    # 1. ต้อง refresh ก่อนเพื่อให้ NodeCleaner รู้ค่าพื้นที่ที่แท้จริง
                     node.refresh_status()
-                    pre_free = node.free_gb  # เก็บค่าพื้นที่ "ก่อนลบ"
+                    pre_free = node.free_gb
 
-                    # ตรวจสอบสภาวะวิกฤตล่วงหน้าจากลูปหลัก (ตัวอย่างเช่น ดิสก์เหลือน้อยกว่าขั้นต่ำ หรือระบบตั้งค่าสั่ง Force มา)
                     is_system_emergency = pre_free < 15.0 
 
-                    # 2. เริ่ม Cleanup (ส่งตัวแปรควบคุมเข้าไปกระตุ้นโหมด Emergency ผ่านเมธอด process)
                     NodeCleaner(node, n_cfg.get('clean_settings', {}), global_clean).process(force_emergency=is_system_emergency)
+                    await asyncio.sleep(2)  
 
-                    # 3. ให้เวลาระบบไฟล์คืนพื้นที่ และอัปเดต Tracker
-                    time.sleep(2)
-
-                    # ทำการกวาดและบังคับ Start งานค้าง (Sweeper)
                     if hasattr(node, '_sweeper_force_start'):
                         node._sweeper_force_start()
 
                     node.reannounce_all()
-
-                    # 4. refresh อีกครั้งเพื่อดูค่าพื้นที่ "หลังลบ"
                     node.refresh_status()
 
-                    # 5. คำนวณและแสดงผลพื้นที่ที่กู้คืนมาได้
                     gained = node.free_gb - pre_free
                     if gained > 0.01:
                         print(f"✨ [{node.name}] Cleaned up: {gained:.2f} GB recovered!")
 
                     active_nodes.append((node, n_cfg))
                     icon = "🟢"
-                else: icon = "❌"
+                else: 
+                    icon = "❌"
+                
                 line = f"{icon} [{node.name}] {getattr(node, 'stat_msg', 'N/A')}"
                 print(line)
                 node_status_buffer.append(line)
@@ -3718,512 +4100,590 @@ def main():
 
             if active_nodes:
                 print("⏳ Waiting 5s for trackers to sync with All Trackers")
-                time.sleep(5)
+                await asyncio.sleep(5)
 
             if node_status_buffer:
-                send_notify("🔌 <b>Node Status Report</b>\n" + "\n".join(node_status_buffer))
+                msg = "🔌 <b>Node Status Report</b>\n" + "\n".join(node_status_buffer)
+                asyncio.create_task(safe_send_notify(msg))
 
-            # 2. Browser Section
-            with sync_playwright() as p:
-                browser, browser_path = launch_any_browser(p)
-                # ดึง Config ของ Site ที่ Enable
-                target_sites_cfg = [s for s in CFG.get('SITE', []) if s.get('enable', True)]
-                print(f"📡 Detected Sites: {[s['name'] for s in target_sites_cfg]}")
+            if not active_nodes:
+                print("⚠️ [Warning] ไม่มี Node ไหนพร้อมใช้งานในรอบนี้ ข้ามไปรอรอบถัดไป")
+                await asyncio.sleep(60)
+                continue
 
-                for site_cfg in target_sites_cfg:
-                    site = site_cfg['name']
-                    
-                    current_site_seen_file = get_seen_file(site)
-                    seen_ids = load_data(current_site_seen_file) 
-                    current_site_hash_file = get_hash_file(site)
-                    seen_hashes = load_data(current_site_hash_file)
-                    
-                    auth_file = get_auth_file(site)
-                    dl_session = requests.Session()
+            # =================================================================
+            # 2. BROWSER SECTION (nodriver Implementation)
+            # =================================================================
 
-                    # 1. สร้าง Context ใหม่ทุกครั้งภายใน Loop (เพื่อให้ได้ Session สดใหม่)
-                    # ถ้ามีไฟล์คุกกี้ให้โหลด ถ้าไม่มีให้เริ่มจากว่างเปล่า
-                    current_context = browser.new_context(
-                        storage_state=auth_file if os.path.exists(auth_file) else None,
-                        user_agent=stealth_args["user_agent"],
-                        viewport=stealth_args["viewport"],
-                        locale=stealth_args["locale"],
-                        timezone_id=stealth_args["timezone_id"],
-                        extra_http_headers=stealth_args["extra_http_headers"],
-                        ignore_https_errors=stealth_args["ignore_https_errors"]
-                    )
-                    current_context.set_default_timeout(30000)
-                    
-                    try:
-                        # 2. สร้างหน้าเพจและฉีด Stealth
-                        site_page = current_context.new_page()
-                        apply_stealth(site_page)
-                    
-                        # เข้าสู่กระบวนการ Universal Login และ Scan ตามปกติ
-                        if ensure_site_logged_in(site_page, site_cfg):
-                            sync_playwright_cookies(site_page.context, dl_session)
-                            # 1. ดึงสถิติและส่ง Report (แยกตาม site_name)
-                            stats_data = get_site_stats(site_page, site_cfg)
-                            send_notify(stats_data)
-                            print(stats_data)
+            # ตรวจสอบว่ามี instance หรือไม่ และยังเชื่อมต่ออยู่หรือไม่ (Is connected?)
+            is_browser_healthy = False
+            if browser_instance is not None:
+                try:
+                    # ใช้การดึงข้อมูลสั้นๆ เพื่อทดสอบว่า Browser ยังตอบสนองไหม
+                    await browser_instance.target.get_targets()
+                    is_browser_healthy = True
+                except Exception:
+                    print("⚠️ ตรวจพบการเชื่อมต่อ Browser ขัดข้อง, กำลังรีเซ็ต...")
+                    browser_instance = None # สั่งรีเซ็ต
 
-                            # --- วนลูปสแกนแต่ละโซน (ดึง config ตามชื่อ site ปัจจุบัน) ---
-                            base_url = site_cfg.get('base_url')
-                            site_target_urls = site_cfg.get('target_urls', [])
+            if not is_browser_healthy:
+                print("🌐 กำลังเริ่ม Browser instance ใหม่...")
+                try:
+                    browser_instance = await launch_any_browser(stealth_args)
+                except Exception as e:
+                    print(f"❌ ไม่สามารถเปิด Browser ได้: {e}")
+                    await asyncio.sleep(30) # รอถ้าเปิดไม่ได้
+                    continue # ข้ามรอบนี้ไป
+            
+            target_sites_cfg = [s for s in CFG.get('SITE', []) if s.get('enable', True)]
+            print(f"📡 Detected Sites: {[s['name'] for s in target_sites_cfg]}")
+            site_page = await browser_instance.get("about:blank", new_tab=True)
+            dl_session = BrowserSessionWrapper(browser_instance) 
+
+            for site_cfg in target_sites_cfg:
+                if stop_event.is_set(): break
+                site = site_cfg['name']
+                current_site_seen_file = get_seen_file(site)
+                seen_ids = load_data(current_site_seen_file) 
+                current_site_hash_file = get_hash_file(site)
+                seen_hashes = load_data(current_site_hash_file)
+                data_saved = False
+        
+                try:
+                    if site_page is None:
+                        print(f"❌ [{site}] ไม่สามารถสร้าง Tab ใหม่ได้")
+                        continue
+                    login_result = await safe_await(ensure_site_logged_in(site_page, site_cfg), "SiteLogin")
+                    if login_result is True:
+                        try:
+                            cookies = await site_page.send(cdp.network.get_cookies())
+                            # ในบาง library ผลลัพธ์ที่ได้อาจอยู่ใน ['cookies']
+                            if isinstance(cookies, dict) and 'cookies' in cookies:
+                                cookies = cookies['cookies']
+
+                            target_domain = site_cfg.get('base_url').split('//')[-1].split('/')[0]
+
+                            for cookie in cookies:
+                                # 1. จัดการข้อมูลให้เป็น dictionary เสมอ
+                                # ถ้า cookie เป็น object ให้แปลงเป็น dict ด้วย .__dict__ หรือเข้าถึงแบบ dict
+                                c_data = cookie if isinstance(cookie, dict) else getattr(cookie, '__dict__', {})
+    
+                                c_name = c_data.get('name')
+                                c_value = c_data.get('value')
+                                c_domain = c_data.get('domain', '')
+                                c_path = c_data.get('path', '/')
+                                c_secure = c_data.get('secure', False)
+
+                                if target_domain in c_domain:
+                                    # หาก dl_session เป็น requests.Session
+                                    if hasattr(dl_session, 'cookies'):
+                                        dl_session.cookies.set(c_name, c_value, domain=c_domain, path=c_path, secure=c_secure)
+            
+                            print(f"✅ [{site}] ดึงคุกกี้สดเข้า Session สำเร็จ ({len(cookies)} cookies)")
+
+                            # 3. บันทึกไฟล์
+                            auth_file = get_auth_file(site)
+                            with open(auth_file, "w") as f:
+                                cookie_list = [{
+                                    'name': (c.name if hasattr(c, 'name') else c['name']),
+                                    'value': (c.value if hasattr(c, 'value') else c['value']),
+                                    'domain': (c.domain if hasattr(c, 'domain') else c['domain']),
+                                    'path': (c.path if hasattr(c, 'path') else c.get('path', '/')),
+                                    'secure': (c.secure if hasattr(c, 'secure') else c.get('secure', False))
+                                } for c in cookies if target_domain in (c.domain if hasattr(c, 'domain') else c['domain'])]
+                                json.dump(cookie_list, f)
+
+                        except Exception as cookie_err:
+                            print(f"⚠️ [{site}] ไม่สามารถดึงคุกกี้: {cookie_err}")
                             
-                            for target_item in site_target_urls:
-                                if site_page.is_closed(): break 
+                        stats_data = await get_site_stats(site_page, site_cfg)
+                        print(stats_data)
 
-                                # 1. เตรียมข้อมูลโซน
-                                if isinstance(target_item, dict):
-                                    if not target_item.get('enable', True): continue
-                                    target_url = target_item.get('url')
-                                    display_zone = target_item.get('name', "Zone")
-                                else:
-                                    target_url, display_zone = target_item, "Zone"
+                        if stats_data and isinstance(stats_data, str):
+                            asyncio.create_task(safe_send_notify(stats_data))
+                        else:
+                            print(f"⚠️ [{site}] ข้อมูลสถิติไม่สมบูรณ์ หรือได้ NoneType, ข้ามการส่ง Notification")
 
+                        base_url = site_cfg.get('base_url')
+                        site_target_urls = site_cfg.get('target_urls', [])
+                            
+                        for target_item in site_target_urls:
+                            if stop_event.is_set(): break
+                            site_page = await ensure_active_page(browser_instance, site_page, site_cfg)
+                            if not site_page:
+                                # พยายามสร้างใหม่แค่ครั้งเดียวต่อโซน ถ้าไม่ได้ให้ข้ามโซนนี้ไป ไม่ใช่ข้ามทั้งเว็บ
+                                print(f"⚠️ [{site}] Tab พัง พยายามสร้างใหม่...")
+                                site_page = await browser_instance.get("about:blank", new_tab=True)
+                                await site_page.get(site_cfg['url'])
+
+                            if isinstance(target_item, dict):
+                                if not target_item.get('enable', True): continue
+                                target_url = target_item.get('url')
+                                display_zone = target_item.get('name', "Zone")
+                            else:
+                                target_url, display_zone = target_item, "Zone"
+
+                            if target_url.startswith('/') or not target_url.startswith('http'):
+                                target_url = f"{base_url.rstrip('/')}/{target_url.lstrip('/')}"
+
+                            try:
                                 print(f"\n🌐 [{site}] Scanning: [{display_zone}]")
-
-                                # แสดงสถานะไอเทมล่าสุด (เช่น ซานตาคลอสจาก BearBit)
-                                status_line = generate_main_status(CFG, site_name=site) 
-                                print(status_line)                        
-            
-                                # 2. ไปยังหน้าเป้าหมาย
-                                try:
-                                    # พยายามเข้าครั้งแรกด้วย Referer หน้าหลัก
-                                    site_page.goto(target_url, referer=base_url, wait_until="networkidle", timeout=60000)
-            
-                                    # ดึง Content มาเช็คทันที
-                                    soup = BeautifulSoup(site_page.content(), "html.parser")
-
-                                    # ตรวจสอบว่าติดหน้า Hotlink หรือไม่
-                                    if "ไม่สามารถเปิดลิงก์จากภายนอกได้" in soup.text:
-                                        print(f"⚠️ [{site}] ติด Hotlink... กำลังใช้แผน B (Double-Referer)")
-                                        # แผน B: เข้าซ้ำโดยใช้ URL ตัวเองเป็น Referer (วิธีนี้ได้ผลดีกับระบบ Anti-Bot หลายที่)
-                                        site_page.goto(target_url, referer=target_url, wait_until="networkidle")
-                                        soup = BeautifulSoup(site_page.content(), "html.parser")
-                
-                                    # ถ้าหลังจากแผน B แล้วยังติดหน้าเดิมอยู่ (อาจจะเพราะ Cookie หลุด)
-                                    if "ไม่สามารถเปิดลิงก์จากภายนอกได้" in soup.text:
-                                        print(f"❌ [{site}] แผน B ล้มเหลว ข้ามโซนนี้ไปก่อน")
-                                        continue
-
-                                except Exception as e:
-                                    print(f"❌ [{site}] Error ระหว่างเข้าหน้า {display_zone}: {e}")
+                                    
+                                if site_page is None: continue
+                                    
+                                await site_page.get(target_url)
+                                await asyncio.sleep(2.5)
+                                    
+                                page_source = await site_page.get_content()
+                                if not page_source:
+                                    print(f"⚠️ [{site}] ได้หน้าว่างเปล่า... พยายามกู้คืน Tab")
+                                    try:
+                                        site_page = await browser_instance.get("about:blank", new_tab=True)
+                                    except:
+                                        site_page = None # หากกู้คืนไม่ได้จริงๆ ถึงค่อยยอมให้เป็น None
                                     continue
 
-                                # --- เริ่มกระบวนการสแกน Torrent ตามปกติ ---
-                                added_in_zone = [] # เก็บ msg รายการที่เพิ่มสำเร็จ
-                                full_nodes_in_zone = []
-                                error_logs = []
-                                count_skip = 0    # นับจำนวนที่ข้าม
-                        
-                                # ดึงรายการ Torrent
-                                all_details = soup.find_all("a", href=re.compile(r"details(new)?\.php\?id=\d+"))
-                                rows = []
-
-                                # --- วนลูปสกัดเฉพาะรายการไฟล์จริง ---
-                                for a in all_details:
-                                    # 1. เช็คชื่อไฟล์เบื้องต้น
-                                    t_text = a.get_text(strip=True)
-                                    if len(t_text) <= 5: continue
+                                soup = BeautifulSoup(page_source, "html.parser")
+                                
+                                if is_cloudflare(soup):
+                                    print(f"🛡️ [{site}] ตรวจพบ Cloudflare! กำลังเข้าสู่กระบวนการกู้คืน...")
+                                    # ใส่ logic การรอ หรือแก้ Challenge ที่นี่
+                                    await asyncio.sleep(10) 
+                                    continue
     
-                                    # 2. ป้องกันการดึงสถิติผู้ใช้ (Ratio, Bonus, User Profile)
-                                    # ปกติสถิติพวกนี้มักจะมีคำเฉพาะ หรืออยู่ใน ID/Class ที่ต่างออกไป
-                                    parent_tr = a.find_parent("tr")
-    
-                                    if parent_tr and parent_tr not in rows:
-                                        # ตรวจสอบว่าในแถว (row) นั้นมีคำบ่งชี้ว่าเป็นข้อมูลส่วนตัวหรือไม่
-                                        row_raw_text = parent_tr.get_text().lower()
-                                        user_stat_keywords = ['ratio:', 'bonus:', 'upload:', 'download:', 'อัพโหลด:', 'ดาวน์โหลด:']
-        
-                                        # ถ้าในแถวมีคำพวกนี้ ให้ข้ามไปเลย เพราะไม่ใช่แถวของ Torrent
-                                        if any(key in row_raw_text for key in user_stat_keywords):
-                                            continue
-            
-                                        rows.append(parent_tr)
-                                # --- วนลูปรายไฟล์ในโซน ---
-                                for row in rows:
-                                    try:
-                                        local_headers = {
-                                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-                                            'Accept-Language': 'th-TH,th;q=0.9,en-US;q=0.8,en;q=0.7',
-                                            'Accept-Encoding': 'gzip, deflate, br',
-                                            'Connection': 'keep-alive',
-                                            'Upgrade-Insecure-Requests': '1',
-                                            'Referer': f"{target_url}", # หรือหน้าหลักที่บอทใช้ดึงข้อมูล
-                                            'Cache-Control': 'max-age=0'
-                                        }
-                                        # 1. สกัดข้อมูลพื้นฐานก่อน
-                                        data = extract_torrent_data(row, base_url, dl_session, local_headers)
-
-                                        if not data or not data.get('id'):
-                                            print(f" ⚠️ ข้าม: สกัดข้อมูล ID ไม่สำเร็จ")
-                                            continue
-
-                                        t_id = data['id']
-                                        download_url = data['download_url']
-                                        details_url = data['details_url']
-                                        # ดึงชื่อดิบมาเตรียมทำความสะอาด
-                                        raw_title = data.get('title', 'Unknown')
-
-
-                                        if not download_url:
-                                            print(f" ⚠️ [{t_id}] ข้าม: ไม่พบลิงก์ดาวน์โหลด")
-                                            continue
-
-                                        # 2. เช็คความสดและโอกาสทำ Ratio ก่อนเลย
-                                        if not is_fresh_and_racing(data):
-                                            #print(f" ⏭️ ข้าม: ไฟล์ไม่อยู่ในเงื่อนไข Racing (เก่าเกินไปหรือ Peer ไม่คุ้ม)")
-                                            count_skip += 1
-                                            continue  # ข้ามไฟล์ที่ "ไม่คุ้ม" ที่จะใช้โหลดและพื้นที่                                        
-
-                                        # 3. เช็คประวัติการเพิ่ม (Seen ID)
-                                        if str(t_id) in seen_ids:
-                                            print(f" ❌ ข้าม: เคยเพิ่มไปแล้ว (ใน {site})")
-                                            count_skip += 1
-                                            continue
-
-                                        # 4. สกัดชื่อไฟล์แบบปลอดภัยยิ่งขึ้น
-                                        safe_title = clean_name(raw_title)
-                
-                                        # Logic การตัดสินใจใช้ชื่อ: ถ้าชื่อมีคำพวก Stat หรือสั้นไป ให้ใช้ ID แทน
-                                        is_stat = any(word in safe_title.lower() for word in ['ratio', 'bonus', 'upload', 'download'])
-                
-                                        if not is_stat and len(safe_title) >= 10:
-                                            t_name = safe_title
-                                        else:
-                                            t_name = f"Torrent_ID_{t_id}"
-
-                                        print(f"🔍 [{site.upper()}] Checking: {t_name[:50]}... (ID: {t_id})")
-
-                                        # ลิงก์ดาวน์โหลด (ตรวจสอบซ้ำอีกครั้ง)
-                                        if not download_url:
-                                            print(f" ⚠️ [{t_id}] ข้าม: ไม่พบลิงก์ดาวน์โหลด")
-                                            continue
-                                        # 5. เช็คขนาดไฟล์ (ป้องกัน Error กรณี t_size_str เป็น None)
-                                        t_size_gb = parse_size(data['size_str'])
-                                        if not (SET.get('MIN_SIZE_GB', 0) <= t_size_gb <= SET.get('MAX_SIZE_GB', 999)):
-                                            print(f" ❌ ข้าม: ขนาด {t_size_gb:.2f}GB ไม่ตรงเงื่อนไข")
-                                            count_skip += 1
-                                            continue
-
-                                        # ##################################################
-                                        # # 6. Logic ฟรีโหลดและไอเทม (ฉบับสมบูรณ์)
-                                        # ##################################################
-                                        is_free_to_go = False
-                                        is_use_item = False
-
-                                        freeload_enable = SET.get('FREELOAD_ENABLE', True) # เช็กว่าเปิดระบบกรองฟรีโหลดไหม
-                                        item_discount = SET.get('CURRENT_DISCOUNT', 0)     # เช่น 50%
-                                        min_free_req = SET.get('MIN_FREE_PERCENT', 0)      # เช่น 10%
-                                        site_name = site.lower()
+                                if "ไม่สามารถเปิดลิงก์จากภายนอกได้" in soup.text:
+                                    print(f"⚠️ [{site}] ติด Hotlink... กำลังใช้มาตรการย้ำหน้ากระตุ้นระบบ Referer")
+                                    index_url = f"{base_url.rstrip('/')}/index.php"
+                                    await site_page.get(index_url)
+                                    await asyncio.sleep(1.5)
+                                    print(f"DEBUG: กำลังเรียก site_page.get({target_url})")    
+                                    await site_page.get(target_url)
+                                    await asyncio.sleep(2.5)
                                         
-                                        # ตรวจสอบสถานะ (รอการอนุมัติ) 
-                                        if details_url and dl_session:
-                                            if check_pending_status(dl_session, details_url):
-                                                print(f" ⏳ ข้าม: ไฟล์นี้ยังอยู่ในสถานะ (รอการอนุมัติ) -> {details_url}")
-                                                count_skip += 1
-                                                continue
+                                    page_source = await site_page.get_content()
+                                    soup = BeautifulSoup(page_source, "html.parser")
+                                    
+                                if "ไม่สามารถเปิดลิงก์จากภายนอกได้" in soup.text:
+                                    print(f"❌ [{site}] ระบบความปลอดภัยเข้มงวดเกินไป ข้ามโซน [{display_zone}] ไปก่อน")
+                                    continue
+                            except Exception as e:
+                                print(f"❌ [{site}] Error ระหว่างเข้าหน้า {display_zone}: {e}")
+                                continue
 
-                                        # --- กรณีที่ 1: ปิดระบบฟรีโหลด (ไม่สนฟรี % ลุยดาวน์โหลดทุกไฟล์) ---
-                                        if not freeload_enable:
-                                            is_free_to_go = True
-                                            is_use_item = False
-                                            # print(f" 🎯 [ALL-IN MODE] ปิดระบบกรองฟรีโหลด: ลุยดาวน์โหลดทุกไฟล์โดยไม่เช็กเปอร์เซ็นต์")
-
-                                        # --- กรณีที่ 2: เปิดระบบฟรีโหลด (กรองตามเงื่อนไขเว็บและไอเทม) ---
-                                        elif "bearbit" in site_name:
-                                            # 1. เช็คหน้าเว็บก่อนว่าให้ฟรีเท่าไหร่
-                                            free_p = check_freeload_status(row)
-
-                                            # 2. เข้าสู่ Logic ตัดสินใจโดยยึดไอเทมเป็นเกณฑ์หลัก
-                                            if item_discount > 0:
-                                                # ถ้าหน้าเว็บฟรี "มากกว่า" ไอเทม -> ข้ามทันที (เพื่อประหยัดไอเทมไปใช้กับไฟล์ไม่ฟรี)
-                                                if free_p > item_discount:
-                                                    print(f" ❌ ข้าม: หน้าเว็บฟรี {free_p}% ซึ่งดีกว่าไอเทม {item_discount}% (เก็บไอเทมไว้ก่อน)")
-                                                    count_skip += 1
-                                                    continue
+                            added_in_zone = [] 
+                            full_nodes_in_zone = []
+                            error_logs = []
+                            count_skip = 0    
                                 
-                                                # กรณีที่หน้าเว็บฟรี "น้อยกว่าหรือเท่ากับ" ไอเทม -> บังคับใช้ไอเทมลุยเลย!
-                                                else:
-                                                    is_use_item = True
-                                                    is_free_to_go = True
-                                                    print(f" 🎫 [ITEM MODE] บังคับใช้ไอเทม {item_discount}% (หน้าเว็บฟรีแค่ {free_p}%)")
+                            all_details = soup.find_all("a", href=re.compile(r"details(new)?\.php\?id=\d+"))
+                            rows = []
 
-                                            # 3. ถ้าไม่มีไอเทม หรือไม่ได้ตั้งค่าไอเทม ค่อยกลับมาพึ่งเกณฑ์ขั้นต่ำบนหน้าเว็บ
-                                            else:
-                                                if free_p >= min_free_req:
-                                                    is_free_to_go = True
-                                                    is_use_item = False
-                                                    print(f" ✅ [NORMAL MODE] หน้าเว็บฟรี {free_p}% ผ่านเกณฑ์ขั้นต่ำ ({min_free_req}%)")
-                                                else:
-                                                    print(f" ❌ ข้าม: ไม่มีไอเทม และหน้าเว็บ ({free_p}%) ต่ำกว่าเกณฑ์ที่กำหนด ({min_free_req}%)")
-                                                    count_skip += 1
-                                                    continue
+                            for a in all_details:
+                                if stop_event.is_set(): break
+                                t_text = a.get_text(strip=True)
+                                if len(t_text) <= 5: 
+                                    continue
+                                    
+                                parent_tr = a.find_parent("tr")
+                                if parent_tr and parent_tr not in rows:
+                                    row_raw_text = parent_tr.get_text().lower()
+                                    user_stat_keywords = ['ratio:', 'bonus:', 'upload:', 'download:', 'อัพโหลด:', 'ดาวน์โหลด:']
+                        
+                                    if any(key in row_raw_text for key in user_stat_keywords):
+                                        continue
+                                    rows.append(parent_tr)
 
-                                        else:
-                                            # --- เว็บอื่น (Unlimitz, TorrentDD) ---
-                                            # ถ้าหลุดมาถึงตรงนี้ แปลว่า freeload_enable = True (เปิดระบบกรองฟรีโหลด)
-                                            # ดังนั้นเว็บอื่นจะต้องบังคับเช็กเฉพาะไฟล์ที่ฟรี 100% เท่านั้นตามลอจิกเดิมของคุณ
-                                            free_p_others = check_freeload_status(row)
-                                            
-                                            if free_p_others == 100:
-                                                is_free_to_go = True
-                                                # print(f" ✅ [OTHERS] ผ่าน: ไฟล์ฟรี 100% (จากระบบสแกนละเอียด)")
-                                            else:
-                                                print(f" ❌ ข้าม: ไฟล์นี้ไม่ฟรี 100% (หน้าเว็บแจ้ง {free_p_others}%)")
-                                                count_skip += 1
-                                                continue
+                            for row in rows:
+                                if stop_event.is_set(): break
+                                t_id = "UNKNOWN"
+                                try:
+                                    local_headers = {
+                                        'User-Agent': stealth_args["user_agent"],
+                                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                                        'Accept-Language': 'th-TH,th;q=0.9,en-US;q=0.8,en;q=0.7',
+                                        'Connection': 'keep-alive',
+                                        'Referer': f"{target_url}"
+                                    }
+                                    data = await extract_torrent_data(row, base_url, dl_session, local_headers)
+                                    
+                                    if not data or not data.get('id'):
+                                        print(f" ⚠️ ข้าม: สกัดข้อมูล ID ไม่สำเร็จ")
+                                        continue
 
-                                        # ตรวจสอบด่านสุดท้าย
-                                        if not is_free_to_go:
+                                    t_id = str(data['id']) 
+                                    download_url = data['download_url']
+                                    details_url = data['details_url']
+                                    raw_title = data.get('title', 'Unknown')
+
+                                    if not download_url:
+                                        with open(f"debug_failed_{t_id}.html", "w", encoding="utf-8") as f:
+                                            f.write(resp.text)
+                                        print(f" ⚠️ [{t_id}] ข้าม: ไม่พบลิงก์ดาวน์โหลด")
+                                        continue
+
+                                    if not is_fresh_and_racing(data):
+                                        count_skip += 1
+                                        continue  
+
+                                    if t_id in seen_ids:
+                                        print(f" ❌ ข้าม: เคยเพิ่มไปแล้ว (ใน {site})")
+                                        count_skip += 1
+                                        continue
+
+                                    safe_title = clean_name(raw_title)
+                                    is_stat = any(word in safe_title.lower() for word in ['ratio', 'bonus', 'upload', 'download'])
+                                        
+                                    if not is_stat and len(safe_title) >= 10:
+                                        t_name = safe_title
+                                    else:
+                                        t_name = f"Torrent_ID_{t_id}"
+
+                                    print(f"🔍 [{site.upper()}] Checking: {t_name[:50]}... (ID: {t_id})")
+
+                                    t_size_gb = parse_size(data['size_str'])
+                                    if not (SET.get('MIN_SIZE_GB', 0) <= t_size_gb <= SET.get('MAX_SIZE_GB', 999)):
+                                        print(f" ❌ ข้าม: ขนาด {t_size_gb:.2f}GB ไม่ตรงเงื่อนไข")
+                                        seen_ids.add(t_id) 
+                                        count_skip += 1
+                                        continue
+
+                                    is_free_to_go = False
+                                    is_use_item = False
+
+                                    freeload_enable = SET.get('FREELOAD_ENABLE', True)
+                                    item_discount = SET.get('CURRENT_DISCOUNT', 0)     
+                                    min_free_req = SET.get('MIN_FREE_PERCENT', 0)      
+                                    site_name = site.lower()
+                                        
+                                    if details_url and dl_session:
+                                        if await check_pending_status(dl_session, details_url):
+                                            print(f" ⏳ ข้าม: ไฟล์นี้ยังอยู่ในสถานะ (รอการอนุมัติ) -> {details_url}")
+                                            count_skip += 1
                                             continue
 
-                                        # --- 7. เริ่มทำการดาวน์โหลดไฟล์ .torrent ---
-                                        r_dl = dl_session.get(download_url, headers=local_headers, timeout=20)
-                
-                                        if r_dl.status_code == 200:
-                                            content_type = r_dl.headers.get('Content-Type', '').lower()
-                    
-                                            # ตรวจสอบว่าเป็น HTML หรือไฟล์ที่เล็กผิดปกติ (หน้าแจ้งเตือน/หน้าใช้ไอเทม)
-                                            if 'html' in content_type or len(r_dl.content) < 800:
-                                                detected = chardet.detect(r_dl.content)
-                                                encoding_type = detected['encoding'] or 'tis-620'
-                                                soup_error = BeautifulSoup(r_dl.content, 'html.parser', from_encoding=encoding_type)
-
-                                                # ค้นหาปุ่มยืนยัน (dcI.php หรือ dI.php)
-                                                confirm_link_tag = soup_error.find("a", href=re.compile(r"d[c]?I\.php", re.I))
-                        
-                                                if not confirm_link_tag:
-                                                    img_btn = soup_error.find("img", {"src": re.compile(r"DL|download|DL5", re.I)})
-                                                    if img_btn: confirm_link_tag = img_btn.find_parent("a")
-
-                                                if confirm_link_tag and confirm_link_tag.get("href"):
-                                                    action_url = confirm_link_tag.get("href")
-                                                    # ประกอบ URL ให้สมบูรณ์
-                                                    final_dl_url = action_url if action_url.startswith('http') else f"{base_url.rstrip('/')}/{action_url.lstrip('/')}"
-                            
-                                                    # สำคัญ: อัปเดต Referer เป็นหน้าปัจจุบันก่อนกดยืนยัน
-                                                    local_headers['Referer'] = r_dl.url 
-                                                    print(f"🔄 [{site}] กดยืนยันดาวน์โหลด -> {final_dl_url}")
-                            
-                                                    r_final = dl_session.get(final_dl_url, headers=local_headers, timeout=20)
-                                                    r_dl = r_final # แทนที่ด้วยผลลัพธ์ใหม่
-
-                                            # --- ตรวจสอบไฟล์ที่ได้รับมาจริง (Final Check) ---
-                                            raw_data = r_dl.content
-                                            if raw_data.startswith(b'd'): # เช็ค Bencode
-                                                t_hash = extract_info_hash(raw_data)
-                        
-                                                if t_hash and t_hash in seen_hashes:
-                                                    print(f" ❌ ข้าม: Hash {t_hash} ซ้ำในระบบ")
-                                                    continue
-                                
-                                                # >>> [ขั้นตอนถัดไป] ส่งเข้า Client: qBittorrent/rTorrent <<<
-                                                print(f"✅ [{site}] พร้อมส่งไฟล์เข้า Client (Hash: {t_hash})")
-                                            else:
-                                                print(f"🚩 ⚠️ ข้าม: ไม่ใช่ไฟล์ทอร์เรนต์ (อาจติดหน้าล็อคอินหรือเรโชต่ำ)")
-                                                # เก็บ Log กรณีพลาด
-                                                with open(f"debug_{site}_{t_id}.html", "wb") as f:
-                                                    f.write(r_dl.content)
-                                
-                                            is_already_in_node = False
-                                            target_node_name = ""
-
-                                            for node_obj, _ in active_nodes:
-                                                # เช็คตรงตัวกับ API ของ Node (qBittorrent/rTorrent)
-                                                if node_obj.is_torrent_exists(t_hash):
-                                                    is_already_in_node = True
-                                                    target_node_name = node_obj.name
-                                                    break
-
-                                            if is_already_in_node:
-                                                # พิมพ์ Log ให้ชัดเจนว่าเจอที่เครื่องไหน และโชว์ Hash 5 ตัวท้ายเพื่อตรวจสอบ
-                                                print(f" ❌ ข้าม: ตรวจพบ Hash [...{t_hash[-5:]}] วิ่งอยู่ใน {target_node_name}")
-    
-                                                # บันทึก ID ลงประวัติเว็บปัจจุบัน (กันโหลด .torrent ซ้ำ)
-                                                seen_ids.add(t_id)
-    
-                                                # ⚠️ ห้ามเอาเข้า seen_hashes ตรงๆ ถ้าพี่อยากให้มันเช็ค Node จริงทุกครั้ง
-                                                # หรือถ้าจะเอาเข้า ต้องมั่นใจว่าใน seen_hashes มีค่าตรงกับในเครื่องจริงๆ เท่านั้น
+                                    if not freeload_enable:
+                                        is_free_to_go = True
+                                        is_use_item = False
+                                    elif "bearbit" in site_name:
+                                        free_p = check_freeload_status(row)
+                                        if item_discount > 0:
+                                            if free_p > item_discount:
+                                                print(f" ❌ ข้าม: หน้าเว็บฟรี {free_p}% ซึ่งดีกว่าไอเทม {item_discount}% (เก็บไอเทมไว้ก่อน)")
                                                 count_skip += 1
                                                 continue
+                                            else:
+                                                is_use_item = True
+                                                is_free_to_go = True
+                                                print(f" 🎫 [ITEM MODE] บังคับใช้ไอเทม {item_discount}% (หน้าเว็บฟรีแค่ {free_p}%)")
+                                        else:
+                                            if free_p >= min_free_req:
+                                                is_free_to_go = True
+                                                is_use_item = False
+                                                print(f" ✅ [NORMAL MODE] หน้าเว็บฟรี {free_p}% ผ่านเกณฑ์ขั้นต่ำ ({min_free_req}%)")
+                                            else:
+                                                print(f" ❌ ข้าม: ไม่มีไอเทม และหน้าเว็บ ({free_p}%) ต่ำกว่าเกณฑ์ที่กำหนด ({min_free_req}%)")
+                                                count_skip += 1
+                                                continue
+                                    else:
+                                        free_p_others = check_freeload_status(row)
+                                        if free_p_others == 100:
+                                            is_free_to_go = True
+                                        else:
+                                            print(f" ❌ ข้าม: ไฟล์นี้ไม่ฟรี 100% (หน้าเว็บแจ้ง {free_p_others}%)")
+                                            count_skip += 1
+                                            continue
 
-                                            # --- [ส่วนเลือก Node และสั่งดาวน์โหลด] ---
+                                    if not is_free_to_go:
+                                        continue
+
+                                    current_url = "unknown"
+                                    try:
+                                        print(f"🚀 เริ่มดาวน์โหลดไฟล์: {t_id}")
+    
+                                        # 1. ใช้ Wrapper .get() ซึ่งจัดการ Browser Tab และคืนค่า MockResponse
+                                        # MockResponse นี้จะมี .text (สำหรับเช็ค HTML) และ .content (สำหรับไฟล์ทอร์เรนต์)
+                                        try:
+                                            r_dl = await safe_timeout(dl_session.get(download_url, headers=local_headers), 30)
+                                        except asyncio.TimeoutError:
+                                            print("หมดเวลา!")
+    
+                                        if not r_dl:
+                                            raise Exception("ไม่สามารถดึงข้อมูลจาก BrowserSessionWrapper ได้")
+
+                                        # 2. ใช้ค่าจาก r_dl แทนการเรียกเมธอดที่ไม่มีอยู่
+                                        current_url = dl_session.browser.main_tab.url
+                                        raw_data_bytes = r_dl.content
+                                        raw_data_text = r_dl.text
+                                        is_torrent = raw_data_bytes.startswith(b'd8:')
+
+                                        t_hash = None
+                                        download_ready = False
+
+                                        # 3. Logic ตรวจสอบและดาวน์โหลด
+                                        if is_torrent:
+                                            t_hash = extract_info_hash(raw_data_bytes)
+                                            if t_hash:
+                                                download_ready = True
+                                                print(f"✅ พบไฟล์ทอร์เรนต์ Hash: {t_hash}")
+                                        else:
+                                            print(f"🔄 พบปัญหาการดาวน์โหลด (URL: {current_url}), กำลังเข้าสู่โหมดกู้คืนการคลิกผ่าน Browser...")
+    
+                                            # เรียกใช้ฟังก์ชันคลิกปุ่มผ่าน tab ที่มี Session ล็อกอินอยู่แล้ว
+                                            raw_content = await download_torrent_via_browser(
+                                                dl_session.browser.main_tab, 
+                                                details_url, 
+                                                download_url
+                                            )
+    
+                                            if raw_content and raw_content.startswith(b'd8:'):
+                                                raw_data_bytes = raw_content
+                                                t_hash = extract_info_hash(raw_data_bytes)
+                                                if t_hash:
+                                                    download_ready = True
+                                                    print(f"✅ กู้คืนการดาวน์โหลดสำเร็จ! Hash: {t_hash}")
+                                            else:
+                                                print("❌ ไม่สามารถดาวน์โหลดไฟล์ได้แม้จะลองคลิกผ่าน Browser แล้ว")
+
+                                        # 4. ส่วนการส่งเข้า Node (เหมือนเดิม)
+                                        if download_ready:
+                                            # ตรวจสอบ Hash ซ้ำ
+                                            if t_hash in seen_hashes:
+                                                print(f" ❌ ข้าม: Hash {t_hash} ซ้ำในระบบ")
+                                                seen_ids.add(t_id)
+                                                download_ready = False
+                                            else:
+                                                is_already_in_node = False
+                                                target_node_name = ""
+                                                for node_obj, _ in active_nodes:
+                                                    if node_obj.is_torrent_exists(t_hash):
+                                                        is_already_in_node = True
+                                                        target_node_name = node_obj.name
+                                                        break
+        
+                                                if is_already_in_node:
+                                                    print(f" ❌ ข้าม: ตรวจพบ Hash [...{t_hash[-5:]}] วิ่งอยู่ใน {target_node_name}")
+                                                    seen_ids.add(t_id)
+                                                    count_skip += 1
+                                                    download_ready = False
+
+                                        if download_ready:
+                                            print(f"✅ [{site}] พร้อมส่งไฟล์เข้า Client (Hash: {t_hash})")
                                             active_nodes.sort(key=lambda x: x[0].free_gb, reverse=True)
-
-                                            success_node = None # ใช้มาร์คว่าแอดไฟล์สำเร็จหรือยัง
+                                            success_node = None
                                             task_weight = calculate_task_weight(t_size_gb)
 
                                             for node_obj, n_cfg in active_nodes:
+                                                if stop_event.is_set(): break
                                                 d_type = n_cfg.get('disk_type', 'HDD')
-                                                dynamic_max_cap, p_wait = get_node_dynamic_cap(node_obj, d_type)
-                                                current_load = round(get_node_current_weight(node_obj), 1)  # ปัดเศษให้เหลือ 1 ตำแหน่งตั้งแต่ตอนคำนวณ
+                                                dynamic_max_cap, _ = get_node_dynamic_cap(node_obj, d_type)
+                                                current_load = round(get_node_current_weight(node_obj), 1)
 
-                                                print(f"📡 Check [{node_obj.name}]: Load {current_load:.1f}/{dynamic_max_cap} (Wait: {p_wait:.1f})")
-
-                                                # 1. เช็ค Capacity
+                                                print(f"📡 Check [{node_obj.name}]: Load {current_load:.1f}/{dynamic_max_cap}")
                                                 if (current_load + task_weight) > dynamic_max_cap:
                                                     print(f" ⏳ [Queue Full] {node_obj.name} ลอง Node ถัดไป")
                                                     continue
 
-                                                # 2. เช็คพื้นที่สุทธิ
                                                 effective_free_gb = node_obj.free_gb - node_obj.get_downloading_size()
-    
-                                                # กำหนดเกณฑ์บัฟเฟอร์ความปลอดภัยขั้นต่ำ (Safe Margin) ป้องกันค่าดิสก์สวิงไปชนเขต Emergency ของลูปอื่น
-                                                safe_buffer = 15.0
-                                                if effective_free_gb < (t_size_gb + safe_buffer):
-                                                    print(f" 🧹 [Effective Space Low] {node_obj.name} สุทธิเหลือ {effective_free_gb:.1f}GB -> พยายามใช้ Bulk Reclaim เคลียร์ทาง")
-        
-                                                    # ส่งพารามิเตอร์ขนาดที่ระบบต้องการทวงคืนสุทธิ เพื่อให้ฟังก์ชันลบไฟล์ประมวลผลได้อย่างแม่นยำ
-                                                    smart_reclaim_process(node_obj, required_gb=(t_size_gb + safe_buffer), is_emergency=False)
-        
-                                                    # 🔄 [Fixed 1]: อัปเดตข้อมูลฮาร์ดแวร์จริงทันทีหลังยิงคำสั่งลบแบบกลุ่มจบ
-                                                    node_obj.refresh_status() 
-        
-                                                    # 🔄 [Fixed 2]: คำนวณเนื้อที่สุทธิ (หักลบงานกำลังโหลด) ใหม่อีกรอบหลังลบ เพื่อดูความจุที่แท้จริง
+                                                if effective_free_gb < (t_size_gb + 15.0):
+                                                    smart_reclaim_process(node_obj, required_gb=(t_size_gb + 15.0), is_emergency=False)
+                                                    node_obj.refresh_status()
                                                     effective_free_gb = node_obj.free_gb - node_obj.get_downloading_size()
+                                                    if effective_free_gb < (t_size_gb + 5.0): continue
 
-                                                    # เช็คด่านสุดท้ายอิงตามพื้นที่สุทธิที่คำนวณใหม่ ต้องไม่ต่ำกว่าเกณฑ์ความจุไฟล์ + บัฟเฟอร์ขั้นต่ำ (เช่น 5-10 GB)
-                                                    if effective_free_gb < (t_size_gb + 5.0):
-                                                        print(f" ❌ [Space Insufficient] {node_obj.name} ทวงคืนพื้นที่สุทธิแล้วยังไม่ปลอดภัยพอ ({effective_free_gb:.1f}GB) -> ลอง Node ถัดไป")
-                                                        continue
-
-                                                # ✅ 3. ดำเนินการ Add ไฟล์ทันทีที่เจอ Node ที่เหมาะสม
                                                 try:
-                                                    if node_obj.add(r_dl.content,site_name=site):
-                                                        success_msg = f"📥 [Success] {node_obj.name} | {t_size_gb:.1f}GB | {t_name[:40]}"
-                                                        print(success_msg)
-
-                                                    # จัดการจองพื้นที่และบันทึกประวัติ
-                                                        booking_size = t_size_gb + 0.1
-                                                        node_obj.free_gb = max(0.0, node_obj.free_gb - booking_size)
-                                                        node_obj.stat_msg = f"Used: (Updating...) | Avail: {node_obj.free_gb:.1f}GB"
-
-                                                        added_in_zone.append(success_msg)
-                                                        seen_ids.add(str(t_id))
-                                                        if t_hash: seen_hashes.add(t_hash)
-
-                                                        success_node = node_obj
-                                                        if details_url:
-                                                            try:
-                                                                auto_click_thanks(site_page,details_url)
-                                                                time.sleep(random.uniform(0.8, 1.5))
-                                                            except Exception as e:
-                                                                print(f" ⚠️ ไม่สามารถขอบคุณ ID {t_id} ได้: {e}")
-
-                                                        break
-                                                    else:
-                                                        # กรณี API ตอบกลับมาเป็น False (เช่น ดิสก์ในโปรแกรมเต็ม หรือไฟล์ซ้ำ)
-                                                        print(f" ⚠️ [API Reject] {node_obj.name} ปฏิเสธงาน (Disk Full/Dup)")
-                                                except Exception as e:
-                                                    # 🚨 จุดสำคัญ: จะโชว์ว่า Password ผิด, Timeout หรือ Server Down
-                                                    print(f"❌ [Connect Error] {node_obj.name}: {str(e)}")
-                                            if not success_node:
-                                                node_summary = []
-                                                for n_obj, _ in active_nodes:
-                                                    c_load = get_node_current_weight(n_obj)
-                                                    d_max, _ = get_node_dynamic_cap(n_obj, n_obj.disk_type if hasattr(n_obj, 'disk_type') else 'HDD')
-                                                    node_summary.append(f"📡 {n_obj.name}: {c_load}/{d_max}")
-
-                                                error_detail = "\n".join(node_summary)
-                                                full_alert_msg = f"❌ **ไม่มีโหนดว่าง**\n\n**สถานะโหลดปัจจุบัน:**\n{error_detail}"
-                                                full_nodes_in_zone.append(f"❌ [Full] {t_name[:30]}...")
-                                                print(f"🚩 สรุปผล: {full_alert_msg}")
-
-                                    except Exception as e: # <--- ถ้าข้างในพัง มันจะเด้งมาที่นี่
-                                        print(f" ❌ Error ในแถวนี้: {e}")
-                                        continue # แล้วไปทำแถวถัดไปทันที
-
-                                    if len(added_in_zone) >= SET.get('MAX_NEW_PER_ZONE', 5): 
-                                        print(f" ⚠️ ครบโควตา {len(added_in_zone)} ไฟล์แล้ว")
-                                        break
-
-                                # ======================================================
-                                # 📊 สรุปหลังจบแต่ละโซน (อยู่นอก Row loop แต่อยู่ใน Zone loop)
-                                # ======================================================
-                                # ตรวจสอบเงื่อนไขการส่งแจ้งเตือน (เพิ่ม len(error_logs) > 0)
-                                if len(added_in_zone) > 0 or count_skip > 0 or len(full_nodes_in_zone) > 0 or len(error_logs) > 0:
-                                    condition_header = generate_main_status(CFG)
-                                    summary_msg = (
-                                        f"⚙️ <b>{condition_header}</b>\n"
-                                        f"🌐 <b>Scanning:</b> [{display_zone}] {target_url}\n\n"
-                                    )
-
-                                    # 1. แสดงไฟล์ที่เพิ่มสำเร็จ
-                                    if added_in_zone:
-                                        summary_msg += "✅ <b>Added:</b>\n" + "\n".join(added_in_zone) + "\n\n"
-
-                                    # 2. แสดงไฟล์ที่พลาดเพราะโหนดเต็ม
-                                    if full_nodes_in_zone:
-                                        summary_msg += "⚠️ <b>Queue Full (ไม่มีโหนดว่าง):</b>\n" + "\n".join(full_nodes_in_zone) + "\n\n"
-
-                                    # 3. แสดง Error ที่เกิดขึ้นระหว่างสแกน (เช่น Login หลุด)
-                                    if error_logs:
-                                        summary_msg += "🚨 <b>System Errors:</b>\n" + "\n".join(error_logs) + "\n\n"
-
-                                    # 4. กรณีไม่มีไฟล์เข้าเงื่อนไข และไม่มี Error
-                                    if not added_in_zone and not full_nodes_in_zone and not error_logs:
-                                        summary_msg += "❌ ไม่มีไฟล์เข้าเงื่อนไข\n\n"            
-    
-                                    # ส่วนท้ายสรุปสถิติ
-                                    footer = (f"📊 <b>สรุป {display_zone}:</b> "
-                                                f"เพิ่ม {len(added_in_zone)} | "
-                                                f"เต็ม {len(full_nodes_in_zone)} | "
-                                                f"ข้าม {count_skip}" + 
-                                                (f" | Error {len(error_logs)}" if error_logs else ""))
-
-                                    summary_msg += footer
-    
-                                    print(f"\n{footer}") # แสดงในหน้าจอ Log
-                                    send_notify(summary_msg) # ส่งแจ้งเตือนไปยัง Discord
-                                # ======================================================
-
-                                # บันทึกข้อมูลหลังจบ "ทุกโซน" 
-                                save_data(current_site_seen_file, seen_ids)
-                                save_data(current_site_hash_file, seen_hashes)
-                    except Exception as e:
-                        print(f"❌ Error at {site}: {e}")
-
-                    finally:
-                        # ✅ 1. ปิด Page และ Context "ทันที" เมื่อจบแต่ละ Site
-                        # เพื่อเคลียร์คุกกี้และรอยนิ้วมือ ไม่ให้ปนกับ Site ถัดไป
-                        if 'site_page' in locals() and not site_page.is_closed():
-                            site_page.close()
-                        if 'site_context' in locals():
-                            site_context.close() 
-                        print(f"🧹 [{site}] เคลียร์ Session เรียบร้อย\n")
-
-                # ปิด Browser เมื่อรันครบทุกโซนแล้วเท่านั้น
-                browser.close()
-                print("🔒 [System] ปิด Browser และจบการทำงานทั้งหมด")
-
-            stats_report = format_site_stats_report([n[0] for n in active_nodes])
-            print(stats_report)
-            send_notify(stats_report)
-            # จบรอบ เข้าสู่ช่วงพัก
-            wait_sec = random.randint(SET.get('MIN_WAIT_MINUTES', 2)*60, SET.get('MAX_WAIT_MINUTES', 10)*60)
-            wait_msg = f"💤 Cycle finished. Waiting {wait_sec//60} minutes for next scan..."
+                                                    
+                                                    # 1. ตรวจสอบให้แน่ใจว่า raw_data_bytes มีข้อมูลอยู่จริงก่อนเรียกใช้งาน
+                                                    if 'raw_data_bytes' in locals() and raw_data_bytes:
+        
+                                                        # 2. ส่งไฟล์เข้า Seedbox โดยใช้ตัวแปรที่ถูกต้อง
+                                                        result = safe_add_torrent(node_obj, raw_data_bytes, site)
+                                                        if result:
+                                                            success_msg = f"📥 [Success] {node_obj.name} | {t_size_gb:.1f}GB | {t_name[:40]}"
+                                                            print(success_msg)
             
-            # พิมพ์ลง Log แค่ครั้งเดียวว่ากำลังรอ
-            print(wait_msg) 
-            send_notify(wait_msg) 
+                                                            # อัปเดตสถานะ Node
+                                                            node_obj.free_gb = max(0.0, node_obj.free_gb - (t_size_gb + 0.1))
+                                                            added_in_zone.append(success_msg)
+                                                            seen_ids.add(t_id)
+                                                            seen_hashes.add(t_hash)
+                                                            success_node = node_obj
+            
+                                                            # กดปุ่ม Thanks
+                                                            if details_url:
+                                                                new_tab = None 
+                                                                try:
+                                                                    # nodriver ใช้ .get(url, new_tab=True) เพื่อสร้าง Tab ใหม่และไปที่ URL ทันที
+                                                                    new_tab = await browser_instance.get(details_url, new_tab=True)
+        
+                                                                    # ส่ง new_tab เข้าไปทำงานต่อ
+                                                                    await auto_click_thanks(new_tab, details_url)
+        
+                                                                except Exception as e:
+                                                                    print(f"⚠️ ไม่สามารถกดปุ่ม Thanks ได้: {e}")
+        
+                                                                finally:
+                                                                    # ปิด Tab หลังจากทำงานเสร็จ
+                                                                    if new_tab:
+                                                                        await new_tab.close()
+            
+                                                            break # ส่งเข้า Node สำเร็จแล้ว ให้หยุด Loop
+                                                    else:
+                                                        print(f"❌ [Error] ข้อมูลไฟล์ทอร์เรนต์ (raw_data_bytes) ว่างเปล่า ไม่สามารถส่งเข้า {node_obj.name}")
 
+                                                except Exception as e:
+                                                    import traceback
+                                                    print(f"❌ [Connect Error] {node_obj.name}: {str(e)}")
+                                                    traceback.print_exc()
+
+                                            if not success_node:
+                                                full_nodes_in_zone.append(f"❌ [Full] {t_name[:30]}...")
+
+                                    except asyncio.TimeoutError:
+                                        print(f"⚠️ [Timeout] {t_id} ค้างนานเกินไป")
+                                        continue 
+                                    except Exception as e:
+                                        print(f"❌ [Error] เกิดปัญหาที่ {t_id}: {str(e)}")
+                                        continue
+
+                                    
+                                except Exception as e:
+                                    if consecutive_errors > 3:
+                                        print("⚠️ พบ Error ติดต่อกันเกิน 3 ครั้ง! กำลังรีเซ็ต Browser ด้วย nodriver...")
+                                        
+                                        # 1. ทำลายซาก Browser อย่างระมัดระวัง
+                                        if dl_session is not None:
+                                            try:
+                                                # ใช้ getattr เพื่อความปลอดภัยสูงสูด
+                                                browser_obj = getattr(dl_session, 'browser', None)
+                                                if browser_obj is not None:
+                                                    await browser_obj.stop()
+                                            except Exception as stop_err:
+                                                print(f"⚠️ ปิด Browser เดิมไม่สมบูรณ์: {stop_err}")
+                                            finally:
+                                                # ล้างค่าทิ้งเพื่อป้องกันการเรียกใช้ซ้ำ
+                                                dl_session = None 
+                                        
+                                        # 2. สร้าง Browser ใหม่ (ต้องมั่นใจว่าฟังก์ชันนี้ไม่มีการอ้างอิงของเก่า)
+                                        try:
+                                            print("🚀 กำลังสร้าง Browser Instance ใหม่...")
+                                            new_browser = await launch_any_browser()
+                                            dl_session = BrowserSessionWrapper(new_browser)
+                                            consecutive_errors = 0
+                                            await asyncio.sleep(10)
+                                        except Exception as launch_err:
+                                            print(f"❌ ล้มเหลวในการสร้าง Browser ใหม่: {launch_err}")
+                                            break
+                                    else:
+                                        # ถ้ายังไม่ถึง 3 ครั้ง ให้พักสั้นๆ
+                                        await asyncio.sleep(5)
+    
+                                    continue
+
+                                if len(added_in_zone) >= SET.get('MAX_NEW_PER_ZONE', 5): 
+                                    break
+
+                            # Summary Section
+                            if len(added_in_zone) > 0 or count_skip > 0 or len(full_nodes_in_zone) > 0 or len(error_logs) > 0:
+                                condition_header = generate_main_status(CFG)
+                                summary_msg = (
+                                    f"⚙️ <b>{condition_header}</b>\n"
+                                    f"🌐 <b>Scanning:</b> [{display_zone}] {target_url}\n\n"
+                                )
+                                if added_in_zone: 
+                                    summary_msg += "✅ <b>Added:</b>\n" + "\n".join(added_in_zone) + "\n\n"
+                                
+                                if full_nodes_in_zone: 
+                                    summary_msg += "⚠️ <b>Queue Full:</b>\n" + "\n".join(full_nodes_in_zone) + "\n\n"
+                                
+                                if error_logs: 
+                                    summary_msg += "🚨 <b>System Errors:</b>\n" + "\n".join(error_logs) + "\n\n"
+                                
+                                if not added_in_zone and not full_nodes_in_zone and not error_logs:
+                                    summary_msg += "❌ ไม่มีไฟล์เข้าเงื่อนไข\n\n"
+
+                                footer = f"📊 <b>สรุป {display_zone}:</b> เพิ่ม {len(added_in_zone)} | เต็ม {len(full_nodes_in_zone)} | ข้าม {count_skip}"
+                                summary_msg += footer
+                                print(f"\n{footer}")
+                                    
+                                await safe_send_notify(summary_msg)
+
+                            # ✅ [FIX 3] ย้ายการเซฟประวัติเข้ามาบันทึกในจบลูปโซนย่อยทันที ข้อมูลสดใหม่ตลอดเวลา ไม่สูญหาย
+                            save_data(current_site_seen_file, seen_ids)
+                            save_data(current_site_hash_file, seen_hashes)
+                            data_saved = True
+                    else:
+                        # ถ้าเป็น None (จาก Warning) หรือเป็น False (จาก logic ของฟังก์ชัน)
+                        # ให้ข้ามไซต์นี้ไปทันที
+                        print(f"❌ [{site}] Login ไม่สำเร็จหรือข้อมูลตอบกลับผิดพลาด")
+                        continue
+                except Exception as site_err:
+                    print(f"🚨 [Site System Error] พังทั้งเว็บ {site}: {site_err}")
+                finally:
+                    # 1. เซฟข้อมูล (เผื่อกรณี error ก่อนเซฟข้อมูล)
+                    if not data_saved:
+                        save_data(current_site_seen_file, seen_ids)
+                        save_data(current_site_hash_file, seen_hashes)
+                    # ปิด Tab ของไซต์นี้ทันทีเมื่อสแกนจบ (ไม่ว่าจะพังหรือไม่)
+                    if site_page:
+                        await site_page.close()
+                        print(f"📂 ปิด Tab ของ {site_name} เรียบร้อย")
+
+            # ปิด Browser หลังจากปิด Tab แล้ว
+            active_browser = browser_instance 
+            
+            if active_browser is not None:
+                try:
+                    if hasattr(active_browser, 'stop'):
+                        # ตรวจสอบว่าเป็น coroutine หรือไม่ก่อนจะ await
+                        import inspect
+                        if inspect.iscoroutinefunction(active_browser.stop):
+                            await asyncio.shield(active_browser.stop())
+                        else:
+                            active_browser.stop() # เรียกแบบปกติถ้าไม่ใช่ async
+                except Exception as e:
+                    print(f"⚠️ Warning during stop(): {e}")
+                finally:
+                    # ไม่ว่า stop() จะพังหรือไม่ ให้ใช้ kill_specific_browser 
+                    # ซึ่งใช้ PID ในการสั่งปิดจริง (OS Level) 
+                    # เพื่อให้แน่ใจว่า Browser ตายแน่นอน
+                    kill_specific_browser()
+                    
+                    # ล้างค่าใน Instance และลบ profile
+                    browser_instance = None
+                    await cleanup_profile() # ฟังก์ชันลบโฟลเดอร์ที่เราคุยกัน
+                    
+                    print("🔒 [System] ปิด Browser และเคลียร์หน่วยความจำแล้ว")
+            else:
+                print("ℹ️ Browser instance ไม่มีอยู่แล้ว")
+
+            #รันรายงานสถิติ (ยิง api ตรง)
+            stats_report = format_site_stats_report([n[0] for n in active_nodes])
+            if stats_report:
+                print(stats_report)
+                await safe_send_notify(stats_report) # แนะนำให้ใช้ await ถ้าเป็นไปได้
+            
+            #Cycle complete (เข้าสู่ช่วงพัก)
+            wait_sec = random.randint(SET.get('MIN_WAIT_MINUTES', 2)*60, SET.get('MAX_WAIT_MINUTES', 10)*60)
+            wait_msg = f"\n💤 Cycle finished. Waiting {wait_sec//60} minutes for next scan..."
+            print(wait_msg)
+            await safe_send_notify(wait_msg)
+        
+            #ช่วงเวลาคอย
             for s in range(wait_sec, 0, -1):
-                # ใช้ \r เพื่อให้พิมพ์ทับบรรทัดเดิมใน Terminal 
-                # และใช้ sys.stdout โดยตรงจะช่วยลดการเขียนลง Log ไฟล์ได้ในบางการตั้งค่า
+                if stop_event.is_set(): break
                 sys.stdout.write(f"\r⏳ Next cycle in: {s//60}m {s%60}s...   ")
                 sys.stdout.flush()
-                time.sleep(1)
+                await asyncio.sleep(1)
+        
+            print("\n🚀 Starting next cycle...")
+
+        except Exception as global_err:
+            print(f"🚨 [Global Critical Error] บอทหลุดนอกลูปหลัก: {global_err}")
+            await asyncio.sleep(30)
             
-            # เมื่อรอเสร็จค่อยพิมพ์ขึ้นบรรทัดใหม่
-            cycle_msg = "\n🚀 Starting next cycle..."
-            print(cycle_msg); send_notify(cycle_msg)
-
-        except Exception as e:
-            print(f"❌ Global Error: {e}"); time.sleep(60)
-
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # หากกด Ctrl+C แล้วติดตรงนี้ ไม่ต้องทำอะไร ปล่อยให้มันจบเอง
+        pass

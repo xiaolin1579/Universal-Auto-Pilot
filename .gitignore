@@ -163,6 +163,8 @@ stats_cache.json
 seen.txt
 hash_seen.txt
 stats_history.json
-history/
+/history
 debug_error.html
 /auth
+*.html
+/uc_profile*

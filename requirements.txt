@@ -5,8 +5,9 @@ requests
 beautifulsoup4
 lxml
 
-# ระบบ Browser Engine (Playwright)
-playwright
+# ระบบ Browser Engine 
+nodriver
+fake-useragent
 
 # รีโมทคอนโทรลผ่าน Telegram & Discord
 pyTelegramBotAPI
@@ -18,3 +19,6 @@ urllib3
 pytz
 ddddocr
 chardet
+cloudscraper
+pyvirtualdisplay
+bencodepy
