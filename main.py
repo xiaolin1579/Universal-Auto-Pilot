@@ -1772,95 +1772,77 @@ class NodeCleaner:
         return False
 
     def process(self, force_emergency=False):
+       # 1. เช็คสถานะการเปิดใช้งาน (Updated Logic)
         node_enable = self.node_cfg.get('enable', self.node_cfg.get('ENABLE', None))
         global_enable = self.global_cfg.get('enable', self.global_cfg.get('ENABLE', False))
         
+        # ตรรกะ: ถ้า node_enable เป็น True -> เปิด | ถ้าเป็น False -> ใช้ global | ถ้าเป็น None -> ใช้ global
         if node_enable is True:
             is_enabled = True
-        elif node_enable is False:
-            is_enabled = global_enable
         else:
-            is_enabled = global_enable
+            is_enabled = bool(global_enable)
 
-        print(f"⚙️ [Cleaner Engine] Node: {self.node.name} | Status: {'ACTIVE' if is_enabled else 'DISABLED'} (Node_Cfg: {node_enable}, Global_Cfg: {global_enable})")
+        print(f"⚙️ [Cleaner Engine] Node: {self.node.name} | Status: {'ACTIVE' if is_enabled else 'DISABLED'} (Node: {node_enable}, Global: {global_enable})")
 
         if not is_enabled:
-            print(f"💤 [Cleaner Bypass] Skipped [{self.node.name}] เพราะระบบถูกปิดการใช้งาน")
+            print(f"💤 [Cleaner Bypass] Skipped [{self.node.name}] เพราะระบบปิดการใช้งาน")
             return
 
+        # 2. เช็คสถานะพื้นที่ (Emergency หรือ Normal)
         current_free = self._get_node_free_gb()
         is_emergency = force_emergency or (current_free < 10.0)
 
         if is_emergency:
-            print(f"🚨 [EMERGENCY TRIGGERED] [{self.node.name}] พื้นที่วิกฤตเหลือ {current_free:.2f}GB -> ส่งต่อให้ระบบ Smart Reclaim ทวงคืนพื้นที่")
-            class_name = self.node.__class__.__name__.lower()
-            node_type = "qbit" if "qbit" in class_name else "rtorrent"
-            
+            print(f"🚨 [EMERGENCY] [{self.node.name}] พื้นที่วิกฤตเหลือ {current_free:.2f}GB")
+            node_type = "qbit" if "qbit" in self.node.__class__.__name__.lower() else "rtorrent"
             success = smart_reclaim_process(self.node, required_gb=10.0, is_emergency=True, node_type=node_type)
-            print(f"♻️ [Emergency Result] [{self.node.name}] จบรอบประมวลผล Smart Reclaim (Success: {success})")
+            print(f"♻️ [Emergency Result] Success: {success}")
             return
 
-        print(f"🔍 Debug: [{self.node.name}] Starting cleanup process... (Normal Idle Mode | Free: {current_free:.2f}GB)")
+        # 3. โหมดปกติ (Idle Cleanup)
+        print(f"🔍 Debug: [{self.node.name}] Starting cleanup... (Free: {current_free:.2f}GB)")
         try:
-            grouped_logs = {}
             class_name = self.node.__class__.__name__.lower()
+            grouped_logs = self._clean_qbit() if "qbit" in class_name else self._clean_rtorrent()
+        
+            if not isinstance(grouped_logs, dict): grouped_logs = {}
+        
+            # กรองเฉพาะกลุ่มที่มีการลบจริง
+            active_logs = {r: d for r, d in grouped_logs.items() if d.get("torrents")}
+
+            if not active_logs:
+                print(f"✨ [{self.node.name}] ตรวจสอบเสร็จสิ้น: ไม่มีไฟล์ขยะ")
+                return
+
+            # Mapping Emoji
+            emoji_map = {
+                "Max Time Exceeded": "🚨",
+                "Idle Dead": "💤",
+                "Target Reached": "💰"
+            }
+
+            notify_lines = []
+            for reason, log_data in active_logs.items():
+                emoji = emoji_map.get(reason, "🧹")
             
-            if "qbit" in class_name:
-                grouped_logs = self._clean_qbit()
-            elif "rtorrent" in class_name:
-                grouped_logs = self._clean_rtorrent()
-
-            if not isinstance(grouped_logs, dict):
-                grouped_logs = {}
-
-            has_removed_items = any(log_data.get("torrents") for log_data in grouped_logs.values() if isinstance(log_data, dict))
-
-            if grouped_logs and has_removed_items:
-                # 🖨️ 1. พ่น Log ลง Console คลีนสายตา ปรับอิโมจิหน้าชื่อไฟล์ให้แมตช์ตามกลุ่มสาเหตุ
-                for reason, log_data in grouped_logs.items():
-                    if not log_data.get("torrents"): 
-                        continue
-                        
-                    # แมตช์อิโมจิหลักประจำกลุ่มสาเหตุ
-                    if reason == "Max Time Exceeded":
-                        emoji = "🚨"
-                        print(f"{emoji} [{reason}] {log_data['header']}")
-                    elif reason == "Idle Dead":
-                        emoji = "💤"
-                        print(f"{emoji} [{reason}] {log_data['header']}")
-                    elif reason == "Target Reached":
-                        emoji = "💰"
-                        print(f"{emoji} [{reason}] {log_data['header']}")
-                    else:
-                        emoji = "🧹"
-                        print(f"{emoji} [{reason}] {log_data['header']}")
-                        
-                    # พ่นรายชื่อไฟล์ (สลับคัดลอกเอาตัวสัญลักษณ์ประจำกลุ่มแปะนำหน้าสลอตงาน)
-                    for t_line in log_data["torrents"]:
-                        print(f"  {emoji} {t_line}")
-
-                # 💬 2. จัดรูปแบบสำหรับส่งแจ้งเตือน Notify (Telegram/Discord)
-                notify_lines = []
-                for reason, log_data in grouped_logs.items():
-                    if not log_data.get("torrents"): 
-                        continue
-                    
-                    emoji = "🚨" if reason == "Max Time Exceeded" else "💤" if reason == "Idle Dead" else "💰" if reason == "Target Reached" else "🧹"
-                    notify_lines.append(f"{emoji} <b>[{reason}]</b> {log_data['header']}")
-                    
-                    for t_line in log_data["torrents"]:
-                        notify_lines.append(f"  {emoji} {t_line}")
-
-                status_title = "🧹 Cleanup Summary (Idle Only)"
-                msg = f"<b>{status_title}</b> [{self.node.name}]:\n" + "\n".join(notify_lines)
+                # Print Console Log
+                print(f"{emoji} [{reason}] {log_data['header']}")
+                for t_line in log_data["torrents"]:
+                    print(f"  {emoji} {t_line}")
                 
-                if callable(globals().get('send_notify')):
-                    asyncio.create_task(send_notify(msg))
-                else:
-                    print(f"📢 Notification (No send_notify func):\n{msg}")
+                # จัดเตรียมข้อความ Notify
+                notify_lines.append(f"{emoji} <b>[{reason}]</b> {log_data['header']}")
+                notify_lines.extend([f"  {emoji} {line}" for line in log_data["torrents"]])
+
+            # 4. ส่งแจ้งเตือน
+            msg = f"<b>🧹 Cleanup Summary (Idle Only)</b> [{self.node.name}]:\n" + "\n".join(notify_lines)
+        
+            send_func = globals().get('send_notify')
+            if callable(send_func):
+                asyncio.create_task(send_func(msg))
             else:
-                print(f"✨ [{self.node.name}] ตรวจสอบเสร็จสิ้น: ไม่มีไฟล์ขยะที่ตรงตามเกณฑ์การลบปกติ")
-                
+                print(f"📢 Notification:\n{msg}")
+
         except Exception as e:
             print(f"⚠️ [{self.node.name}] Clean Error: {e}")
 
@@ -2346,7 +2328,11 @@ def smart_reclaim_process(node, required_gb, is_emergency=False, node_type="qbit
 
         if reclaimed_logs and callable(globals().get('send_notify')):
             header_str = f"🚨 <b>[Emergency Bypass Smart Reclaim]</b> [{node.name}]\n" if is_emergency else f"🧹 <b>[Normal Smart Reclaim]</b> [{node.name}]\n"
-            asyncio.create_task(safe_send_notify(header_str + "ระบบทำการกวาดล้างและทวงคืนพื้นที่ดิสก์เสร็จสิ้น รายละเอียดไฟล์:\n" + "\n".join(reclaimed_logs)))
+            msg = header_str + "ระบบทำการกวาดล้างและทวงคืนพื้นที่ดิสก์เสร็จสิ้น รายละเอียดไฟล์:\n" + "\n".join(reclaimed_logs)
+            try:
+                asyncio.create_task(safe_send_notify(msg))
+            except Exception as e:
+                print(f"⚠️ การแจ้งเตือนล้มเหลวหรือช้าเกินไป: {e}")
 
         print(f"⏳ [{node.name}] รอฮาร์ดแวร์จัดสรรบล็อกดิสก์คืน...")
         for attempt in range(20): 
@@ -3604,96 +3590,65 @@ def update_bot_config(active_item):
             print(f"❌ Error reloading config: {e} | Switching to Emergency Safety Mode")
 
 async def auto_vote_snatched(page: uc.Tab, base_url: str, site_name: str = "BEARBIT") -> bool:
-    """
-    ฟังก์ชันช่วยโหวตทอร์เรนต์ที่ดาวน์โหลดไปแล้ว (snatchdown.php)
-    - [Direct Element Targeting] กวาดดึงปุ่มรูปภาพโหวตยอดเยี่ยมโดยตรง ไม่ต้องผ่านลูป TR ป้องกันปัญหา Nested Table
-    - [DOM Parent Navigation] ใช้ JavaScript ช่วยสกัด Torrent ID ย้อนกลับขึ้นมาจากตำแหน่งปุ่ม
-    """
     try:
         max_p = 5
         total_voted = 0
+        snatch_url = f"{base_url.rstrip('/')}/snatchdown.php"
         
-        if not base_url.endswith('/'):
-            base_url += '/'
-        snatch_url = f"{base_url}snatchdown.php"
+        print(f"🗳️ [{site_name}] เริ่มระบบ Auto-Vote...")
         
-        print(f"🗳️ [{site_name}] เริ่มระบบ Auto-Vote (สแกนสูงสุด {max_p} หน้า ผ่านระบบกรองงานซ้ำ)...")
+        # 1. บังคับเปลี่ยน URL และรอจนโหลดเสร็จจริงๆ
         await page.get(snatch_url)
+        await asyncio.sleep(3) # รอให้แน่ใจว่าหน้าโหลดครบ
         
-        # 🎯 ตัวเลือก Selector สำหรับรูปภาพปุ่มโหวต "ยอดเยี่ยม" ตรงตาม HTML หน้าเว็บเป๊ะๆ
-        # ค้นหาภาพที่มี src เป็น v5.1.1.png หรือมี title คำว่า ยอดเยี่ยม
         vote_img_selector = 'img[src*="v5.1.1.png"], img[title="ยอดเยี่ยม"]'
         
         for p_idx in range(1, max_p + 1):
-            print(f"📖 [{site_name}] กำลังสแกนหน้า {p_idx}...")
-            await asyncio.sleep(2.0)
-            
-            # 1. กวาดปุ่มโหวต
+            # 2. ป้องกันกรณีหลุดไปหน้าอื่น (เช็ค URL ทุกครั้งก่อนเริ่ม Loop)
+            current_url = await page.evaluate("window.location.href")
+            if "snatchdown.php" not in current_url:
+                print(f"⚠️ [{site_name}] ตรวจพบการแทรกแซง! กำลังดึง Tab กลับมาที่ Snatchdown...")
+                await page.get(snatch_url)
+                await asyncio.sleep(3)
+
             all_vote_btns = await page.select_all(vote_img_selector)
             
-            # [Smart Break] ถ้าหน้านี้ไม่มีงานค้างเลย สั่งหยุดทันที (สะอาดแล้ว)
             if not all_vote_btns:
-                print(f"✅ [{site_name}] หน้า {p_idx} สะอาดเรียบร้อย ไม่พบรายการค้างโหวต สั่งหยุดระบบ!")
+                print(f"✅ [{site_name}] หน้า {p_idx} ไม่มีรายการค้าง - ตรวจสอบเสร็จสิ้น")
                 break
                 
-            voted_in_page = 0
-            print(f"🔍 [{site_name}] พบ {len(all_vote_btns)} รายการที่ต้องโหวต")
+            print(f"🔍 [{site_name}] พบ {len(all_vote_btns)} รายการ (หน้า {p_idx})")
             
-            # 2. ทำการโหวต
-            for btn_idx, vote_btn in enumerate(all_vote_btns):
+            for vote_btn in all_vote_btns:
                 try:
                     await vote_btn.click()
                     total_voted += 1
-                    voted_in_page += 1
-                    await asyncio.sleep(random.uniform(0.5, 0.9))
+                    await asyncio.sleep(random.uniform(0.8, 1.5))
                 except Exception:
                     continue
             
-            # 3. ตรวจสอบปุ่ม Next Page อย่างระมัดระวัง
+            # 3. เช็คปุ่มถัดไป
             next_btn = await page.select('img[src*="nextpage.gif"]')
-            if not next_btn:
-                print(f"🏁 [{site_name}] ถึงหน้าสุดท้ายแล้ว (ไม่พบปุ่ม Next) สั่งหยุดระบบ")
+            if not next_btn or p_idx >= max_p:
                 break
             
-            # ถ้ายังมีหน้าถัดไป
-            if p_idx < max_p:
-                print(f"➡️ [{site_name}] กำลังไปหน้า {p_idx + 1}...")
-                
-                # ตรวจสอบว่าปุ่ม clickable หรือไม่ก่อนคลิก
-                if isinstance(next_btn, list): next_btn = next_btn[0]
-                await next_btn.click()
-                await asyncio.sleep(3.5) # รอ AJAX Render
-            else:
-                print(f"🛑 [{site_name}] ถึงโควตาหน้าสูงสุด ({max_p}) สั่งหยุดเพื่อความปลอดภัย")
-                break        
-        # -------------------------------------------------------------------------
-        # 🎯 ระบบสรุปยอดรายงานผลส่งเข้า Discord
-        # -------------------------------------------------------------------------
-        has_notify_func = False
-        try:
-            notify_fn = globals().get('send_notify')
-            if notify_fn and callable(notify_fn):
-                has_notify_func = True
-        except:
-            pass
-
-        if has_notify_func:
-            if total_voted > 0:
-                msg = f"🗳️ <b>[{site_name}]</b> ทำการ Auto-Vote ทอร์เรนต์สำเร็จรวม <b>{total_voted}</b> รายการ (หน้า 1-{p_idx})"
-            else:
-                msg = f"🗳️ <b>[{site_name}]</b> ตรวจสอบหน้าดาวน์โหลดแล้ว ไม่มีทอร์เรนต์ค้างโหวต ระบบสะอาดเรียบร้อย ✨"
-                
+            print(f"➡️ ไปหน้า {p_idx + 1}...")
+            await next_btn.click()
+            await asyncio.sleep(4.0) 
+        
+        # ส่วน Notify
+        notify_fn = globals().get('send_notify')
+        if callable(notify_fn):
+            msg = f"🗳️ <b>[{site_name}]</b> Auto-Vote สำเร็จ: <b>{total_voted}</b> รายการ" if total_voted > 0 else f"🗳️ <b>[{site_name}]</b> Auto-Vote : สถานะสะอาดเรียบร้อย ✨"
+            
             if asyncio.iscoroutinefunction(notify_fn):
                 await notify_fn(msg)
             else:
                 notify_fn(msg)
-        else:
-            print(f"📢 [{site_name}] เสร็จสิ้นภารกิจ Auto-Vote รวมทั้งสิ้น {total_voted} รายการ")
-            
+                
     except Exception as e:
         print(f"❌ [{site_name}] Vote Error: {e}")
         return False
-        
     return True
     
 # ========================= Smart Node Controller =========================

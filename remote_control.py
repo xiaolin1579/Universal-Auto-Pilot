@@ -475,6 +475,7 @@ async def main():
                 elif txt == '🔄 Restart & Update':
                     await tg_bot.send_message(chat_id, "⏳ กำลังเริ่มกระบวนการ Update...")
                     try:
+                        await tg_bot.send_message(chat_id, "⏳ กำลังส่งสัญญาณหยุดบอทหลัก...")
                         if is_process_running("python3 -u main.py"):
                             stop_cmd = "pkill -15 -f 'python3 -u main.py'" if os.name != 'nt' else 'wmic process where "commandline like \'%main.py%\'" delete'
                             os.system(stop_cmd)
@@ -519,8 +520,6 @@ async def main():
                     await tg_bot.send_message(chat_id, "♻️ รีสตาร์ท Remote...")
                     os._exit(0)
 
-            # ✅ เปลี่ยนวิธีเปิด Polling สำหรับ AsyncTeleBot เพื่อให้ทำงานร่วมกับ Discord ได้อย่างเสถียร
-            # skip_pending=True จะช่วยเคลียร์คำสั่งค้างทิ้งทันทีเมื่อเกิดเหตุเน็ตหลุด ไม่ให้บอทค้างตอนเปิดใหม่
             tasks.append(tg_bot.infinity_polling(skip_pending=True, timeout=60, request_timeout=60))
             
         except Exception as e: print(f"❌ TG Error: {e}")
