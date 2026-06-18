@@ -168,3 +168,4 @@ debug_error.html
 /auth
 *.html
 /uc_profile*
+/db
