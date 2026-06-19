@@ -78,7 +78,7 @@ async def handle_exit(sig):
     # 3. แจ้งเตือน (ทำไปพร้อมกับการปิดของ)
     print("⏳ [Step 3/3] กำลังส่งข้อความแจ้งเตือน...")
     try:
-        await safe_send_notify(f"🛑 Universal Auto-Pilot : Stopped\nReason: Signal {sig}")
+        await send_notify(f"🛑 Universal Auto-Pilot : Stopped\nReason: Signal {sig}")
     except: pass
 
     # รอให้ทุกอย่างจบลงอย่างสมบูรณ์
@@ -106,33 +106,27 @@ def load_full_config():
     with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
         return json.load(f)
 
-async def safe_send_notify(msg, *args, **kwargs):
+async def send_notify(msg, *args, **kwargs):
+    """
+    เรียก _send_notify_sync โดยตรงผ่าน asyncio.to_thread
+    ไม่ต้องพึ่งพา globals() เพื่อป้องกันปัญหา Name Resolution
+    """
     try:
-        # เรียก send_notify ตรงๆ ไม่ต้องผ่าน globals()
-        # ตรวจสอบก่อนว่ามันเป็น coroutine หรือไม่
-        if asyncio.iscoroutinefunction(send_notify):
-            await send_notify(msg, *args, **kwargs)
-        else:
-            await asyncio.to_thread(send_notify, msg, *args, **kwargs)
+        # เรียกฟังก์ชันซิงค์โดยตรง ถ้ามันอยู่ในไฟล์เดียวกันหรือ Import มา
+        await asyncio.to_thread(_send_notify_sync, msg, *args, **kwargs)
+        
     except Exception as e:
-        print(f"🚨 [SafeNotify System Error]: {e}")
-        # สำคัญ: ต้องคืนค่าเสมอ เพื่อไม่ให้ await ต่อไปพัง
-        return False 
+        error_msg = f"🚨 [Notification Error]: {e}"
+        print(error_msg)
+        with open("bot_error.log", "a", encoding="utf-8") as f:
+            f.write(f"{get_now()} - {error_msg}\n")
+        return False
     return True
 
-async def send_notify(msg, raw_data=None):
-    """
-    Async wrapper สำหรับการส่งแจ้งเตือน แบบปลอดภัยและไม่บล็อก Loop
-    """
-    try:
-        # ใช้ to_thread ซึ่งจัดการเรื่อง thread pool ให้อัตโนมัติและเสถียรกว่า
-        await asyncio.to_thread(_send_notify_sync, msg)
-    except Exception as e:
-        with open("bot_error.log", "a", encoding="utf-8") as f:
-            f.write(f"{get_now()} - Error: {e}\n")
-        print(f"⚠️ [Notification Error] รายละเอียดถูกบันทึกลง log แล้ว: {e}")
-
 def _send_notify_sync(msg):
+    """
+    ฟังก์ชันสำหรับจัดการการส่งแจ้งเตือนแบบ Blocking (Sync)
+    """
     try:
         cfg = load_full_config()
         msg = msg.strip()
@@ -174,11 +168,11 @@ def _send_notify_sync(msg):
             except Exception as e:
                 print(f"Discord Error: {e}")
         
-        return True # <--- สำคัญมาก: ให้ฟังก์ชันส่งค่ากลับเสมอ
+        return True
         
     except Exception as e:
         print(f"Critical _send_notify_sync Error: {e}")
-        return False # <--- คืนค่า False เมื่อเกิดความผิดพลาด
+        return False
 
 # กำหนด Timezone ไทย
 tz = pytz.timezone('Asia/Bangkok')
@@ -914,6 +908,13 @@ class QbitNode:
         except Exception as e:
             return []
 
+    def get_torrent_by_hash(self, t_hash):
+        all_torrents = self.get_all_torrents_info()
+        for t in all_torrents:
+            if t['hash'].lower() == t_hash.lower():
+                return t
+        return None
+
     def is_torrent_exists(self, t_hash):
         if not self.is_connected: self.login()
         try:
@@ -1367,6 +1368,13 @@ class RtorrentNode:
             print(f"❌ rTorrent Fetch Info Error: {e}")
             return []
 
+    def get_torrent_by_hash(self, t_hash):
+        all_torrents = self.get_all_torrents_info()
+        for t in all_torrents:
+            if t['hash'].lower() == t_hash.lower():
+                return t
+        return None
+
     def is_torrent_exists(self, t_hash):
         if not self.is_connected: self.login()
         try:
@@ -1756,18 +1764,27 @@ class NodeCleaner:
         self.node_cfg = node_clean_cfg or {}
         self.global_cfg = global_clean_cfg or {}
         self.site_key = getattr(self.node, 'site_key', 'UNKNOWN')
+        self._db_cache = None
 
-    def is_protected_hash(self, t_hash):
-        """เช็คกับ DB ว่า Hash นี้ติด H&R หรือไม่"""
+    def check_torrent_permission(self, t_hash):
+        """
+        ตรวจสอบสิทธิ์การจัดการไฟล์ตามสถานะใน DB
+        คืนค่า: 'PROTECTED', 'COMPLETED', หรือ 'NOT_FOUND'
+        """
         try:
-            # ใช้ฟังก์ชัน load_db ที่คุณมีใน main.py
-            db = load_db(self.site_key) 
-            for data in db.values():
+            if self._db_cache is None:
+                self._db_cache = load_db(self.site_key)
+            
+            # 2. ค้นหาจาก Cache ที่โหลดมาแล้ว
+            for data in self._db_cache.values():
                 if data.get("hash") == t_hash:
-                    return True
+                    return data.get("status", "NOT_FOUND")
+        
+            return "NOT_FOUND"
+        
         except Exception as e:
             print(f"⚠️ [Guardrail] Error checking DB for {t_hash}: {e}")
-        return False
+            return "NOT_FOUND"
 
     def _get_node_free_gb(self):
         try:
@@ -1777,54 +1794,108 @@ class NodeCleaner:
             return 100.0
 
     def _hard_purge_sequence(self, t_hash, node_type):
-        """🔥🔥 ระบบลบไฟล์แบบ 3 สเต็ปพร้อม Guardrail"""
-        # 🛡️ เกราะป้องกันชั้นสุดท้าย: ห้ามลบไฟล์หากพบใน DB H&R
-        if self.is_protected_hash(t_hash):
-            print(f"🔒 [GUARD] ป้องกันการลบไฟล์ติด H&R: {t_hash}")
+        status = self.check_torrent_permission(t_hash)
+
+        # ปรับตรรกะ: อนุญาตให้ลบได้ถ้าสถานะเป็น COMPLETED หรือ NOT_FOUND
+        if status not in ["COMPLETED", "NOT_FOUND"]:
+            print(f"🔒 [GUARD] ปฏิเสธการลบ: สถานะคือ {status} - {t_hash}")
             return False
+        
+        # กรณีที่เป็น NOT_FOUND อาจจะบันทึก Log เตือนไว้เล็กน้อย
+        if status == "NOT_FOUND":
+            print(f"⚠️ [GUARD] ล้างไฟล์ที่ไม่อยู่ใน DB (NOT_FOUND): {t_hash}")
 
         try:
+            # ทำการลบผ่าน API (qBit/rTorrent)
+            success = False
             if node_type == "qbit":
-                self.node.s.post(f"{self.node.url}/api/v2/torrents/reannounce", data={"hashes": t_hash}, auth=self.node.auth, verify=False, timeout=5)
-                time.sleep(0.5)
-                self.node.s.post(f"{self.node.url}/api/v2/torrents/pause", data={"hashes": t_hash}, auth=self.node.auth, verify=False, timeout=5)
-                time.sleep(0.5)
-                return self.node.delete_torrent(t_hash)
-
+                # เพิ่ม delete_files=True ในเมธอดลบของคุณ
+                success = self.node.delete_torrent(t_hash)
             elif node_type == "rtorrent":
-                xml_announce = f'<?xml version="1.0"?><methodCall><methodName>d.tracker_announce</methodName><params><param><value><string>{t_hash}</string></value></param></params></methodCall>'
-                self.node.s.post(self.node.url, data=xml_announce, auth=self.node.auth, verify=False, timeout=5)
-                time.sleep(0.5)
-                xml_stop = f'<?xml version="1.0"?><methodCall><methodName>d.stop</methodName><params><param><value><string>{t_hash}</string></value></param></params></methodCall>'
-                self.node.s.post(self.node.url, data=xml_stop, auth=self.node.auth, verify=False, timeout=5)
-                time.sleep(0.5)
-                return self.node.delete_torrent(t_hash)
+                success = self.node.delete_torrent(t_hash)
+
+            if success:
+                # อัปเดตสถานะใน DB เป็น DELETED
+                self._update_db_status(t_hash, "DELETED")
+                return True
+                
         except Exception as e:
             print(f"⚠️ [{self.node.name}] ผิดพลาดในขั้นตอน Hard Purge: {e}")
         return False
+
+    def _update_db_status(self, t_hash, new_status):
+        """อัปเดตสถานะใน DB และบันทึกเวลา"""
+        if self._db_cache is None:
+            self._db_cache = load_db(self.site_key)
+            
+        for tid, data in self._db_cache.items():
+            if data.get("hash") == t_hash:
+                data["status"] = new_status
+                data["deleted_at"] = get_now().strftime("%Y-%m-%d %H:%M")
+                save_db(self.site_key, self._db_cache) # เรียกฟังก์ชันบันทึกของคุณ
+                break
+
+    def cleanup_old_deleted_records(self, days=7):
+        """ลบข้อมูลที่สถานะเป็น DELETED เกินกำหนดออกจากไฟล์ DB"""
+        if self._db_cache is None:
+            self._db_cache = load_db(self.site_key)
+            
+        now = datetime.now()
+        keys_to_remove = []
+        
+        for tid, data in self._db_cache.items():
+            if data.get("status") == "DELETED":
+                deleted_at = datetime.strptime(data.get("deleted_at", "2000-01-01 00:00"), "%Y-%m-%d %H:%M")
+                if (now - deleted_at).days >= days:
+                    keys_to_remove.append(tid)
+        
+        for tid in keys_to_remove:
+            del self._db_cache[tid]
+            
+        if keys_to_remove:
+            save_db(self.site_key, self._db_cache)
+            print(f"🧹 [DB] ลบรายการ DELETED เกินกำหนดจำนวน {len(keys_to_remove)} รายการ")
 
     def process(self, force_emergency=False):
         # 1. เช็คสถานะการเปิดใช้งาน
         node_enable = self.node_cfg.get('enable', self.node_cfg.get('ENABLE', None))
         global_enable = self.global_cfg.get('enable', self.global_cfg.get('ENABLE', False))
-        is_enabled = node_enable if node_enable is not None else bool(global_enable)
+        # ตรรกะ: ถ้า node_enable เป็น True -> เปิด ถ้า node_enable เป็น False หรือ None -> ใช้ค่า global_enable
+        is_enabled = bool(node_enable) if node_enable is True else bool(global_enable)
+
+        print(f"⚙️ [Cleaner Engine] Node: {self.node.name} | Status: {'ACTIVE' if is_enabled else 'DISABLED'} (Node: {node_enable}, Global: {global_enable})")
 
         if not is_enabled:
+            print(f"💤 [Cleaner Bypass] Skipped [{self.node.name}] เพราะระบบปิดการใช้งาน")
             return
 
+        print(f"🔄 [{self.node.name}] เริ่มต้นรอบการทำงาน (Cycle Start)...")
+        
+        # 1.1 Maintenance
+        self.cleanup_old_deleted_records(days=7)
+        
         # 2. จัดการโหมด Emergency หรือ Normal
         current_free = self._get_node_free_gb()
         if force_emergency or (current_free < 10.0):
+            print(f"🚨 [{self.node.name}] สถานะวิกฤต: พื้นที่เหลือ {current_free:.2f} GB -> เริ่มโหมดกู้คืนด่วน")
             node_type = "qbit" if "qbit" in self.node.__class__.__name__.lower() else "rtorrent"
             smart_reclaim_process(self.node, required_gb=10.0, is_emergency=True, node_type=node_type)
+            print(f"✅ [{self.node.name}] กู้คืนพื้นที่เสร็จสิ้น")
             return
 
         # 3. โหมด Idle Cleanup
+        print(f"🔍 [{self.node.name}] เริ่มสแกน Idle Cleanup (โหมดปกติ)...")
         class_name = self.node.__class__.__name__.lower()
         grouped_logs = self._clean_qbit() if "qbit" in class_name else self._clean_rtorrent()
         
-        # ส่ง Notification (รวบยอด)
-        self._notify_results(grouped_logs)
+        # ส่ง Notification
+        if grouped_logs:
+            self._notify_results(grouped_logs)
+            print(f"📝 [{self.node.name}] ส่งสรุปผลการลบเรียบร้อย")
+        else:
+            print(f"ℹ️ [{self.node.name}] ไม่พบทอร์เรนต์ที่เข้าเงื่อนไขการลบในรอบนี้")
+            
+        print(f"🏁 [{self.node.name}] จบรอบการทำงาน.")
 
     def _notify_results(self, active_logs):
         """แยก Logic การแจ้งเตือนออกมาเพื่อให้ Clean ขึ้น"""
@@ -2023,6 +2094,25 @@ class NodeCleaner:
         return res_grouped
 
 # ========================= Smart Reclaim Space (Hardened Version) =========================
+
+PROTECTION_CACHE = {}
+
+def get_protected_hashes(site_key):
+    """โหลดข้อมูลไฟล์ที่ติด H&R มาเก็บไว้ใน Cache"""
+    global PROTECTION_CACHE
+    if site_key not in PROTECTION_CACHE:
+        db = load_db(site_key)
+        # กรองเฉพาะไฟล์ที่สถานะเป็น PROTECTED
+        PROTECTION_CACHE[site_key] = {
+            data.get("hash") for data in db.values() 
+            if data.get("status") == "PROTECTED"
+        }
+    return PROTECTION_CACHE[site_key]
+
+def is_protected_hash_global(site_key, t_hash):
+    """ตรวจสอบว่า Hash นี้ติดสถานะ PROTECTED หรือไม่ โดยใช้ Set Lookup"""
+    protected_set = get_protected_hashes(site_key)
+    return t_hash in protected_set
 
 def _bulk_delete_qbit(node, target_hashes):
     """ 
@@ -2332,7 +2422,7 @@ def smart_reclaim_process(node, required_gb, is_emergency=False, node_type="qbit
             header_str = f"🚨 <b>[Emergency Bypass Smart Reclaim]</b> [{node.name}]\n" if is_emergency else f"🧹 <b>[Normal Smart Reclaim]</b> [{node.name}]\n"
             msg = header_str + "ระบบทำการกวาดล้างและทวงคืนพื้นที่ดิสก์เสร็จสิ้น รายละเอียดไฟล์:\n" + "\n".join(reclaimed_logs)
             try:
-                asyncio.create_task(safe_send_notify(msg))
+                asyncio.create_task(send_notify(msg))
             except Exception as e:
                 print(f"⚠️ การแจ้งเตือนล้มเหลวหรือช้าเกินไป: {e}")
 
@@ -2897,8 +2987,9 @@ async def ensure_dedbit_logged_in(page):
     return True
 
 class BotContext:
-    def __init__(self, active_nodes, seen_hashes, seen_ids):
+    def __init__(self, active_nodes, dl_session, seen_hashes, seen_ids):
         self.active_nodes = active_nodes
+        self.dl_session = dl_session
         self.seen_hashes = seen_hashes
         self.seen_ids = seen_ids
         
@@ -3310,107 +3401,127 @@ def format_site_stats_report(all_nodes):
 async def sync_hr_with_web(site_key, page, base_url, ctx):
     print(f"🔄 [{site_key}] เริ่มต้นกระบวนการ Sync H&R...")
     hr_url = f"{base_url.rstrip('/')}/myhr.php"
+    
+    # STEP 1: การดึงข้อมูล
+    print(f"📡 [{site_key}] กำลังโหลดหน้า H&R: {hr_url}")
     await page.get(hr_url)
     await asyncio.sleep(2)
     
     soup = BeautifulSoup(await page.get_content(), 'html.parser')
     db = await async_load_db(site_key)
     rows = soup.find_all('tr')
+    print(f"📄 [{site_key}] พบรายการทั้งหมด {len(rows)} รายการ")
     
-    # 📊 ติดตามสถิติการทำงาน
     stats = {"total": 0, "scanned": 0, "warning": 0, "completed": 0}
     current_ids_on_web = []
     
+    # STEP 2: ประมวลผลแต่ละรายการ
     for row in rows:
-        link = row.find('a', href=re.compile(r'details\.php\?id='))
-        if not link: continue
+        links = row.find_all('a', href=re.compile(r'details\.php\?id='))
+        valid_link = None
+        for link in links:
+            if 'userdetails.php' not in link['href'] and 'details.php' in link['href']:
+                valid_link = link
+                break
+
+        if not valid_link: continue
         
-        torrent_id = re.search(r'id=(\d+)', link['href']).group(1)
+        torrent_id = re.search(r'id=(\d+)', valid_link['href']).group(1)
         current_ids_on_web.append(torrent_id)
         hr_status = extract_hr_status(row)
+        if hr_status in ['warning', 'danger']: stats["warning"] += 1
         stats["total"] += 1
         
-        needs_deep_scan = (db.get(torrent_id, {}).get("hash") == "UNKNOWN") or (hr_status == 'warning')
-        
+        # STEP 3: ตรวจสอบสถานะ DB
+        if torrent_info := db.get(torrent_id):
+            if torrent_info.get("status") in ["PROTECTED", "COMPLETED", "PROCESSING"]:
+                continue 
+
+        needs_deep_scan = (db.get(torrent_id, {}).get("hash") == "UNKNOWN") or (hr_status in ['warning', 'danger'])
+
         if needs_deep_scan:
+            print(f"🔎 [{site_key}] ID {torrent_id}: พบไฟล์ที่ต้องสแกน/แก้ไข (สถานะ: {hr_status.upper()})")
+            db[torrent_id] = {"status": "PROCESSING", "hash": "UNKNOWN"}
+            await async_save_db(site_key, db) 
+
             stats["scanned"] += 1
-            print(f"🔍 [{site_key}] Deep Scan [ID: {torrent_id}] - Status: {hr_status.upper()}")
             
+            # STEP 4: ทำการ Deep Scan
+            print(f"🏗️ [{site_key}] ID {torrent_id}: กำลังดึงข้อมูลรายละเอียด...")
             new_tab = await page.browser.get("about:blank", new_tab=True)
             try:
                 details_url = f"{base_url.rstrip('/')}/details.php?id={torrent_id}"
                 meta = await get_torrent_details_full(new_tab, base_url, details_url, torrent_id)
                 
                 if meta['hash'] != "UNKNOWN":
-                    db[torrent_id] = {
-                        "hash": meta['hash'],
-                        "added_at": get_now().strftime("%Y-%m-%d %H:%M"),
-                        "status": "PROTECTED"
-                    }
+                    db[torrent_id] = {"hash": meta['hash'], "added_at": get_now().strftime("%Y-%m-%d %H:%M"), "status": "PROTECTED"}
                     
-                    if hr_status == 'warning':
-                        stats["warning"] += 1
-                        await trigger_download_if_needed(torrent_id, meta['name'], meta['size_gb'], details_url, meta['download_url'], site_key, page, page, ctx.active_nodes, ctx.seen_hashes, ctx.seen_ids)
+                    if hr_status in ['warning', 'danger']:
+                        print(f"⚡ [{site_key}] ID {torrent_id}: ดำเนินการแก้ไขสถานะ (Force: {hr_status == 'danger'})")
+                        success = await trigger_download_if_needed(
+                            torrent_id, meta['name'], meta['size_gb'], 
+                            details_url, meta['download_url'], site_key, 
+                            ctx.dl_session, page, ctx.active_nodes, ctx.seen_hashes, 
+                            ctx.seen_ids, force_download=(hr_status == 'danger')
+                        ) # ใส่ arguments เดิมของคุณ
+                        if success:
+                            db[torrent_id]["status"] = "PROTECTED"
+                            await async_save_db(site_key, db)
+                    
+                    print(f"✅ [{site_key}] ID {torrent_id}: อัปเดตข้อมูลสำเร็จ")
+                else:
+                    print(f"⚠️ [{site_key}] ID {torrent_id}: ไม่สามารถดึง Hash ได้")
+            except Exception as e:
+                print(f"❌ [{site_key}] ID {torrent_id}: เกิดข้อผิดพลาด {e}")
+                db[torrent_id]["status"] = "ERROR"
             finally:
                 await new_tab.close()
-
+        
         if torrent_id in db:
             db[torrent_id]["hr_status"] = hr_status
             
-    # อัปเดตสถานะงานที่จบจากตาราง H&R ไปแล้ว
-    for tid in list(db.keys()):
+    # STEP 5: การสรุปงาน Cleanup
+    print(f"🧹 [{site_key}] กำลังตรวจสอบไฟล์ที่ต้องเปลี่ยนสถานะเป็น COMPLETED...")
+    
+    # ดึงรายชื่อ ID ที่มีอยู่ใน DB ทั้งหมดมาตรวจสอบ
+    all_stored_ids = list(db.keys())
+    
+    for tid in all_stored_ids:
+        # เงื่อนไข: ถ้า ID นั้นไม่อยู่ในรายการหน้าเว็บปัจจุบัน และสถานะยังไม่เป็น COMPLETED
         if tid not in current_ids_on_web:
-            if db[tid].get("status") != "COMPLETED":
+            current_status = db[tid].get("status")
+            
+            if current_status != "COMPLETED":
+                # ปรับสถานะเป็น COMPLETED
                 db[tid]["status"] = "COMPLETED"
+                # บันทึกเวลาที่เปลี่ยนสถานะ เพื่อให้ระบบ Auto Clean ใช้เป็นจุดอ้างอิงในการลบไฟล์
                 db[tid]["completed_at"] = get_now().strftime("%Y-%m-%d %H:%M")
+                
                 stats["completed"] += 1
-        
+                print(f"✅ [{site_key}] ID {tid}: เปลี่ยนสถานะเป็น COMPLETED (พร้อมสำหรับ Auto Clean)")
+
+    # บันทึกสถานะล่าสุดลง DB
     await async_save_db(site_key, db)
     
-    # 🏁 สรุปผลและส่งแจ้งเตือน
-    summary_msg = (
-        f"🏁 **SYNC SUMMARY: {site_key}**\n"
-        f"📋 Total H&R Items: `{stats['total']}`\n"
-        f"🔍 Deep Scanned: `{stats['scanned']}`\n"
-        f"⚠️ Action Required: `{stats['warning']}`\n"
-        f"✅ Jobs Completed: `{stats['completed']}`"
-    )
+    # STEP 6: รายงานสรุปผล
+    summary_msg = f"🏁 <b>SYNC SUMMARY: {site_key}</b>\n📋 Total: `{stats['total']}`\n🔍 Scanned: `{stats['scanned']}`\n⚠️ Warning/Danger: `{stats['warning']}`\n✅ Completed: `{stats['completed']}`"
     
-    # ส่งแจ้งเตือนผ่านฟังก์ชันที่คุณมี (เลือกใช้ตัวใดตัวหนึ่ง)
-    try:
-        # หากมี send_notify หรือ safe_send_notify
-        if 'safe_send_notify' in globals():
-            await safe_send_notify(summary_msg)
-        elif 'send_notify' in globals():
-            await send_notify(summary_msg)
-        print(summary_msg)    
-        print(f"📧 [{site_key}] ส่งสรุปผลเข้าช่องทางแจ้งเตือนเรียบร้อยแล้ว")
-    except Exception as e:
-        print(f"⚠️ [{site_key}] ไม่สามารถส่งแจ้งเตือนได้: {e}")
+    await send_notify(summary_msg)
+    print(f"📧 [{site_key}] สรุปผลเรียบร้อย: {stats}")
 
 def extract_hr_status(row):
-    """
-    วิเคราะห์สถานะ H&R จากแถว (tr) ของตาราง
-    คืนค่าเป็น 'warning' หรือ 'normal'
-    """
-    # ดึง text ทั้งหมดใน row ออกมาเป็นตัวพิมพ์เล็กเพื่อเทียบง่ายๆ
     row_text = row.get_text().lower()
     
-    # ดึงค่า class ของแถวหรือ cell สถานะเพื่อความแม่นยำ
-    status_cell = row.find('td', class_='status') # ปรับ class_ ตามหน้าเว็บจริง
+    # ดึงค่าสีจาก style หรือ class
+    style = row.get('style', '').lower()
+    classes = " ".join(row.get('class', []))
     
-    # 1. เช็คจาก Keywords ที่ชัดเจน
-    if 'warning' in row_text or 'h&r' in row_text:
-        return 'warning'
-        
-    # 2. เช็คจาก Class ของ tag (กรณีเว็บใช้สีแดง/เหลืองเตือน)
-    if status_cell:
-        classes = " ".join(status_cell.get('class', []))
-        if 'alert' in classes or 'warning' in classes:
-            return 'warning'
-            
-    # 3. เช็คจากรูปภาพ (ถ้ามี)
-    if row.find('img', alt=re.compile(r'warning', re.I)):
+    # เช็คว่าติด H&R ชัดเจน (เช่น สีแดง หรือ keyword รุนแรง)
+    if 'red' in style or 'danger' in classes or 'h&r' in row_text:
+        return 'danger' # สถานะติดแดง
+    
+    # เช็คสถานะเตือนปกติ
+    if 'warning' in row_text or 'yellow' in style or 'alert' in classes:
         return 'warning'
         
     return 'normal'
@@ -3459,73 +3570,112 @@ def extract_torrent_metadata(html_content):
             
     return t_name, t_size_gb
 
-async def trigger_download_if_needed(t_id, t_name, t_size_gb, details_url, download_url, site, dl_session, browser_instance, active_nodes, seen_hashes, seen_ids):
+async def trigger_download_if_needed(t_id, t_name, t_size_gb, details_url, download_url, site, dl_session, browser_instance, active_nodes, seen_hashes, seen_ids, force_download=False):
     try:
         print(f"🚀 เริ่มดาวน์โหลดไฟล์: {t_id}")
         raw_data_bytes = None
+        download_ready = False
 
-        # 1. ตรวจสอบว่า dl_session เป็น aiohttp.ClientSession จริงหรือไม่
-        # หาก dl_session คือตัวแปรที่คุณสร้างจาก aiohttp.ClientSession()
-        if hasattr(dl_session, 'get'):
+        # 1. พยายามดาวน์โหลดผ่าน Session ปกติ (Wrapper หรือ aiohttp)
+        if isinstance(dl_session, BrowserSessionWrapper):
             try:
-                # การใช้ aiohttp จะไม่มี timeout ใน .get() โดยตรงในบางเวอร์ชัน 
-                # ให้ใช้ผ่าน client_timeout ถ้าจำเป็น หรือลบออกไปก่อนเพื่อทดสอบ
+                resp = await dl_session.get(download_url)
+                if resp and resp.status_code == 200:
+                    raw_data_bytes = resp.content
+            except Exception as e:
+                print(f"⚠️ ดาวน์โหลดผ่าน Wrapper ล้มเหลว: {e}")
+        
+        elif hasattr(dl_session, 'get'):
+            try:
                 async with dl_session.get(download_url) as resp:
                     if resp.status == 200:
                         raw_data_bytes = await resp.read()
             except Exception as e:
                 print(f"⚠️ ดาวน์โหลดผ่าน Session ล้มเหลว: {e}")
 
-        # 2. กู้คืนผ่าน Browser ถ้าโหลดปกติไม่สำเร็จ
-        if not raw_data_bytes or not raw_data_bytes.startswith(b'd8:'):
-            print(f"🔄 กำลังเข้าสู่โหมดกู้คืนผ่าน Browser...")
-            # ส่ง browser_instance เข้าไป (ตรวจสอบว่า function นี้ใช้ tab ไม่ใช่ dl_session)
-            raw_data_bytes = await download_torrent_via_browser(
-                browser_instance, details_url, download_url
-            )
-
-        # 3. ตรวจสอบว่าได้ไฟล์ .torrent มาจริงๆ (d8: คือ header ของไฟล์ torrent)
-        if not raw_data_bytes or not raw_data_bytes.startswith(b'd8:'):
-            print("❌ ไม่สามารถดาวน์โหลดไฟล์ได้: ข้อมูลไม่ถูกต้อง")
-            return
-
-        # 4. ดำเนินการต่อ (เช็ค Hash, ส่งเข้า Node...)
-        t_hash = extract_info_hash(raw_data_bytes)
-        
-        # 3. เช็ค Hash ซ้ำ
-        if t_hash in seen_hashes:
-            print(f"❌ ข้าม: Hash {t_hash[:8]} ซ้ำในระบบ")
-            return
-
-        # 4. เลือก Node และส่งเข้า Client
-        active_nodes.sort(key=lambda x: x[0].free_gb, reverse=True)
-        success_node = None
-        
-        for node_obj, n_cfg in active_nodes:
-            # ตรวจสอบพื้นที่และสถานะ Node (เหมือนเดิมที่คุณทำ)
-            if node_obj.is_torrent_exists(t_hash):
-                print(f"❌ ข้าม: ตรวจพบ Hash ใน {node_obj.name}")
-                break
+        # 2. ตรวจสอบเบื้องต้น (ถ้าโหลดได้แล้วให้ข้ามไปตรวจสอบ Hash เลย)
+        if raw_data_bytes and raw_data_bytes.startswith(b'd8:'):
+            download_ready = True
+        else:
+            # 3. โหมดกู้คืน (Recovery) - ทำงานเมื่อโหลดปกติไม่สำเร็จ
+            print(f"🔄 เข้าสู่โหมดกู้คืนผ่าน Browser สำหรับ ID: {t_id}")
+            raw_content = await download_torrent_via_browser(browser_instance, details_url, download_url)
             
-            # ส่งเข้า Seedbox
-            result = safe_add_torrent(node_obj, raw_data_bytes, site)
-            if result:
-                print(f"✅ [Success] {node_obj.name} | {t_size_gb:.1f}GB | {t_name[:40]}")
-                await link_new_torrent(site_key=site, torrent_id=t_id, torrent_hash=t_hash)
-                
-                # กด Thanks
-                await auto_click_thanks(await browser_instance.get(details_url, new_tab=True), details_url)
-                
-                success_node = node_obj
-                seen_hashes.add(t_hash)
+            if raw_content and raw_content.startswith(b'd8:'):
+                raw_data_bytes = raw_content
+                download_ready = True
+                print(f"✅ กู้คืนสำเร็จ!")
+            else:
+                print(f"❌ ไม่สามารถดาวน์โหลดไฟล์ {t_id} ได้ แม้จะลองกู้คืนแล้ว")
+                seen_ids.add(t_id) # Blacklist ไว้ไม่ให้วนลูปซ้ำ
+                return
+
+        # 4. ตรวจสอบ Hash และจัดการ Node
+        t_hash = extract_info_hash(raw_data_bytes)
+        if not t_hash:
+            return
+
+        if download_ready:
+            # ตรวจสอบ Hash ซ้ำ
+            if not force_download and t_hash in seen_hashes:
+                print(f" ❌ ข้าม: Hash {t_hash} ซ้ำในระบบ")
                 seen_ids.add(t_id)
-                break
+                download_ready = False
+            else:
+                is_already_in_node = False
+                target_node_name = ""
+                for node_obj, _ in active_nodes:
+                    if node_obj.is_torrent_exists(t_hash):
+                        is_already_in_node = True
+                        target_node_name = node_obj.name
+                        break
         
-        if not success_node:
-            print(f"❌ [Full/Error] ไม่สามารถส่งไฟล์ {t_name[:30]} เข้า Node ใดได้เลย")
+                if is_already_in_node:
+                    print(f" ❌ ข้าม: ตรวจพบ Hash [...{t_hash[-5:]}] วิ่งอยู่ใน {target_node_name}")
+                    seen_ids.add(t_id)
+                    download_ready = False
+
+        # จัดการส่งเข้า Node
+        if download_ready:
+            active_nodes.sort(key=lambda x: x[0].free_gb, reverse=True)
+        
+            for node_obj, n_cfg in active_nodes:
+                torrent_info = node_obj.get_torrent_by_hash(t_hash)
+            
+                if not torrent_info or node_obj.is_torrent_exists(t_hash):
+                    if not torrent_info:
+                        result = safe_add_torrent(node_obj, raw_data_bytes, site)
+                        if result:
+                            print(f"✅ [Success] {node_obj.name} | {t_name[:40]}")
+                            await link_new_torrent(site, t_id, t_hash)
+                            asyncio.create_task(handle_thanks_click(browser_instance, details_url))
+                            
+                            success_node = node_obj
+                            seen_hashes.add(t_hash)
+                            seen_ids.add(t_id)
+                            return True
+                    else:
+                        status = torrent_info.get('status', 'unknown')
+                        if status in ['paused', 'stopped', 'error']:
+                            node_obj.resume_torrent(t_hash)
+                            return True
+                        break # พบแล้วและทำงานอยู่ ไม่ต้องวน Loop ต่อ
+        
+            if not success_node and not torrent_info:
+                print(f"❌ [Full/Error] ไม่สามารถส่งไฟล์เข้า Node ได้")
+                return False
 
     except Exception as e:
         print(f"❌ [Download Trigger Error] {e}")
+        return False
+
+async def handle_thanks_click(browser_instance, details_url):
+    """แยกออกมาเป็น Task เพื่อไม่ให้กระทบการดาวน์โหลดหลัก"""
+    thanks_tab = await browser_instance.get(details_url, new_tab=True)
+    try:
+        await auto_click_thanks(thanks_tab, details_url)
+    finally:
+        await thanks_tab.close()
 
 async def clear_bearbit_notifications(page: uc.Tab, base_url: str, site_name: str = "BEARBIT") -> bool:
     """
@@ -4260,8 +4410,10 @@ async def main():
     startup_msg = "🚀 Universal Auto-Pilot (nodriver Edition) : Started"
     print(startup_msg)
     
-    asyncio.create_task(safe_send_notify(startup_msg))
+    asyncio.create_task(send_notify(startup_msg))
     browser_instance = None
+    site_page = None
+    dl_session = None
     resp = None
     consecutive_errors = 0
     
@@ -4321,7 +4473,7 @@ async def main():
 
             if node_status_buffer:
                 msg = "🔌 <b>Node Status Report</b>\n" + "\n".join(node_status_buffer)
-                asyncio.create_task(safe_send_notify(msg))
+                asyncio.create_task(send_notify(msg))
 
             if not active_nodes:
                 print("⚠️ [Warning] ไม่มี Node ไหนพร้อมใช้งานในรอบนี้ ข้ามไปรอรอบถัดไป")
@@ -4345,17 +4497,19 @@ async def main():
 
             if not is_browser_healthy:
                 print("🌐 กำลังเริ่ม Browser instance ใหม่...")
-                try:
-                    browser_instance = await launch_any_browser(stealth_args)
-                except Exception as e:
-                    print(f"❌ ไม่สามารถเปิด Browser ได้: {e}")
-                    await asyncio.sleep(30) # รอถ้าเปิดไม่ได้
-                    continue # ข้ามรอบนี้ไป
+                browser_instance = await launch_any_browser(stealth_args)
+                
+                # เมื่อเปลี่ยน Browser ต้องสร้างใหม่ทุกอย่าง
+                site_page = await browser_instance.get("about:blank", new_tab=True)
+                dl_session = BrowserSessionWrapper(browser_instance)
+            
+            # กรณีที่ Browser ปกติ แต่เรายังไม่มี site_page หรือ dl_session (รอบแรก)
+            elif 'site_page' not in locals():
+                site_page = await browser_instance.get("about:blank", new_tab=True)
+                dl_session = BrowserSessionWrapper(browser_instance)
             
             target_sites_cfg = [s for s in CFG.get('SITE', []) if s.get('enable', True)]
             print(f"📡 Detected Sites: {[s['name'] for s in target_sites_cfg]}")
-            site_page = await browser_instance.get("about:blank", new_tab=True)
-            dl_session = BrowserSessionWrapper(browser_instance) 
 
             for site_cfg in target_sites_cfg:
                 if stop_event.is_set(): break
@@ -4413,12 +4567,12 @@ async def main():
                         except Exception as cookie_err:
                             print(f"⚠️ [{site}] ไม่สามารถดึงคุกกี้: {cookie_err}")
                             
-                        ctx = BotContext(active_nodes, seen_hashes, seen_ids)
+                        ctx = BotContext(active_nodes, dl_session, seen_hashes, seen_ids)
                         stats_data = await get_site_stats(site_page, site_cfg, ctx)
                         print(stats_data)
 
                         if stats_data and isinstance(stats_data, str):
-                            asyncio.create_task(safe_send_notify(stats_data))
+                            asyncio.create_task(send_notify(stats_data))
                         else:
                             print(f"⚠️ [{site}] ข้อมูลสถิติไม่สมบูรณ์ หรือได้ NoneType, ข้ามการส่ง Notification")
 
@@ -4662,7 +4816,7 @@ async def main():
                                             else:
                                                 print("❌ ไม่สามารถดาวน์โหลดไฟล์ได้แม้จะลองคลิกผ่าน Browser แล้ว")
 
-                                        # 4. ส่วนการส่งเข้า Node (เหมือนเดิม)
+                                        # 4. ส่วนการส่งเข้า Node
                                         if download_ready:
                                             # ตรวจสอบ Hash ซ้ำ
                                             if t_hash in seen_hashes:
@@ -4825,7 +4979,7 @@ async def main():
                                 summary_msg += footer
                                 print(f"\n{footer}")
                                     
-                                await safe_send_notify(summary_msg)
+                                await send_notify(summary_msg)
 
                             # ✅ [FIX 3] ย้ายการเซฟประวัติเข้ามาบันทึกในจบลูปโซนย่อยทันที ข้อมูลสดใหม่ตลอดเวลา ไม่สูญหาย
                             save_data(current_site_seen_file, seen_ids)
@@ -4880,13 +5034,13 @@ async def main():
             stats_report = format_site_stats_report([n[0] for n in active_nodes])
             if stats_report:
                 print(stats_report)
-                await safe_send_notify(stats_report) # แนะนำให้ใช้ await ถ้าเป็นไปได้
+                await send_notify(stats_report) # แนะนำให้ใช้ await ถ้าเป็นไปได้
             
             #Cycle complete (เข้าสู่ช่วงพัก)
             wait_sec = random.randint(SET.get('MIN_WAIT_MINUTES', 2)*60, SET.get('MAX_WAIT_MINUTES', 10)*60)
             wait_msg = f"\n💤 Cycle finished. Waiting {wait_sec//60} minutes for next scan..."
             print(wait_msg)
-            await safe_send_notify(wait_msg)
+            await send_notify(wait_msg)
         
             #ช่วงเวลาคอย
             for s in range(wait_sec, 0, -1):
