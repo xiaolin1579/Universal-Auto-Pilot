@@ -10,6 +10,7 @@ import gzip
 import time
 import os
 import re
+from functools import lru_cache
 import hashlib
 import json
 import bencodepy
@@ -471,7 +472,7 @@ _global_display = None
 _active_browser_instance = None #ตัวแปรเพื่อติดตาม instance
 _current_profile_path = None #ตัวแปรเก็บ pathpath
 
-async def launch_any_browser(custom_args=None):
+async def launch_any_browser(sitename="default", custom_args=None):
     global _global_display, _active_browser_instance, _current_profile_path
     
     # 1. เคลียร์ Instance เก่า (เพิ่มการหน่วงเวลาเพื่อความเสถียร)
@@ -491,14 +492,17 @@ async def launch_any_browser(custom_args=None):
         _global_display.start()
         await asyncio.sleep(2)
 
-    # 3. ใช้ Config ของ nodriver
-    browser_path = get_universal_browser_path()
+    # 3. ใช้ Config ของ nodriver โดยเปลี่ยน Path ตามชื่อเว็บ
+    # เปลี่ยนชื่อ Folder ให้กระชับขึ้นตามชื่อ Site
+    _current_profile_path = f"./profiles/{sitename}_uc_profile"
     
-    # กำหนด path ใหม่ทุกครั้งที่เปิด
-    _current_profile_path = f"./uc_profile_{random.randint(100, 999)}"
+    # [สำคัญ] ตรวจสอบว่ามีโฟลเดอร์รองรับหรือไม่ (ถ้าจำเป็น)
+    import os
+    if not os.path.exists("./profiles"):
+        os.makedirs("./profiles")
     
     config = Config(
-        browser_executable_path=browser_path,
+        browser_executable_path=get_universal_browser_path(),
         user_data_dir=_current_profile_path,
         headless=False
     )
@@ -3161,89 +3165,124 @@ def extract_digit(tag):
     except:
         return 0
 
-async def extract_torrent_data(row, base_url, dl_session=None, headers=None):
+# แยก Regex ออกมาให้ชัดเจน
+ID_REGEX = re.compile(r"details\.php\?id=(\d+)", re.I)
+DL_REGEX = re.compile(r"download(new)?\.php", re.I)
+BAD_LINK_PATTERN = re.compile(r"ndonatedn|vip|donate|/nDonatedN\.php", re.I)
+
+async def extract_torrent_data(row, base_url, dl_session=None, headers=None, checked_cache=None):
     if row is None: return None
     
-    # --- 1. สกัด ID & Title ---
-    title_tag = row.find("a", href=re.compile(r"details\.php\?id=(\d+)", re.I))
+    # 1. สกัด ID & Title พร้อมป้องกัน Error
+    title_tag = row.find("a", href=ID_REGEX)
     t_id, title, details_url = None, "Unknown File", None
+    
     if title_tag:
         title = title_tag.get_text(strip=True)
-        t_id = re.search(r"id=(\d+)", title_tag.get('href', '')).group(1)
-        details_url = f"{base_url.rstrip('/')}/details.php?id={t_id}"
+        match = ID_REGEX.search(title_tag.get('href', ''))
+        if match:
+            t_id = match.group(1)
+            details_url = f"{base_url.rstrip('/')}/details.php?id={t_id}"
 
-    # --- 2. สกัดข้อมูล (รองรับโครงสร้างตาราง Bearbit) ---
-    all_tds = row.find_all("td")
-    s, l, c = 0, 0, 0
-    t_size_str, raw_date_str = "0 GB", ""
+    # 2. เข้าถึง TD (คงเดิม)
+    tds = row.select("td")
+    if len(tds) < 12: return None
 
-    # Bearbit Index:
-    # [7]: Date, [8]: Size, [9]: Completed, [10]: Seeders, [11]: Leechers
-    if len(all_tds) >= 11:
-        raw_date_str = all_tds[7].get_text(separator=' ', strip=True)
-        t_size_str = all_tds[8].get_text(separator=' ', strip=True)
-        c = extract_digit(all_tds[9])
-        s = extract_digit(all_tds[10])
-        l = extract_digit(all_tds[11])
+    # ดึงข้อมูลตัวเลข (สมมติว่าฟังก์ชัน extract_digit ถูกนิยามไว้ที่อื่นแล้ว)
+    c, s, l = extract_digit(tds[9]), extract_digit(tds[10]), extract_digit(tds[11])
 
-    # 3. สกัดลิงก์ดาวน์โหลด (ฉบับคัดกรอง)
+    # 3. ตรวจสอบ Action ลิงก์ (คงเดิม)
     download_url = None
-    
-    # ดึงจากส่วน Action บนหน้าหลัก
     action_div = row.find("div", class_="bb-file-actions")
     if action_div:
-        # Regex ตัวเดียวจบ ครอบคลุมทั้ง download.php และ downloadnew.php
-        btn_dl = action_div.find("a", href=re.compile(r"download(new)?\.php|nDonatedN\.php", re.I))
+        btn_dl = action_div.find("a", href=DL_REGEX)
         if btn_dl:
-            path = btn_dl.get('href', '')
-            download_url = path if path.startswith('http') else f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+            href = btn_dl.get('href', '')
+            if not BAD_LINK_PATTERN.search(href):
+                download_url = href if href.startswith('http') else f"{base_url.rstrip('/')}/{href.lstrip('/')}"
 
-    # Fallback ถ้าไม่เจอใน div action
-    if not download_url:
-        btn_dl = row.find("a", href=re.compile(r"download(new)?\.php\?id=" + str(t_id), re.I))
-        if btn_dl:
-            download_url = f"{base_url.rstrip('/')}/{btn_dl.get('href', '').lstrip('/')}"
-
-    # [จุดสำคัญ] กรองลิงก์ VIP/Donate ทิ้งทันที
-    if download_url and any(bad in download_url.lower() for bad in ['ndonatedn', 'vip', 'donate']):
-        #print(f"⚠️ [{t_id}] ตรวจพบลิงก์หน้า VIP, บังคับทำ Deep Scan เพื่อหาลิงก์จริง...")
-        download_url = None # บังคับให้ข้ามไปทำ Deep Scan ในข้อ 4
-
-    # --- 4. Deep Scan (ฉบับอัปเกรด) ---
+    # 4. Deep Scan แบบประหยัดพลังงาน
     if not download_url and details_url and dl_session:
-        #print(f"🔍 [{t_id}] ไม่พบลิงก์หน้าหลัก ทำ Deep Scan...")
-        try:
-            local_headers = headers.copy() if headers else {}
-            local_headers['Referer'] = details_url
-            
-            # ดึงข้อมูลผ่าน session
-            resp = await dl_session.get(details_url, headers=local_headers, timeout=20)
-            
-            if resp and resp.status_code == 200:
-                soup_details = BeautifulSoup(resp.content, 'html.parser')
+        # เช็ค Cache
+        if checked_cache is not None and details_url in checked_cache:
+            pass 
+        else:
+            try:
+                local_headers = headers.copy() if headers else {}
+                #print(f"DEBUG: ส่ง Headers ไปดังนี้: {local_headers}")
+                resp = await dl_session.get(details_url, timeout=10, headers=local_headers)
                 
-                if is_cloudflare(soup_details):
-                    return {"id": t_id, "status": "cf_blocked"}
+                # --- [ส่วนการตรวจสอบความสมบูรณ์] ---
+                # ปรับเปลี่ยนจากการใช้ return เป็นการพิมพ์ Log แล้วให้ทำงานต่อด้วยค่าเริ่มต้น
+                is_valid = True
+                if not resp or resp.status_code != 200:
+                    print(f"❌ [DeepScan] โหลดหน้าไม่ผ่าน (Status: {resp.status_code if resp else 'No Resp'})")
+                    is_valid = False
                 
-                # [แก้ไข] ค้นหาลิงก์ดาวน์โหลดที่รองรับทั้ง download.php และ downloadnew.php
-                # และหลีกเลี่ยงลิงก์ที่เป็น VIP/Donate
-                dl_tag = soup_details.find("a", href=re.compile(r"download(new)?\.php\?.*id=" + str(t_id), re.I))
+                content = resp.text if resp else ""
+                if is_valid and (not content or len(content) < 500):
+                    print(f"❌ [DeepScan] หน้าเว็บว่างเปล่าหรือโดน Block")
+                    is_valid = False
                 
-                if dl_tag:
-                    action_url = dl_tag.get('href', '').strip()
-                    # ตรวจสอบลิงก์ที่ได้ว่าไม่ใช่หน้า VIP
-                    if any(bad in action_url.lower() for bad in ['ndonatedn', 'vip', 'donate']):
-                        print(f"🚩 [{t_id}] ตรวจพบลิงก์ VIP/Donate, ข้าม...")
-                    else:
-                        download_url = action_url if action_url.startswith('http') else f"{base_url.rstrip('/')}/{action_url.lstrip('/')}"
-        
-        except Exception as e:
-            print(f"⚠️ [{t_id}] Error ในการ Deep Scan: {e}")
+                # ถ้าเช็คผ่านทั้งหมด ค่อยทำ BeautifulSoup
+                if is_valid:
+                    # [สำคัญ] ถ้า dl_session คือ BrowserSessionWrapper ให้ดึง content ล่าสุดจาก tab
+                    # เพราะอาจมี JS ทำงานต่อหลังจากโหลด HTML แรกมา
+                    content = await dl_session.browser.main_tab.get_content()
+                    soup = BeautifulSoup(content, 'lxml')
+                    # เพิ่มหลังประกาศ soup = BeautifulSoup(content, 'lxml')
+                    #print(f"DEBUG: จำนวนลิงก์ <a> ทั้งหมดที่พบ: {len(soup.find_all('a'))}")
+                    # ลองพิมพ์ HTML เฉพาะจุดที่น่าจะมีปุ่มออกมาดู
+                    
+                    # 1. ค้นหาจาก Text "ดาวน์โหลด" หรือคำที่มีความหมายในทุกๆ <a> (แม่นยำที่สุด)
+                    dl_tag = soup.find("a", string=re.compile(r"ดาวน์โหลด", re.I))
 
+                    # 2. ถ้าไม่เจอ ให้ค้นหาจาก href ที่มี pattern ของการดาวน์โหลด (ครอบคลุมทั้ง .torrent และ downloadnew.php)
+                    if not dl_tag:
+                        dl_tag = soup.find("a", href=re.compile(r"(downloadnew\.php|\.torrent|/download/)", re.I))
+
+                    # 3. ถ้ายังไม่เจอ ให้หว่านแห (Catch-All) โดยหา <a> ที่มีคำว่า 'download' ใน href
+                    # นี่คือวิธีที่บอทของคุณใช้จนเจอลิงก์ล่าสุด
+                    if not dl_tag:
+                        dl_tag = soup.find("a", href=lambda href: href and "download" in href.lower())
+
+                    # 4. หากยังไม่เจอจริงๆ ให้ลองหาปุ่มที่อาจจะเป็นการส่ง Form หรือ JS (ตัวเลือกสุดท้าย)
+                    if not dl_tag:
+                        dl_tag = soup.find("button", string=re.compile(r"ดาวน์โหลด", re.I))
+
+                    # 5. ตรวจสอบและดึงข้อมูล (คงเดิม)
+                    if dl_tag and dl_tag.has_attr('href'):
+                        href = dl_tag['href']
+                        if not BAD_LINK_PATTERN.search(href):
+                            download_url = href if href.startswith('http') else f"{base_url.rstrip('/')}/{href.lstrip('/')}"
+                            print(f"✅ [DeepScan] พบลิงก์สำเร็จสำหรับ ID {t_id}")
+                        else:
+                            print(f"⚠️ [DeepScan] ลิงก์ที่พบติด BAD_LINK_PATTERN: {href}")
+                    else:
+                        # ถ้าไม่เจอให้ Log เช็คหน้า Login อีกครั้ง
+                        content_text = soup.get_text()
+                        if "เข้าสู่ระบบ" in content_text or "Login" in content_text:
+                            print(f"❌ [CRITICAL] บอทถูกส่งไปหน้า Login! Cookie ไม่ทำงาน")
+                        else:
+                            print(f"❌ [DeepScan] ไม่พบปุ่มดาวน์โหลดในหน้า {details_url}")
+                            # เก็บลง Cache เพื่อไม่ให้วนลูป
+                            if checked_cache is not None:
+                                if len(checked_cache) > 5000: # ถ้าเกิน 5,000 รายการ ให้ล้างทิ้งเพื่อประหยัด RAM
+                                    checked_cache.clear()
+                                checked_cache.add(details_url)
+            except Exception as e:
+                print(f"❌ [DeepScan Error] ID {t_id}: {str(e)}")
+    
     return {
-        "id": t_id, "title": title, "seeders": s, "leechers": l,
-        "completed": c, "size_str": t_size_str, "raw_date": raw_date_str,
-        "download_url": download_url, "details_url": details_url
+        "id": t_id, 
+        "title": title, 
+        "seeders": s, 
+        "leechers": l,
+        "completed": c, 
+        "size_str": tds[8].get_text(strip=True) if len(tds) > 8 else "0", 
+        "raw_date": tds[7].get_text(strip=True) if len(tds) > 7 else "N/A",
+        "download_url": download_url, 
+        "details_url": details_url
     }
 
 class ResponseWrapper:
@@ -3407,7 +3446,18 @@ async def sync_hr_with_web(site_key, page, base_url, ctx):
     await page.get(hr_url)
     await asyncio.sleep(2)
     
-    soup = BeautifulSoup(await page.get_content(), 'html.parser')
+    content = await page.get_content()
+    
+    # 1. เช็คพื้นฐาน
+    if not content or len(content) < 500:
+        print(f"❌ [{site_key}] หน้าเว็บว่างเปล่า ข้ามการ Sync")
+        return
+
+    if "myhr" not in content.lower() and "details" not in content.lower():
+        print(f"❌ [{site_key}] โครงสร้างหน้าไม่ถูกต้อง ข้ามการ Sync")
+        return
+    
+    soup = BeautifulSoup(content, 'html.parser')
     db = await async_load_db(site_key)
     rows = soup.find_all('tr')
     print(f"📄 [{site_key}] พบรายการทั้งหมด {len(rows)} รายการ")
@@ -3416,6 +3466,11 @@ async def sync_hr_with_web(site_key, page, base_url, ctx):
     current_ids_on_web = []
     
     # STEP 2: ประมวลผลแต่ละรายการ
+    # ถ้า rows มีน้อยกว่า 3 แสดงว่าหน้าเว็บอาจจะยังโหลดไม่เสร็จหรือมีปัญหา
+    if len(rows) < 3:
+        print(f"⚠️ [{site_key}] พบรายการน้อยผิดปกติ ({len(rows)} รายการ), อาจโหลดข้อมูลไม่ครบ!")
+        return 
+
     for row in rows:
         links = row.find_all('a', href=re.compile(r'details\.php\?id='))
         valid_link = None
@@ -3550,23 +3605,36 @@ async def get_torrent_details_full(page, base_url, details_url, torrent_id):
     return {"hash": real_hash, "name": t_name, "size_gb": t_size_gb, "download_url": download_url}
 
 def extract_torrent_metadata(html_content):
-    soup = BeautifulSoup(html_content, 'html.parser')
+    soup = BeautifulSoup(html_content, 'lxml')
     
-    # 1. ดึงชื่อเรื่อง
-    # จาก HTML ที่ส่งมา ชื่อเรื่องอยู่ใน <h1><u><a...>Title</a></u></h1>
-    title_tag = soup.find('h1').find('a') if soup.find('h1') else None
-    t_name = title_tag.get_text(strip=True) if title_tag else "Unknown Title"
+    t_name = "Unknown Title"
     
-    # 2. ดึงขนาดไฟล์
-    # วิธีคือหา <tr> ที่มีข้อความ 'Size' แล้วดึง <td> ตัวถัดไป
-    size_td = soup.find('td', string=lambda text: text and 'Size' in text)
+    # 1. ค้นหา h1 ทั้งหมด แล้วกรองหาตัวที่มีเนื้อหา (ไม่เอาตัวว่าง)
+    # เราใช้ list comprehension ดึงข้อความของทุก h1 มาดู
+    all_h1 = [h1.get_text(strip=True) for h1 in soup.find_all('h1') if h1.get_text(strip=True)]
+    
+    # ถ้ามี h1 ที่มีข้อความ ให้เลือกตัวแรกที่เจอ (ซึ่งมักจะเป็นชื่อเรื่องหลัก)
+    if all_h1:
+        t_name = all_h1[0]
+    
+    # 2. ถ้ายังไม่ได้ ให้ลองหาจาก <title> tag
+    if t_name == "Unknown Title" and soup.title:
+        # สมมติชื่อเว็บคือ ":: Bearbit" เราตัดทิ้งเพื่อให้เหลือแค่ชื่อหนัง
+        t_name = soup.title.get_text(strip=True).split('::')[0].strip()
+
+    # 3. ดึงขนาดไฟล์ (ใช้ string match ที่แม่นยำขึ้น)
     t_size_gb = 0.0
+    # ใช้ select_one หา td ที่มีคำว่า Size 
+    size_td = soup.find('td', string=lambda text: text and 'Size' in text)
+    
     if size_td:
-        # จะได้รูปแบบ: "393.19 GB (422,182,017,991 bytes)"
-        size_text = size_td.find_next_sibling('td').get_text()
-        match = re.search(r'([\d\.]+)\s*GB', size_text)
-        if match:
-            t_size_gb = float(match.group(1))
+        # ขยับไปช่องข้างๆ
+        sibling = size_td.find_next_sibling('td')
+        if sibling:
+            # ใช้ regex หาเลขหน้าคำว่า GB
+            match = re.search(r'([\d\.]+)\s*GB', sibling.get_text())
+            if match:
+                t_size_gb = float(match.group(1))
             
     return t_name, t_size_gb
 
@@ -3637,32 +3705,56 @@ async def trigger_download_if_needed(t_id, t_name, t_size_gb, details_url, downl
 
         # จัดการส่งเข้า Node
         if download_ready:
-            active_nodes.sort(key=lambda x: x[0].free_gb, reverse=True)
-        
-            for node_obj, n_cfg in active_nodes:
-                torrent_info = node_obj.get_torrent_by_hash(t_hash)
+            print(f"✅ [{site}] พร้อมส่งไฟล์เข้า Client (Hash: {t_hash})")
             
-                if not torrent_info or node_obj.is_torrent_exists(t_hash):
-                    if not torrent_info:
-                        result = safe_add_torrent(node_obj, raw_data_bytes, site)
-                        if result:
-                            print(f"✅ [Success] {node_obj.name} | {t_name[:40]}")
-                            await link_new_torrent(site, t_id, t_hash)
-                            asyncio.create_task(handle_thanks_click(browser_instance, details_url))
-                            
-                            success_node = node_obj
-                            seen_hashes.add(t_hash)
-                            seen_ids.add(t_id)
-                            return True
-                    else:
-                        status = torrent_info.get('status', 'unknown')
-                        if status in ['paused', 'stopped', 'error']:
-                            node_obj.resume_torrent(t_hash)
-                            return True
-                        break # พบแล้วและทำงานอยู่ ไม่ต้องวน Loop ต่อ
+            # เรียงลำดับ Node ตาม Free GB (ดีแล้ว)
+            sorted_nodes = sorted(active_nodes, key=lambda x: x[0].free_gb, reverse=True)
+            
+            task_weight = calculate_task_weight(t_size_gb)
+            success_node = None
         
-            if not success_node and not torrent_info:
-                print(f"❌ [Full/Error] ไม่สามารถส่งไฟล์เข้า Node ได้")
+            for node_obj, n_cfg in sorted_nodes:
+                # ตรวจสอบสถานะโหลดและพื้นที่
+                d_type = n_cfg.get('disk_type', 'HDD')
+                dynamic_max_cap, _ = get_node_dynamic_cap(node_obj, d_type)
+                current_load = round(get_node_current_weight(node_obj), 1)
+
+                if (current_load + task_weight) > dynamic_max_cap:
+                    continue # Node นี้โหลดเต็มแล้ว
+
+                # เช็คพื้นที่และพยายาม Reclaim ถ้าจำเป็น
+                needed_gb = t_size_gb + 15.0
+                effective_free = node_obj.free_gb - node_obj.get_downloading_size()
+                
+                if effective_free < needed_gb:
+                    smart_reclaim_process(node_obj, required_gb=needed_gb, is_emergency=False)
+                    node_obj.refresh_status()
+                    effective_free = node_obj.free_gb - node_obj.get_downloading_size()
+                    if effective_free < (t_size_gb + 5.0): # ยอมลด Buffer ลงนิดหน่อยในกรณีจำเป็น
+                        continue
+
+                # ตรวจสอบซ้ำว่ามีใน Node นี้ไหมก่อน Add
+                torrent_info = node_obj.get_torrent_by_hash(t_hash)
+                
+                if torrent_info:
+                    # ถ้าเจอแล้ว ให้จัดการสถานะและจบการทำงาน
+                    if torrent_info.get('status') in ['paused', 'stopped', 'error']:
+                        node_obj.resume_torrent(t_hash)
+                    print(f"ℹ️ ไฟล์ {t_hash[:8]} มีอยู่แล้วใน {node_obj.name}")
+                    return True 
+                
+                # ถ้าไม่เจอ ให้ Add ใหม่
+                result = safe_add_torrent(node_obj, raw_data_bytes, site)
+                if result:
+                    print(f"✅ [Success] {node_obj.name} | {t_name[:30]}")
+                    await link_new_torrent(site, t_id, t_hash)
+                    asyncio.create_task(handle_thanks_click(browser_instance, details_url))
+                    seen_hashes.add(t_hash)
+                    seen_ids.add(t_id)
+                    return True
+
+            if not success_node:
+                print(f"❌ [Full/Error] ทุก Node ไม่พร้อมรับไฟล์ {t_id}")
                 return False
 
     except Exception as e:
@@ -4355,28 +4447,22 @@ class BrowserSessionWrapper:
         except Exception:
             return []
     class MockResponse:
-                def __init__(self, raw_bytes):
-                    self.content = raw_bytes
-                    self.text = raw_bytes.decode('utf-8', errors='ignore')
-                    self.status_code = 200
+        def __init__(self, raw_bytes):
+            self.content = raw_bytes
+            self.text = raw_bytes.decode('utf-8', errors='ignore')
+            self.status_code = 200
 
     async def get(self, url, headers=None, timeout=15):
         try:
-            if not url:
-                return None
-
             tab = self.browser.main_tab
-        
-            # 1. ใช้ handler ดัก Request ขาออกเพื่อแทรก Headers
-            # วิธีนี้ปลอดภัยที่สุดเพราะไม่ต้องเรียกใช้ cdp.network ที่มีปัญหา
-            async def add_headers(event: uc.cdp.network.RequestWillBeSent):
-                if headers:
-                    event.request.headers.update(headers)
-        
-            # ลงทะเบียน Handler (ทำก่อนสั่ง get)
+            
+            # ลงทะเบียน Handler Headers
+            async def add_headers(event):
+                if headers: event.request.headers.update(headers)
+            
             tab.add_handler(uc.cdp.network.RequestWillBeSent, add_headers)
 
-            # 2. โหลด URL
+            # โหลด URL
             await tab.get(url)
             await tab.wait(timeout)
         
@@ -4387,9 +4473,8 @@ class BrowserSessionWrapper:
                 return None
             
             return self.MockResponse(content.encode('utf-8', errors='ignore'))
-
         except Exception as e:
-            print(f"❌ Error ในการดึงข้อมูล: {e}")
+            print(f"❌ Error: {e}")
             return None
 
 async def safe_timeout(coro, timeout_sec):
@@ -4483,23 +4568,30 @@ async def main():
             # =================================================================
             # 2. BROWSER SECTION (nodriver Implementation)
             # =================================================================
+            
+            if 'site' not in locals():
+                site = "initial_boot"
 
             # ตรวจสอบว่ามี instance หรือไม่ และยังเชื่อมต่ออยู่หรือไม่ (Is connected?)
             is_browser_healthy = False
             if browser_instance is not None:
                 try:
-                    # ใช้การดึงข้อมูลสั้นๆ เพื่อทดสอบว่า Browser ยังตอบสนองไหม
                     await browser_instance.target.get_targets()
                     is_browser_healthy = True
+                
                 except Exception:
                     print("⚠️ ตรวจพบการเชื่อมต่อ Browser ขัดข้อง, กำลังรีเซ็ต...")
-                    browser_instance = None # สั่งรีเซ็ต
+                    browser_instance = None
+                    # รีเซ็ตตัวแปรที่เกี่ยวข้องไปด้วยเพื่อให้มั่นใจว่าต้องสร้างใหม่
+                    site_page = None
+                    dl_session = None
 
             if not is_browser_healthy:
-                print("🌐 กำลังเริ่ม Browser instance ใหม่...")
-                browser_instance = await launch_any_browser(stealth_args)
-                
-                # เมื่อเปลี่ยน Browser ต้องสร้างใหม่ทุกอย่าง
+                # ใช้ค่า site ที่กำหนดไว้แล้ว หากยังไม่มีค่าในลูปให้ใช้ 'system_init'
+                target_site = site if 'site' in locals() else "system_init"
+                print(f"🌐 กำลังเริ่ม Browser instance ใหม่สำหรับ: {target_site}...")
+                browser_instance = await launch_any_browser(target_site, stealth_args)
+    
                 site_page = await browser_instance.get("about:blank", new_tab=True)
                 dl_session = BrowserSessionWrapper(browser_instance)
             
@@ -4940,7 +5032,7 @@ async def main():
                                         # 2. สร้าง Browser ใหม่ (ต้องมั่นใจว่าฟังก์ชันนี้ไม่มีการอ้างอิงของเก่า)
                                         try:
                                             print("🚀 กำลังสร้าง Browser Instance ใหม่...")
-                                            new_browser = await launch_any_browser()
+                                            new_browser = await launch_any_browser(site)
                                             dl_session = BrowserSessionWrapper(new_browser)
                                             consecutive_errors = 0
                                             await asyncio.sleep(10)
