@@ -678,6 +678,12 @@ def create_robust_scraper():
     
     return scraper
     
+class ForcedCloseAdapter(HTTPAdapter):
+    def send(self, request, *args, **kwargs):
+        # บังคับเพิ่ม header Connection: close ทุกครั้งในระดับต่ำสุด
+        request.headers['Connection'] = 'close'
+        return super().send(request, *args, **kwargs)
+
 # ========================= NODE CLASSES =========================
 
 class QbitNode:
@@ -685,123 +691,137 @@ class QbitNode:
         self.name, self.url = cfg["name"], cfg["url"].rstrip("/")
         self.user, self.pw = cfg["qb_user"], cfg["qb_pass"]
         self.quota_gb = cfg.get("quota_gb", 0)
-        self.auth = HTTPBasicAuth(self.user, self.pw) if cfg.get("nginx") else None
+        
+        self.auth = (self.user, self.pw) if cfg.get("nginx") else None
+        
         self.s = requests.Session()
-        self.free_gb = 0
+        self.s.auth = self.auth 
+        
+        # --- แก้ตรงนี้ครับ ---
+        # ต้องใช้ ForcedCloseAdapter แทน HTTPAdapter ปกติ
+        adapter = ForcedCloseAdapter() 
+        self.s.mount('https://', adapter)
+        self.s.mount('http://', adapter)
+        # --------------------
+        
+        self.s.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        })
+        
         self.is_connected = False
         self.jobs = 0
         self.stat_msg = "Active/Total: 0/0"
+    
+    def _execute_request(self, method, url, **kwargs):
+        # 1. จัดการ Headers
+        headers = kwargs.get('headers', {}).copy()
+        headers['Connection'] = 'close'
+        kwargs['headers'] = headers
+        
+        # 2. ยัด auth ลงไปใน kwargs ทุกครั้งถ้ามีตัวตน
+        if self.auth:
+            kwargs['auth'] = self.auth
+            
+        # 3. กำหนดค่าพื้นฐานที่จำเป็น
+        kwargs.setdefault('timeout', 20)
+        kwargs.setdefault('verify', False)
+        
+        try:
+            # ใช้ self.s.request เพื่อรักษา Connection Pool ไว้ที่ 1 ตามที่ mount ไว้
+            return self.s.request(method, url, **kwargs)
+        except Exception as e:
+            print(f"⚠️ [{self.name}] Network Error in {method} {url}: {e}")
+            return None
 
     def login(self):
         try:
-            # 1. ล้างคุกกี้เก่าทิ้งก่อนเริ่มใหม่ เพื่อป้องกัน Session ทับซ้อน
             self.s.cookies.clear()
             
-            # 2. เพิ่ม Header Referer (เวอร์ชัน 5.x.x บางครั้งต้องการเพื่อป้องกัน CSRF)
-            headers = {'Referer': self.url}
-            
-            r = self.s.post(
+            # การล็อกอินเข้า qBittorrent: 
+            # 1. ส่ง auth=self.auth เพื่อผ่านด่าน Nginx Basic Auth
+            # 2. ส่ง data={"username": ..., "password": ...} เพื่อ Login เข้า Web UI
+            r = self._execute_request(
+                'POST',
                 f"{self.url}/api/v2/auth/login", 
                 data={"username": self.user, "password": self.pw}, 
-                headers=headers,
-                auth=self.auth, 
-                verify=False, 
+                headers = {'Referer': self.url, 'Origin': self.url},
                 timeout=10
             )
 
-            # 3. เช็คเงื่อนไขความสำเร็จที่กว้างขึ้น
-            # - 5.1.4 มักตอบ 200 "Ok."
-            # - 5.2.0 มักตอบ 204 (No Content) และไม่มี Text
-            if r.status_code in [200, 204]:
-                # ตรวจสอบคุกกี้แบบเจาะจง (5.2.0 จะส่ง SID หรือ QBT_SID_xxxx)
-                has_cookie = any("SID" in cookie.name for cookie in self.s.cookies)
+            if r is None:
+                self.is_connected = False
+                return False
+
+            # ตรวจสอบสถานะ: qBittorrent ปกติจะตอบ 200
+            if r.status_code == 200:
+                has_sid = any("SID" in cookie.name for cookie in self.s.cookies)
+                is_ok_text = "Ok." in r.text
                 
-                # ถ้ามีคุกกี้ หรือใน r.text มีคำว่า Ok (สำหรับรุ่นเก่า)
-                self.is_connected = has_cookie or "Ok." in r.text
+                self.is_connected = has_sid or is_ok_text
+                
+                if self.is_connected:
+                    print(f"✅ [{self.name}] Login successful! (SID: {has_sid}, Text: {is_ok_text})")
+                else:
+                    print(f"⚠️ [{self.name}] Login accepted but session not found. Response: {r.text[:50]}")
+            
+            elif r.status_code == 403:
+                print(f"❌ [{self.name}] Login failed: 403 Forbidden (Check CSRF/Referer/Origin headers)")
+                self.is_connected = False
+            elif r.status_code == 401:
+                print(f"❌ [{self.name}] Login failed: 401 Unauthorized (Check Username/Password)")
+                self.is_connected = False
             else:
+                print(f"⚠️ [{self.name}] Login failed with unexpected status: {r.status_code}")
                 self.is_connected = False
                 
-            if self.is_connected:
-                print(f" ✅ [{self.name}] Login Success (v{r.status_code})")
             return self.is_connected
 
         except Exception as e:
-            print(f" ⚠️ [{self.name}] Login Error: {e}")
+            print(f" ⚠️ [{self.name}] Login Exception: {e}")
             self.is_connected = False
             return False
 
     def refresh_status(self):
         if not self.is_connected: return False
+        
         try:
-            # 1. ดึงข้อมูลระบบหลัก (Maindata) พร้อมเสริมเกราะ Retry ลูปสั้น
-            r_main = None
-            for attempt in range(3):
-                try:
-                    r_main = self.s.get(f"{self.url}/api/v2/sync/maindata", auth=self.auth, verify=False, timeout=10)
-                    break
-                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-                    if attempt < 2:
-                        time.sleep(1.0)
-                    else:
-                        print(f"⚠️ [{self.name}] อัปเดต Maindata ไม่สำเร็จ (ใช้ค่าสถานะเดิมชั่วคราว)")
-                        return True  # ใช้ค่าเก่าประคองตัวลูปหลัก
-
-            # ตรวจสอบเซสชันหลุด (401/403)
-            if r_main.status_code in [401, 403]:
-                print(f" 🔄 [{self.name}] qBittorrent Session expired ({r_main.status_code}), re-logging in...")
-                if self.login(): return False
+            # 1. ดึงข้อมูล Maindata
+            # ใช้ _execute_request พร้อมระบุ timeout ให้ชัดเจน
+            r_main = self._execute_request('GET', f"{self.url}/api/v2/sync/maindata", timeout=10)
+            
+            if r_main is None or r_main.status_code in [401, 403]:
+                print(f" 🔄 [{self.name}] Session expired or connection failed, re-logging...")
+                return self.login() and self.refresh_status()
 
             try:
                 main_data = r_main.json()
+                server_state = main_data.get('server_state', {})
             except Exception:
-                print(f" ⚠️ [{self.name}] Response is not JSON. Re-logging in...")
-                if self.login(): return False
                 return False
-                
-            server_state = main_data.get('server_state', {})
-            
-            # 2. ดึงลิสต์ทอร์เรนต์ทั้งหมด พร้อมเกราะ Retry ลูปสั้น
-            r_torrents = None
-            for attempt in range(3):
-                try:
-                    r_torrents = self.s.get(f"{self.url}/api/v2/torrents/info", auth=self.auth, verify=False, timeout=10)
-                    break
-                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-                    if attempt < 2:
-                        time.sleep(1.0)
-                    else:
-                        print(f"⚠️ [{self.name}] อัปเดตข้อมูลทอร์เรนต์ไม่สำเร็จ (ใช้ค่าสถานะเดิมชั่วคราว)")
-                        return True
 
-            if r_torrents.status_code in [401, 403]:
-                if self.login(): return False
+            # 2. ดึงลิสต์ทอร์เรนต์ทั้งหมด
+            r_torrents = self._execute_request('GET', f"{self.url}/api/v2/torrents/info", timeout=15)
+            
+            if r_torrents is None or r_torrents.status_code in [401, 403]:
+                return self.login() and self.refresh_status()
 
             try:
                 torrents = r_torrents.json()
             except Exception:
-                if self.login(): return False
                 return False
             
-            # 3. คำนวณข้อมูลในลูปเดียวเพื่อความรวดเร็ว
+            # 3. คำนวณข้อมูล (ลอจิกเดิมของคุณ)
             used_bytes = 0
             active_count = 0
-            
-            # กลุ่มสถานะหยุดนิ่ง/รอคิว (ไม่นับเป็น Active)
-            inactive_states = {
-                'pausedDL', 'pausedUP', 
-                'queuedDL', 'queuedUP', 
-                'checkingResumeData', 
-                'stalledUP'
-            }
+            inactive_states = {'pausedDL', 'pausedUP', 'queuedDL', 'queuedUP', 'checkingResumeData', 'stalledUP'}
+            downloading_states = {'downloading', 'stalledDL', 'metaDL', 'allocating', 'forcedDL'}
             
             for t in torrents:
                 state = t.get('state', '')
                 size = t.get('total_size', t.get('size', 0))
                 completed_bytes = t.get('completed', 0)
                 
-                downloading_states = {'downloading', 'stalledDL', 'metaDL', 'allocating', 'forcedDL'}
-                
-                # คิดขนาดพื้นที่บนดิสก์จริง
+                # คิดขนาดพื้นที่จริง
                 if 'checking' in state.lower():
                     current_on_disk = size
                 elif state in downloading_states:
@@ -810,29 +830,23 @@ class QbitNode:
                     current_on_disk = size
 
                 used_bytes += current_on_disk
-                
-                # นับจำนวน Active Torrent เฉพาะตัวที่กำลังทำงานจริง
                 if state not in inactive_states:
                     active_count += 1
 
-            # แปลงหน่วยเป็น GB
             used_gb = used_bytes / (1024**3)
             safety_buffer = 15.0
 
-            # 4. คำนวณพื้นที่ว่างและการดึงข้อมูล Disk Free ในมาตรฐานเดียวกับ rTorrent (สายซิ่ง ไม่หัก pending ค้าง)
+            # 4. คำนวณพื้นที่ว่าง (ลอจิกเดิม)
             if self.quota_gb > 0:
                 my_quota_free = max(0, self.quota_gb - used_gb)
                 display_free = my_quota_free
-                
-                # 🎯 สูตร Safe เวอร์ชันปลดล็อกความเร็วในการ Racing (หักแค่บัฟเฟอร์ 15GB กันเหนียว)
                 self.free_gb = max(0, my_quota_free - safety_buffer)
             else:
-                # เคสไม่มีโควตา ดึงเนื้อที่ว่างจริงจากตัวเครื่องแม่
                 real_disk_free = server_state.get('free_space_on_disk', 0) / (1024**3)
                 display_free = real_disk_free
                 self.free_gb = max(0, real_disk_free - safety_buffer)
 
-            # 5. ประกอบร่างข้อความแสดงผลใหม่ (Format เดียวกับ rTorrent เป๊ะๆ)
+            # 5. ประกอบร่างข้อความ
             if self.quota_gb > 0:
                 self.stat_msg = f"FREE: {display_free:.1f}GB | A: {active_count} | Used: {used_gb:.1f}G / {self.quota_gb:.0f}G | Safe: {self.free_gb:.1f}G"
             else:
@@ -841,48 +855,50 @@ class QbitNode:
             return True
             
         except Exception as e:
-            print(f"⚠️ [{self.name}] qBittorrent Refresh Status Error: {e}")
+            print(f"⚠️ [{self.name}] qBittorrent Refresh Error: {e}")
             return False
 
     def add(self, content, site_name="Universal", size=None, n_cfg=None):
         try:
             if len(content) < 1000: return False
 
-            # เตรียมไฟล์ในรูปแบบ Multipart
             files = {"torrents": ("f.torrent", content, "application/x-bittorrent")}
-
-            # data สำหรับ API qBittorrent
             data = {
                 "paused": "false",
                 "firstLastPiecePrio": "true",
-                "sequentialDownload": "false", # ปิดไว้เพื่อให้กระจายขอชิ้นส่วนไฟล์พร้อมกัน รีดสปีดเน็ตเวิร์กได้เต็มข้อ
+                "sequentialDownload": "false",
                 "category": site_name,
                 "tags": "AutoPilot",
-                "autoTMM": "false" # บังคับให้ใช้ Path ที่เราคุมเอง (ถ้ามีระบุเพิ่ม)
+                "autoTMM": "false"
             }
 
-            # เพิ่ม Referer ป้องกัน CSRF สำหรับ qBit 5.2.0+
-            headers = {'Referer': self.url}
-
-            r = self.s.post(
+            # ใช้ _execute_request แทน self.s.post
+            # โดยส่ง headers{'Referer': self.url} เข้าไป เดี๋ยว helper จะเติม Connection: close ให้เอง
+            r = self._execute_request(
+                'POST',
                 f"{self.url}/api/v2/torrents/add",
                 files=files,
                 data=data,
-                headers=headers,
+                headers={'Referer': self.url},
                 auth=self.auth,
                 verify=False,
                 timeout=30
             )
 
-            # เช็คความสำเร็จ: 200 คือผ่าน
-            if r.status_code == 200:
+            # ตรวจสอบ Response
+            if r is not None and r.status_code == 200:
                 return True
-            else:
-                # กรณี 401, 403 ให้ลองสั่ง Login ใหม่ทันทีเผื่อ Session หลุด
-                if r.status_code in [401, 403]:
-                    self.login()
-                print(f"⚠️ [API Error] {self.name}: {r.status_code} - {r.text}")
-                return False
+            
+            # กรณี Session หลุดหรือ Error
+            if r is not None and r.status_code in [401, 403]:
+                print(f" 🔄 [{self.name}] Session expired during add(), re-logging...")
+                if self.login():
+                    # ลองใหม่อีกครั้งหลังจาก Login ใหม่สำเร็จ
+                    return self.add(content, site_name, size, n_cfg)
+            
+            error_msg = r.text if r is not None else "No response"
+            print(f"⚠️ [API Error] {self.name}: {r.status_code if r else 'None'} - {error_msg}")
+            return False
 
         except Exception as e:
             print(f"❌ [Exception] {self.name}: {str(e)}")
@@ -890,49 +906,53 @@ class QbitNode:
 
     def get_all_torrents_info(self):
         try:
-            # 🔥 ปลดล็อกฟิลเตอร์จาก 'completed' เป็น 'all' เพื่อดึงข้อมูลครอบคลุมทุกสภาวะดิสก์เอ๋อ
-            r = self.s.get(
+            # 1. ใช้ _execute_request แทน self.s.get เพื่อแก้ปัญหา RemoteDisconnected
+            r = self._execute_request(
+                'GET', 
                 f"{self.url}/api/v2/torrents/info", 
-                params={'filter': 'all'},  # <--- เปลี่ยนเป็น ALL เพื่อกวาดมาให้หมดเกลี้ยงเครื่อง!
+                params={'filter': 'all'}, 
                 auth=self.auth, 
                 verify=False, 
-                timeout=15 
+                timeout=15
             )
-        
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                except:
-                    return []
 
-                data.sort(key=lambda x: x.get('ratio', 0), reverse=True)
+            # 2. ตรวจสอบสถานะการเชื่อมต่อ (ถ้า r เป็น None แสดงว่า Network มีปัญหา)
+            if r is None or r.status_code != 200:
+                if r is not None and r.status_code in [401, 403]:
+                    self.is_connected = False
+                return []
 
-                results = []
-                for t in data:
-                    size_bytes = t.get('total_size', t.get('size', 0))
+            # 3. ประมวลผลข้อมูล JSON
+            try:
+                data = r.json()
+            except Exception:
+                return []
+
+            data.sort(key=lambda x: x.get('ratio', 0), reverse=True)
+
+            results = []
+            for t in data:
+                size_bytes = t.get('total_size', t.get('size', 0))
                 
-                    # แมปปิ้งคีย์สำรองให้ครบถ้วน เพื่อส่งต่อเข้าปากระบบควบคุมพื้นที่ได้แบบไม่มีพลาด
-                    results.append({
-                        'hash': t.get('hash'),
-                        'ratio': t.get('ratio', 0),
-                        'name': t.get('name', 'Unknown'),
-                        'size': size_bytes / (1024**3),
-                        'size_bytes': size_bytes,
-                        'amount_left': t.get('amount_left', t.get('left', -1)),
-                        'progress': t.get('progress', 0.0),
-                        'state': t.get('state', 'unknown'),
-                        'added_on': t.get('added_on'),
-                        'ts_finished': t.get('completion_on', 0), # แมป completion_on ให้ตรง
-                        'ts_init': t.get('added_on', 0),         # qBit ใช้ added_on แทน
-                        'is_rt_complete': t.get('progress', 0) >= 1.0
-                    })
-                return results
+                # แมปปิ้งข้อมูล
+                results.append({
+                    'hash': t.get('hash'),
+                    'ratio': t.get('ratio', 0),
+                    'name': t.get('name', 'Unknown'),
+                    'size': size_bytes / (1024**3),
+                    'size_bytes': size_bytes,
+                    'amount_left': t.get('amount_left', t.get('left', -1)),
+                    'progress': t.get('progress', 0.0),
+                    'state': t.get('state', 'unknown'),
+                    'added_on': t.get('added_on'),
+                    'ts_finished': t.get('completion_on', 0),
+                    'ts_init': t.get('added_on', 0),
+                    'is_rt_complete': t.get('progress', 0) >= 1.0
+                })
+            return results
             
-            elif r.status_code in [401, 403]:
-                self.is_connected = False 
-            
-            return []
         except Exception as e:
+            print(f"⚠️ [{self.name}] Error in get_all_torrents_info: {e}")
             return []
 
     def get_torrent_by_hash(self, t_hash):
@@ -943,204 +963,198 @@ class QbitNode:
         return None
 
     def is_torrent_exists(self, t_hash):
-        if not self.is_connected: self.login()
+        if not self.is_connected and not self.login(): 
+            return False
+            
         try:
-            # ตรวจสอบจาก hash โดยตรงผ่าน API ของ qBittorrent
-            r = self.s.get(f"{self.url}/api/v2/torrents/info", params={'hashes': t_hash}, auth=self.auth, timeout=10)
-            return r.status_code == 200 and len(r.json()) > 0
-        except: return False
-
-    def delete_torrent(self, hash_str):
-        try:
-            self.s.post(f"{self.url}/api/v2/torrents/delete", data={"hashes": hash_str, "deleteFiles": "true"}, auth=self.auth, verify=False, timeout=10)
-            return True
-        except: return False
-
-    def get_downloading_size(self):
-        try:
-            # 1. เพิ่ม auth และ verify เพื่อให้ผ่าน Nginx และ SSL ของ AppBox
-            # 2. ใช้ params เพื่อกรองเฉพาะตัวที่กำลังโหลด (ลดภาระ CPU/Network)
-            r = self.s.get(
+            # ใช้ _execute_request เพื่อให้ผ่านด่าน Nginx และใช้ adapter ที่ถูกต้อง
+            r = self._execute_request(
+                'GET', 
                 f"{self.url}/api/v2/torrents/info", 
-                params={'filter': 'downloading'}, 
-                auth=self.auth, 
-                verify=False, 
+                params={'hashes': t_hash}, 
                 timeout=10
             )
-            
-            if r.status_code == 200:
-                torrents = r.json()
-                # amount_left คือ Bytes ที่เหลือ | size คือขนาดเต็ม (กรณีจองพื้นที่แบบ Pre-allocate)
-                # ในสาย Racing เรามักสน amount_left เพื่อดูว่าดิสก์จะลดลงอีกเท่าไหร่
-                total_left = sum(t.get('amount_left', 0) for t in torrents)
-                
-                # หากต้องการความปลอดภัยสูงสุด (เผื่อกรณีไฟล์ Error แล้วต้องโหลดใหม่ทั้งหมด)
-                # สามารถพิจารณาใช้ t.get('size', 0) แทนได้ในบางกรณี
-                
-                return total_left / (1024**3) # แปลงเป็น GB
-            
-            # กรณี Token หมดอายุ (403) หรือ Error อื่นๆ
-            return 0.0
-        except Exception as e:
-            # print(f" ⚠️ [{self.name}] get_downloading_size error: {e}")
-            return 0.0
-            
-    def get_active_downloads(self):
-        try:
-            if not self.is_connected: self.login()
+            return r is not None and r.status_code == 200 and len(r.json()) > 0
+        except Exception: 
+            return False
 
-            results = []
-            # ใช้การวน Loop ดึงทั้ง downloading และ checking
-            for filter_type in ['downloading', 'checking']:
-                r = self.s.get(f"{self.url}/api/v2/torrents/info", params={'filter': filter_type}, auth=self.auth, verify=False, timeout=10)
-
-                if r.status_code == 200 and r.text:
-                    try:
-                        torrents = r.json()
-                        for t in torrents:
-                            results.append({
-                                'hash': t.get('hash'),
-                                'size_bytes': t.get('size', 0),
-                                'state': t.get('state'),
-                                'amount_left': t.get('amount_left', 0)
-                            })
-                    except:
-                        continue # ถ้า Parse JSON ไม่ได้ให้ข้ามไปก่อน
-                elif r.status_code in [401, 403]:
-                    self.is_connected = False # สั่งให้ Login ใหม่ในรอบหน้า
-
-            return results
-        except Exception as e:
-            self.is_connected = False
-            return []
-
-    def _sweeper_force_start(self):
-        """ระบบกวาดงานค้างอัตโนมัติ"""
-        if not self.is_connected and not self.login():
+    def delete_torrent(self, hash_str):
+        if not self.is_connected and not self.login(): 
             return False
 
         try:
-            # ดึงเฉพาะงานที่ไม่ได้รัน (pausedUP, pausedDL, queuedUP, queuedDL, stalledUP)
-            # เราใช้ filter 'paused' จะครอบคลุมกรณีที่ Client สั่งหยุดคิวไว้
-            r = self.s.get(f"{self.url}/api/v2/torrents/info", params={'filter': 'paused'}, auth=self.auth, verify=False, timeout=10)
+            # ใช้ _execute_request แทนการยิงตรง
+            r = self._execute_request(
+                'POST', 
+                f"{self.url}/api/v2/torrents/delete", 
+                data={"hashes": hash_str, "deleteFiles": "true"}, 
+                timeout=10
+            )
+            return r is not None and r.status_code == 200
+        except Exception: 
+            return False
+
+    def get_downloading_size(self):
+        try:
+            # ใช้ _execute_request แทน self.s.get เพื่อให้ผ่าน Adapter และ Header ที่เราตั้งไว้
+            r = self._execute_request(
+                'GET',
+                f"{self.url}/api/v2/torrents/info", 
+                params={'filter': 'downloading'}, 
+                timeout=10
+            )
             
-            if r.status_code == 200:
+            # ตรวจสอบ r เป็น None หรือ status_code ก่อนประมวลผล
+            if r is not None and r.status_code == 200:
                 torrents = r.json()
-                # กรองเอาเฉพาะ Hash ของงานที่สถานะเป็น 'pausedUP' หรือ 'pausedDL' 
-                # (ถ้างานไหนเราตั้งใจหยุดเอง พี่อาจต้องเช็ค tag เพิ่มเติม)
+                total_left = sum(t.get('amount_left', 0) for t in torrents)
+                return total_left / (1024**3)
+            
+            return 0.0
+        except Exception:
+            return 0.0
+            
+    def get_active_downloads(self):
+        # ไม่จำเป็นต้องสั่ง login() ตรงนี้ ถ้า _execute_request ของคุณจัดการ re-login ให้แล้ว
+        # แต่ถ้าต้องการเช็คก่อนก็ทำได้ครับ
+        
+        results = []
+        # วนลูปดึงข้อมูลด้วย _execute_request
+        for filter_type in ['downloading', 'checking']:
+            try:
+                r = self._execute_request(
+                    'GET', 
+                    f"{self.url}/api/v2/torrents/info", 
+                    params={'filter': filter_type},
+                    timeout=10
+                )
+
+                if r is not None and r.status_code == 200:
+                    torrents = r.json()
+                    for t in torrents:
+                        results.append({
+                            'hash': t.get('hash'),
+                            'size_bytes': t.get('size', 0),
+                            'state': t.get('state'),
+                            'amount_left': t.get('amount_left', 0)
+                        })
+                elif r is not None and r.status_code in [401, 403]:
+                    self.is_connected = False
+                    
+            except Exception:
+                continue # ข้ามกรณีที่ Parse JSON ผิดพลาดหรือ network มีปัญหา
+
+        return results
+
+    def _sweeper_force_start(self):
+        """ระบบกวาดงานค้างอัตโนมัติ"""
+        # _execute_request จะเป็นตัวจัดการการเชื่อมต่อทั้งหมด
+        try:
+            # 1. ดึงข้อมูลงานที่ paused
+            r = self._execute_request(
+                'GET', 
+                f"{self.url}/api/v2/torrents/info", 
+                params={'filter': 'paused'}, 
+                timeout=10
+            )
+            
+            if r is not None and r.status_code == 200:
+                torrents = r.json()
                 hashes_to_resume = [t['hash'] for t in torrents if t.get('state') in ['pausedUP', 'pausedDL', 'queuedUP', 'queuedDL']]
                 
                 if hashes_to_resume:
-                    # สั่ง Resume เป็นชุดเพื่อลดการยิง API ถี่เกินไป
-                    self.s.post(
+                    # 2. สั่ง Resume ผ่าน _execute_request
+                    self._execute_request(
+                        'POST',
                         f"{self.url}/api/v2/torrents/resume", 
-                        data={"hashes": "|".join(hashes_to_resume)}, 
-                        auth=self.auth, headers={'Referer': self.url}, verify=False, timeout=10
+                        data={"hashes": "|".join(hashes_to_resume)},
+                        headers={'Referer': self.url},
+                        timeout=10
                     )
-                    # print(f"🔄 [{self.name}] Sweeper resumed {len(hashes_to_resume)} torrents.")
-        except Exception:
+        except Exception as e:
+            # print(f"⚠️ [{self.name}] Sweeper Error: {e}")
             pass
 
     def reannounce_torrent(self, hash_str):
         """Re-announce เฉพาะ Torrent ที่ระบุ"""
-        if not self.is_connected and not self.login():
-            return False
-        
         try:
-            # ใช้ POST ไปที่ endpoint /torrents/reannounce โดยส่ง hashes ที่ต้องการ
-            r = self.s.post(
+            r = self._execute_request(
+                'POST',
                 f"{self.url}/api/v2/torrents/reannounce",
                 data={"hashes": hash_str},
                 headers={'Referer': self.url},
-                auth=self.auth,
-                verify=False,
                 timeout=10
             )
-            return r.status_code == 200
+            return r is not None and r.status_code == 200
         except Exception as e:
             print(f" ⚠️ [{self.name}] Re-announce Error for {hash_str}: {e}")
             return False
 
     def stop_torrent(self, hash_str):
         """สั่ง Stop (Pause) เฉพาะ Torrent ที่ระบุ"""
-        if not self.is_connected and not self.login():
-            return False
-        
         try:
-            r = self.s.post(
+            r = self._execute_request(
+                'POST',
                 f"{self.url}/api/v2/torrents/pause",
                 data={"hashes": hash_str},
                 headers={'Referer': self.url},
-                auth=self.auth,
-                verify=False,
                 timeout=10
             )
-            return r.status_code == 200
+            return r is not None and r.status_code == 200
         except Exception as e:
             print(f" ⚠️ [{self.name}] Stop Error for {hash_str}: {e}")
             return False
 
     def reannounce_all(self):
         """ สั่ง Re-announce ทุก Torrent (หรือเฉพาะที่กำลังโหลด) """
-        if not self.is_connected and not self.login(): 
-            return False
-            
         try:
-            # เพิ่ม Referer ป้องกัน CSRF สำหรับ 5.2.0+
-            headers = {'Referer': self.url}
-            
-            # การส่ง hashes: all คือวิธีที่เร็วที่สุด แต่ต้องมั่นใจว่า Tracker ไม่แบน
-            r = self.s.post(
+            # ใช้ _execute_request เพื่อรวมมาตรฐานการเชื่อมต่อทั้งหมด
+            # ไม่ต้องใส่ auth, verify หรือ headers ที่ซ้ำซ้อน
+            r = self._execute_request(
+                'POST', 
                 f"{self.url}/api/v2/torrents/reannounce", 
                 data={"hashes": "all"}, 
-                headers=headers,
-                auth=self.auth, 
-                verify=False, 
+                headers={'Referer': self.url},
                 timeout=15
             )
             
-            if r.status_code == 200:
-                # print(f" ✅ [{self.name}] Re-announced all torrents.")
+            if r is not None and r.status_code == 200:
                 return True
-            else:
-                # ถ้าเจอ 403/401 ให้หลุดไป Login ใหม่
-                if r.status_code in [401, 403]:
-                    self.is_connected = False
-                return False
-        except Exception as e:
-            # print(f" ⚠️ [{self.name}] Re-announce Error: {e}")
+            
+            # ตรวจสอบสถานะการเชื่อมต่อหากมีการปฏิเสธสิทธิ์
+            if r is not None and r.status_code in [401, 403]:
+                self.is_connected = False
+                
+            return False
+        except Exception:
             return False
 
     def get_stats_by_site(self):
-        # 1. เช็คการเชื่อมต่อก่อนเริ่ม
-        if not self.is_connected and not self.login(): 
-            return {}
-            
+        """ดึงสถิติแยกตาม Category ของแต่ละเว็บ"""
         try:
-            # 2. เพิ่ม auth และ verify สำหรับ Nginx/SSL
-            r = self.s.get(
-                f"{self.url}/api/v2/torrents/info", 
-                auth=self.auth, 
-                verify=False, 
-                timeout=15 # สถิติรวมอาจใช้เวลาประมวลผลนานกว่าปกติ
+            # ใช้ _execute_request เพื่อรักษา Connection Pool และ Header ที่เรากำหนดไว้
+            r = self._execute_request(
+                'GET',
+                f"{self.url}/api/v2/torrents/info",
+                timeout=15
             )
             
-            if r.status_code != 200:
-                if r.status_code in [401, 403]: self.is_connected = False
+            # ตรวจสอบว่าได้ข้อมูลและสถานะ 200
+            if r is None or r.status_code != 200:
+                if r is not None and r.status_code in [401, 403]:
+                    self.is_connected = False
                 return {}
 
             torrents = r.json()
             site_stats = {}
             
             for t in torrents:
-                # 3. ใช้ Category เป็นตัวแยกชื่อเว็บ (เช่น BEARBIT, TORRENTDD)
-                # ถ้าไม่มี Category ให้ลงถัง "General" หรือ "Unknown"
+                # แยกกลุ่มด้วย Category
                 site = t.get('category') or "Uncategorized"
                 
-                # ดึงค่าความเร็วอัปโหลดปัจจุบัน และยอดอัปโหลดรวม (Bytes)
                 up_speed = t.get('upspeed', 0)
                 total_up = t.get('uploaded', 0)
-                downloaded = t.get('downloaded', 0) # แถม: เก็บยอดดาวน์โหลดไว้ดู Ratio ราย Site ก็ได้
+                downloaded = t.get('downloaded', 0)
 
                 if site not in site_stats:
                     site_stats[site] = {
@@ -1156,8 +1170,7 @@ class QbitNode:
                 site_stats[site]['count'] += 1
                 
             return site_stats
-        except Exception as e:
-            # print(f"⚠️ [{self.name}] Stats Error: {e}")
+        except Exception:
             return {}
 
 class RtorrentNode:
@@ -1182,7 +1195,6 @@ class RtorrentNode:
     def login(self):
         try:
             # 1. ยิงทดสอบด้วยรหัสที่มีอยู่ (เริ่มต้นด้วย BasicAuth)
-            # ใช้ system.listMethods เป็นคำสั่งที่เบาที่สุดในการเช็คสิทธิ์
             r = self.s.post(
                 self.url, 
                 data='<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName></methodCall>', 
@@ -1192,11 +1204,11 @@ class RtorrentNode:
                 verify=False
             )
             
-            # 2. กรณี 401 Unauthorized: เช็คว่าต้องการ Digest หรือไม่
+            # 2. กรณี 401 Unauthorized
             if r.status_code == 401:
                 auth_header = r.headers.get('WWW-Authenticate', '').lower()
                 if 'digest' in auth_header:
-                    # สลับไปใช้ Digest Auth และยิงใหม่
+                    print(f"🔄 [{self.name}] Switching to Digest Auth...")
                     self.auth = HTTPDigestAuth(self.user, self.pw)
                     r = self.s.post(
                         self.url, 
@@ -1206,20 +1218,31 @@ class RtorrentNode:
                         timeout=10,
                         verify=False
                     )
+                else:
+                    print(f"❌ [{self.name}] Login failed: 401 Unauthorized (Basic Auth)")
             
             # 3. ตัดสินผลการเชื่อมต่อ
             if r.status_code == 200:
                 self.is_connected = True
+                print(f"✅ [{self.name}] Login successful!")
                 return True
+            elif r.status_code == 403:
+                print(f"❌ [{self.name}] Login failed: 403 Forbidden (Check permissions/IP whitelist)")
             else:
-                self.is_connected = False
-                # print(f"⚠️ [{self.name}] Login Failed: {r.status_code}")
-                return False
+                print(f"⚠️ [{self.name}] Login failed with status: {r.status_code}")
                 
-        except requests.exceptions.RequestException as e:
             self.is_connected = False
-            # print(f"❌ [{self.name}] Connection Error: {e}")
             return False
+                
+        except requests.exceptions.Timeout:
+            print(f"⏳ [{self.name}] Login failed: Request Timed Out")
+        except requests.exceptions.ConnectionError as e:
+            print(f"❌ [{self.name}] Login failed: Connection Error ({e})")
+        except Exception as e:
+            print(f"❌ [{self.name}] Login Exception: {e}")
+            
+        self.is_connected = False
+        return False
 
     def refresh_status(self):
         if not self.is_connected: return False
@@ -1757,7 +1780,7 @@ class RtorrentNode:
             print(f"❌ [{self.name}] Batch Operation Error: {e}")
             return False
 
-    def stop_torrents(self, target_hashes):
+    def stop_torrent(self, target_hashes):
         """สั่ง Stop งานหลายตัวพร้อมกันผ่าน system.multicall"""
         if not target_hashes: return False
         
@@ -1771,7 +1794,7 @@ class RtorrentNode:
         
         return self._execute_multicall(calls)
 
-    def reannounce_torrents(self, target_hashes):
+    def reannounce_torrent(self, target_hashes):
         """สั่ง Re-announce งานเฉพาะกลุ่มผ่าน system.multicall"""
         if not target_hashes: return False
         
