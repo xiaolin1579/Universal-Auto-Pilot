@@ -1041,6 +1041,45 @@ class QbitNode:
         except Exception:
             pass
 
+    def reannounce_torrent(self, hash_str):
+        """Re-announce เฉพาะ Torrent ที่ระบุ"""
+        if not self.is_connected and not self.login():
+            return False
+        
+        try:
+            # ใช้ POST ไปที่ endpoint /torrents/reannounce โดยส่ง hashes ที่ต้องการ
+            r = self.s.post(
+                f"{self.url}/api/v2/torrents/reannounce",
+                data={"hashes": hash_str},
+                headers={'Referer': self.url},
+                auth=self.auth,
+                verify=False,
+                timeout=10
+            )
+            return r.status_code == 200
+        except Exception as e:
+            print(f" ⚠️ [{self.name}] Re-announce Error for {hash_str}: {e}")
+            return False
+
+    def stop_torrent(self, hash_str):
+        """สั่ง Stop (Pause) เฉพาะ Torrent ที่ระบุ"""
+        if not self.is_connected and not self.login():
+            return False
+        
+        try:
+            r = self.s.post(
+                f"{self.url}/api/v2/torrents/pause",
+                data={"hashes": hash_str},
+                headers={'Referer': self.url},
+                auth=self.auth,
+                verify=False,
+                timeout=10
+            )
+            return r.status_code == 200
+        except Exception as e:
+            print(f" ⚠️ [{self.name}] Stop Error for {hash_str}: {e}")
+            return False
+
     def reannounce_all(self):
         """ สั่ง Re-announce ทุก Torrent (หรือเฉพาะที่กำลังโหลด) """
         if not self.is_connected and not self.login(): 
@@ -1692,6 +1731,59 @@ class RtorrentNode:
             print(f"❌ [{self.name}] Delete Error: {e}")
             return False
 
+    def _execute_multicall(self, calls):
+        """ตัวกลางส่งคำสั่งแบบ Batch (system.multicall)"""
+        # สร้างส่วนของ array ของคำสั่ง
+        data_parts = []
+        for call in calls:
+            data_parts.append(f'''
+                <value><struct>
+                    <member><name>methodName</name><value><string>{call['methodName']}</string></value></member>
+                    <member><name>params</name><value><array><data>
+                        <value><string>{call['params'][0]}</string></value>
+                    </data></array></value></member>
+                </struct></value>''')
+        
+        xml = f'''<?xml version="1.0"?>
+        <methodCall>
+            <methodName>system.multicall</methodName>
+            <params><param><value><array><data>{"".join(data_parts)}</data></array></value></param></params>
+        </methodCall>'''
+        
+        try:
+            r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, verify=False, timeout=10)
+            return r.status_code == 200
+        except Exception as e:
+            print(f"❌ [{self.name}] Batch Operation Error: {e}")
+            return False
+
+    def stop_torrents(self, target_hashes):
+        """สั่ง Stop งานหลายตัวพร้อมกันผ่าน system.multicall"""
+        if not target_hashes: return False
+        
+        # สร้างรายการคำสั่ง stop สำหรับทุก hash
+        calls = []
+        for t_hash in target_hashes:
+            calls.append({
+                "methodName": "d.stop",
+                "params": [t_hash]
+            })
+        
+        return self._execute_multicall(calls)
+
+    def reannounce_torrents(self, target_hashes):
+        """สั่ง Re-announce งานเฉพาะกลุ่มผ่าน system.multicall"""
+        if not target_hashes: return False
+        
+        calls = []
+        for t_hash in target_hashes:
+            calls.append({
+                "methodName": "d.tracker_announce",
+                "params": [t_hash]
+            })
+            
+        return self._execute_multicall(calls)
+
     def reannounce_all(self):
         if not self.is_connected and not self.login(): return False
         try:
@@ -1798,6 +1890,8 @@ def safe_add_torrent(node, content, site):
 # ========================= AUTO CLEAN =========================
 
 class NodeCleaner:
+    _PROTECTED_CACHE_STORAGE = None
+
     def __init__(self, node_obj, node_clean_cfg, global_clean_cfg):
         self.node = node_obj
         self.node_cfg = node_clean_cfg or {}
@@ -1805,15 +1899,35 @@ class NodeCleaner:
         self.site_key = getattr(self.node, 'site_key', 'UNKNOWN')
         self._db_cache = None
 
+    @classmethod
+    def get_global_protected_set(cls):
+        """โหลดและแคชข้อมูล Hash ในระดับ Class"""
+        if cls._PROTECTED_CACHE_STORAGE is None:
+            all_dbs = load_all_db() 
+            cls._PROTECTED_CACHE_STORAGE = set()
+            for db_data in all_dbs.values():
+                for data in db_data.values():
+                    if data.get("status") == "PROTECTED":
+                        h = data.get("hash")
+                        if h:
+                            cls._PROTECTED_CACHE_STORAGE.add(h.lower())
+        return cls._PROTECTED_CACHE_STORAGE
+
+    @classmethod
+    def clear_cache(cls):
+        """ล้าง Cache เมื่อมีการอัปเดต DB"""
+        cls._PROTECTED_CACHE_STORAGE = None
+
     def check_torrent_permission(self, t_hash):
-        """
-        ตรวจสอบสถานะแบบ Global (ใช้ Cache เดียวทั้งระบบ)
-        """
-        # 1. เช็คจาก Registry รวมที่โหลดมาแล้ว
-        all_dbs = get_global_protected_set_full() # ฟังก์ชันนี้ควรเรียก load_all_db() และเก็บลง Global
+        # ใช้ Method ของคลาสในการดึงข้อมูล
+        protected_hashes = self.get_global_protected_set()
         
-        # ตรวจสอบว่า Hash นี้มีข้อมูลในไซต์ของตัวเองหรือไม่
-        site_data = all_dbs.get(self.site_key, {})
+        # ตรวจสอบว่า Hash อยู่ในกลุ่ม Protected หรือไม่
+        if t_hash.lower() in protected_hashes:
+            return "PROTECTED"
+            
+        # ตรวจสอบสถานะใน DB ของตัวเอง
+        site_data = load_db(self.site_key)
         for data in site_data.values():
             if data.get("hash", "").lower() == t_hash.lower():
                 return data.get("status", "NOT_FOUND")
@@ -1821,10 +1935,9 @@ class NodeCleaner:
         return "NOT_FOUND"
 
     def _update_db_status(self, t_hash, new_status):
-        """อัปเดตสถานะในไฟล์เฉพาะไซต์ และล้าง Cache Global"""
         db = load_db(self.site_key)
         updated = False
-        for tid, data in db.items():
+        for data in db.values():
             if data.get("hash", "").lower() == t_hash.lower():
                 data["status"] = new_status
                 data["deleted_at"] = get_now().strftime("%Y-%m-%d %H:%M")
@@ -1833,9 +1946,8 @@ class NodeCleaner:
         
         if updated:
             save_db(self.site_key, db)
-            # สำคัญ: ต้องเคลียร์ Cache Global เพื่อให้รอบถัดไปโหลดข้อมูลใหม่
-            global GLOBAL_CACHE
-            GLOBAL_CACHE = None
+            # เรียกใช้ Class Method เพื่อเคลียร์ Cache
+            NodeCleaner.clear_cache()
 
     def _get_node_free_gb(self):
         try:
@@ -1844,35 +1956,48 @@ class NodeCleaner:
         except Exception:
             return 100.0
 
-    def _hard_purge_sequence(self, t_hash, node_type):
+    def _hard_purge_sequence(self, t_hash):
+        """
+        ระบบล้างไฟล์แบบ Hard Purge: ตรวจสอบสิทธิ์ -> เตรียมตัว -> ลบจริง
+        รองรับทุกโหนดโดยไม่ต้องเช็ค node_type (อาศัย Polymorphism)
+        """
         status = self.check_torrent_permission(t_hash)
 
-        # ปรับตรรกะ: อนุญาตให้ลบได้ถ้าสถานะเป็น COMPLETED หรือ NOT_FOUND
+        # 1. ตรวจสอบสถานะก่อนลบ
         if status not in ["COMPLETED", "NOT_FOUND"]:
             print(f"🔒 [GUARD] ปฏิเสธการลบ: สถานะคือ {status} - {t_hash}")
             return False
         
-        # กรณีที่เป็น NOT_FOUND อาจจะบันทึก Log เตือนไว้เล็กน้อย
         if status == "NOT_FOUND":
             print(f"⚠️ [GUARD] ล้างไฟล์ที่ไม่อยู่ใน DB (NOT_FOUND): {t_hash}")
 
         try:
-            # ทำการลบผ่าน API (qBit/rTorrent)
-            success = False
-            if node_type == "qbit":
-                # เพิ่ม delete_files=True ในเมธอดลบของคุณ
-                success = self.node.delete_torrent(t_hash)
-            elif node_type == "rtorrent":
-                success = self.node.delete_torrent(t_hash)
+            # 2. ขั้นตอนการเตรียมตัว (Sequence)
+            # เราใช้ self.node เรียก Method ตรงๆ โดยไม่ต้องเช็ค if node_type
+            # เพื่อให้โค้ดนี้ทำงานได้ ออบเจกต์ใน self.node ต้องมีเมธอดเหล่านี้เตรียมไว้
+            print(f"🔄 [PURGE] กำลังทำ Sequence ลบสำหรับ: {t_hash}")
+            
+            self.node.reannounce_torrent(t_hash)
+            self.node.stop_torrent(t_hash)
+            
+            # 3. ลบจริง
+            success = self.node.delete_torrent(t_hash)
 
             if success:
-                # อัปเดตสถานะใน DB เป็น DELETED
                 self._update_db_status(t_hash, "DELETED")
+                print(f"✅ [PURGE] ลบสำเร็จ: {t_hash}")
                 return True
+            else:
+                print(f"❌ [PURGE] ลบผ่าน API ไม่สำเร็จ: {t_hash}")
+                return False
                 
+        except AttributeError as e:
+            # ดักกรณีที่ Node นั้นไม่มีเมธอดที่เรียกใช้ (เผื่อลืม Implement)
+            print(f"⚠️ [NODE ERROR] Node นี้ไม่มีฟังก์ชันที่จำเป็น: {e}")
+            return False
         except Exception as e:
             print(f"⚠️ [{self.node.name}] ผิดพลาดในขั้นตอน Hard Purge: {e}")
-        return False
+            return False
 
     def process(self, force_emergency=False):
         # 1. เช็คสถานะการเปิดใช้งาน
@@ -2003,7 +2128,7 @@ class NodeCleaner:
                 if remove_check:
                     reason_key, header_msg = remove_check
                     
-                    if self._hard_purge_sequence(t['hash'], node_type="qbit"):
+                    if self._hard_purge_sequence(t['hash']):
                         raw_name = t.get('name', 'Unknown')
                         name_safeguard = raw_name[:27] + "..." if len(raw_name) > 27 else raw_name
                         # 🛠️ [FIX]: ลบอิโมจิ 💤 ตรงนี้ออก ให้เหลือข้อมูลรายชื่อเพียว ๆ
@@ -2090,7 +2215,7 @@ class NodeCleaner:
                 if remove_check:
                     reason_key, header_msg = remove_check
                     
-                    if self._hard_purge_sequence(t_hash, node_type="rtorrent"):
+                    if self._hard_purge_sequence(t_hash):
                         name_safeguard = t_name[:27] + "..." if len(t_name) > 27 else t_name
                         # 🛠️ [FIX]: ลบอิโมจิ 🧹 ตรงนี้ออก ให้ส่งกลับแค่สายอักขระข้อมูลดิบ
                         line = f"{name_safeguard} (R:{ratio:.2f}, {age_hours:.1f}h)"
@@ -2129,81 +2254,6 @@ def get_global_protected_hashes():
                 if h:
                     global_set.add(h.lower())
     return global_set
-
-def _bulk_delete_qbit(node, target_hashes):
-    """ 
-    ส่งคำสั่งลบแบบ Batch ของ qBittorrent ระดับ Hardened 
-    🔥 ลอจิก 3 สเต็ป: Re-announce -> Pause -> Bulk Delete
-    """
-    try:
-        # 1. Update Tracker (Re-announce) พร้อมกันทุกตัว
-        node.s.post(f"{node.url}/api/v2/torrents/reannounce", data={"hashes": "|".join(target_hashes)}, auth=node.auth, verify=False, timeout=5)
-        time.sleep(0.5) # รอเน็ตเวิร์กเคลียร์แพ็กเก็ต
-        
-        # 2. สั่งเบรกงานทั้งหมด (Pause) เพื่อคลาย File Handle Lock จาก SSD
-        node.s.post(f"{node.url}/api/v2/torrents/pause", data={"hashes": "|".join(target_hashes)}, auth=node.auth, verify=False, timeout=5)
-        time.sleep(0.5) # รอ Engine สั่งเคลียร์ RAM Cache ลงระบบดิสก์
-        
-        # 3. ยิงคำสั่งสังหารตัวงานพร้อมทลายเนื้อไฟล์จริงทิ้งในครั้งเดียว
-        url = f"{node.url}/api/v2/torrents/delete"
-        r = node.s.post(url, data={"hashes": "|".join(target_hashes), "deleteFiles": "true"}, auth=node.auth, timeout=15, verify=False)
-        return r.status_code == 200
-    except Exception as e:
-        print(f"❌ Bulk Delete qBit Error: {e}")
-        return False
-
-def _bulk_delete_rtorrent(node, target_hashes):
-    """ 
-    ห่อหุ้มคำสั่งลบส่งแบบ XML-RPC ระดับ Hardened สำหรับ rTorrent 
-    🔥 ลอจิก 3 สเต็ป: d.tracker_announce -> d.stop -> d.erase_data (ยิงคอมโบมัลติคอล)
-    """
-    try:
-        # สเต็ปที่ 1: สั่ง Re-announce แทร็กเกอร์พร้อมกันเพื่อบันทึกสถิติรอบสุดท้าย
-        xml_announce_parts = ['<?xml version="1.0"?><methodCall><methodName>system.multicall</methodName><params><param><value><array><data>']
-        for h in target_hashes:
-            xml_announce_parts.append(
-                f'<value><struct>'
-                f'<member><name>methodName</name><value><string>d.tracker_announce</string></value></member>'
-                f'<member><name>params</name><value><array><data><value><string>{h}</string></value></data></array></value></member>'
-                f'</struct></value>'
-            )
-        xml_announce_parts.append('</data></array></value></param></params></methodCall>')
-        node.s.post(node.url, data="".join(xml_announce_parts), auth=node.auth, headers={"Connection": "close", "Content-Type": "text/xml"}, verify=False, timeout=10)
-        time.sleep(0.5)
-
-        # สเต็ปที่ 2: สั่งหยุดงาน (d.stop) ทั้งหมด เพื่อตัด File Lock จาก Engine บอร์ดแชร์
-        xml_stop_parts = ['<?xml version="1.0"?><methodCall><methodName>system.multicall</methodName><params><param><value><array><data>']
-        for h in target_hashes:
-            xml_stop_parts.append(
-                f'<value><struct>'
-                f'<member><name>methodName</name><value><string>d.stop</string></value></member>'
-                f'<member><name>params</name><value><array><data><value><string>{h}</string></value></data></array></value></member>'
-                f'</struct></value>'
-            )
-        xml_stop_parts.append('</data></array></value></param></params></methodCall>')
-        node.s.post(node.url, data="".join(xml_stop_parts), auth=node.auth, headers={"Connection": "close", "Content-Type": "text/xml"}, verify=False, timeout=10)
-        time.sleep(0.5)
-
-        # สเต็ปที่ 3: สั่งกวาดล้างไฟล์จาก storage จริงทั้งหมด (d.erase_data) คืนพื้นที่ 100%
-        xml_delete_parts = ['<?xml version="1.0"?><methodCall><methodName>system.multicall</methodName><params><param><value><array><data>']
-        for h in target_hashes:
-            xml_delete_parts.append(
-                f'<value><struct>'
-                f'<member><name>methodName</name><value><string>d.erase_data</string></value></member>'
-                f'<member><name>params</name><value><array><data><value><string>{h}</string></value></data></array></value></member>'
-                f'</struct></value>'
-            )
-        xml_delete_parts.append('</data></array></value></param></params></methodCall>')
-        
-        req_headers = getattr(node, 'headers', {}).copy()
-        req_headers["Connection"] = "close"
-        req_headers["Content-Type"] = "text/xml"
-        
-        r = node.s.post(node.url, data="".join(xml_delete_parts), auth=node.auth, headers=req_headers, verify=False, timeout=15)
-        return r.status_code == 200
-    except Exception as e:
-        print(f"❌ Bulk Delete rTorrent Error: {e}")
-        return False
 
 def smart_reclaim_process(node, required_gb, is_emergency=False):
     """
@@ -2266,23 +2316,36 @@ def smart_reclaim_process(node, required_gb, is_emergency=False):
             return False
 
         # --- [🚀 EXECUTION PHASE] ---
+        # เรียงลำดับงานที่จะลบ (เน้นลบไฟล์ใหญ่ก่อน)
         scannable_torrents.sort(key=lambda x: (-x['_calculated_size_gb'], x['_calculated_ratio']))
         
-        target_hashes = [t['hash'] for t in scannable_torrents[:15 if is_emergency else 6]]
+        # เลือกจำนวนงานที่ต้องการลบ (เช่น ไม่เกิน 15 งานถ้าฉุกเฉิน)
+        targets = scannable_torrents[:15 if is_emergency else 6]
         
-        # เรียกใช้ Method ลบภายใน Node (ให้แต่ละ Node จัดการ Bulk Delete เอง)
-        if hasattr(node, 'bulk_delete'):
-            bulk_success = node.bulk_delete(target_hashes)
-        else:
-            # Fallback หากไม่ได้เขียน method bulk_delete ไว้ใน class
-            bulk_success = False 
+        reclaim_count = 0
+        for t in targets:
+            t_hash = t['hash']
+            try:
+                print(f"🔄 [RECLAIM] กำลังลบ: {t.get('name', 'Unknown')} | Hash: {t_hash}")
+                
+                # ทำตาม Sequence ใหม่: Re-announce -> Stop -> Delete
+                node.reannounce_torrent(t_hash)
+                node.stop_torrent(t_hash)
+                success = node.delete_torrent(t_hash)
+                
+                if success:
+                    reclaim_count += 1
+                    # อัปเดตสถานะใน DB ถ้ามีระบบนี้อยู่
+                    if hasattr(self, '_update_db_status'):
+                        self._update_db_status(t_hash, "DELETED")
+                else:
+                    print(f"⚠️ [RECLAIM] ลบไม่สำเร็จ (API Error): {t_hash}")
+                    
+            except Exception as e:
+                print(f"❌ [RECLAIM] Error ลบรายตัว {t_hash}: {e}")
+                continue
 
-        if bulk_success:
-            print(f"🧹 [{node.name}] ล้างข้อมูลสำเร็จ")
-            # แจ้งเตือน...
-            return True
-        
-        return False
+        return reclaim_count > 0
 
     except Exception as e:
         print(f"❌ Critical Reclaim Error: {e}")
