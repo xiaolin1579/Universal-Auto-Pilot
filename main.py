@@ -3676,7 +3676,6 @@ async def trigger_download_if_needed(t_id, t_name, t_size_gb, details_url, downl
                 result = safe_add_torrent(node_obj, raw_data_bytes, site)
                 if result:
                     print(f"✅ [Success] {node_obj.name} | {t_name[:30]}")
-                    await link_new_torrent(site, t_id, t_hash)
                     asyncio.create_task(handle_thanks_click(browser_instance, details_url))
                     seen_hashes.add(t_hash)
                     seen_ids.add(t_id)
@@ -4339,32 +4338,6 @@ def is_cloudflare(soup):
             
     return False
 
-async def link_new_torrent(site_key, torrent_id, torrent_hash):
-    """
-    ผูก Hash และสร้างรายการใหม่หากไม่มีในฐานข้อมูล
-    """
-    try:
-        db = await async_load_db(site_key)
-        
-        # ปรับปรุง: ถ้าไม่มี ID ใน DB ให้สร้างรายการใหม่ทันที
-        if torrent_id not in db:
-            db[torrent_id] = {
-                "hash": torrent_hash,
-                "added_at": get_now().strftime("%Y-%m-%d %H:%M"),
-                "status": "PROTECTED"
-            }
-            print(f"➕ [{site_key}] สร้างรายการใหม่: ID:{torrent_id} | Hash:{torrent_hash[:8]}...")
-        else:
-            # กรณีมีอยู่แล้ว อัปเดตเฉพาะ hash
-            db[torrent_id]["hash"] = torrent_hash
-        
-        await async_save_db(site_key, db)
-        return torrent_id
-            
-    except Exception as e:
-        print(f"⚠️ [Link Error] {site_key}: {e}")
-        return None
-
 class BrowserSessionWrapper:
     def __init__(self, browser_instance):
         self.browser = browser_instance
@@ -4894,8 +4867,6 @@ async def main():
                                                             success_msg = f"📥 [Success] {node_obj.name} | {t_size_gb:.1f}GB | {t_name[:40]}"
                                                             print(success_msg)
                                                             
-                                                            await link_new_torrent(site_key=site, torrent_id=t_id, torrent_hash=t_hash)
-
                                                             # อัปเดตสถานะ Node
                                                             node_obj.free_gb = max(0.0, node_obj.free_gb - (t_size_gb + 0.1))
                                                             added_in_zone.append(success_msg)
