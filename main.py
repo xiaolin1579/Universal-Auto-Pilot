@@ -752,8 +752,8 @@ class QbitNode:
                 self.is_connected = False
                 return False
 
-            # ตรวจสอบสถานะ: qBittorrent ปกติจะตอบ 200
-            if r.status_code == 200:
+            # ตรวจสอบสถานะ: qBittorrent ปกติจะตอบ 200 หรือ 204
+            if r.status_code in [200, 204]:
                 has_sid = any("SID" in cookie.name for cookie in self.s.cookies)
                 is_ok_text = "Ok." in r.text
                 
@@ -3393,8 +3393,9 @@ async def sync_hr_with_web(site_key, page, base_url, ctx):
     stats = {"total": 0, "scanned": 0, "warning": 0, "completed": 0}
     current_ids_on_web = []
     
-    # STEP 2 & 3: ประมวลผลและอัปเดตสถานะ
+    # STEP 2 : ประมวลผลและอัปเดตสถานะ
     for row in rows:
+        meta = {}
         stats["total"] += 1  # นับ Total ทันทีที่พบ
         
         links = row.find_all('a', href=re.compile(r'details\.php\?id='))
@@ -3408,7 +3409,7 @@ async def sync_hr_with_web(site_key, page, base_url, ctx):
         if hr_status in ['warning', 'danger']:
             stats["warning"] += 1
 
-        # 1. การลงทะเบียนรายการใหม่
+        # การลงทะเบียนรายการใหม่
         if torrent_id not in db:
             db[torrent_id] = {"status": "PROTECTED", "hash": "UNKNOWN", "hr_status": hr_status, "added_at": get_now().strftime("%Y-%m-%d %H:%M"), "retry_count": 0}
             await async_save_db(site_key, db)
@@ -3416,58 +3417,68 @@ async def sync_hr_with_web(site_key, page, base_url, ctx):
         tid_info = db[torrent_id]
         tid_info["hr_status"] = hr_status # อัปเดตสถานะล่าสุดเสมอ
 
-        # 3. ตรวจสอบสถานะการทำงาน
-        if tid_info.get("status") in ["COMPLETED", "PROCESSING", "PROTECTED"]:
-            continue 
-
-        needs_deep_scan = (tid_info.get("hash") == "UNKNOWN") or (hr_status in ['warning', 'danger'])
+        # STEP 3: ตรวจสอบสถานะการทำงาน (ปรับปรุง)
+        # 1. ถ้า COMPLETED แล้ว ข้ามทันที
+        if tid_info.get("status") == "COMPLETED":
+            continue
+    
+        # 2. คำนวณความจำเป็นในการ Deep Scan
+        is_unknown_hash = (tid_info.get("hash") == "UNKNOWN")
+        needs_deep_scan = is_unknown_hash or (hr_status in ['warning', 'danger'])
+    
+        # 3. ถ้าเป็น PROTECTED แต่ไม่ได้ต้องการ Deep Scan ให้ข้าม
+        if tid_info.get("status") == "PROTECTED" and not needs_deep_scan:
+            continue
         
-        if needs_deep_scan:
-            stats["scanned"] += 1 # นับรายการที่ต้องสแกน
-            meta = {} 
-            new_tab = None
-
-            # --- PHASE 1: กู้คืน Hash ---
-            if tid_info.get("hash") == "UNKNOWN":
-                new_tab = await page.browser.get("about:blank", new_tab=True)
-                try:
-                    details_url = f"{base_url.rstrip('/')}/details.php?id={torrent_id}"
-                    meta = await get_torrent_details_full(new_tab, base_url, details_url, torrent_id)
-                    if meta.get('hash') and meta['hash'] != "UNKNOWN":
-                        tid_info["hash"] = meta['hash'].lower()
-                        await async_save_db(site_key, db)
-                    else:
-                        tid_info["status"] = "ERROR"
-                        continue 
-                finally:
-                    if new_tab: await new_tab.close()
-            
-            # --- PHASE 2: ตรวจสอบความซ้ำซ้อน ---
-            hash_val = tid_info.get("hash")
-            if any(node_obj.is_torrent_exists(hash_val) for node_obj, _ in ctx.active_nodes):
-                tid_info.update({"status": "PROTECTED"})
-                await async_save_db(site_key, db)
-                continue
-
-            # --- PHASE 3: ดาวน์โหลด ---
-            # ดึง meta ให้มั่นใจว่ามีข้อมูลก่อนรัน
-            if not meta.get('download_url'):
+        # 4. หากผ่านจุดนี้ แสดงว่าต้องสแกนแน่นอน
+        stats["scanned"] += 1 
+    
+        # --- PHASE 1: กู้คืน Hash ---
+        if is_unknown_hash:
+            new_tab = await page.browser.get("about:blank", new_tab=True)
+            try:
                 details_url = f"{base_url.rstrip('/')}/details.php?id={torrent_id}"
-                meta = await get_torrent_details_full(page, base_url, details_url, torrent_id)
-
-            success = await trigger_download_if_needed(
-                torrent_id, meta.get('name'), meta.get('size_gb'), 
-                details_url, meta.get('download_url'), site_key, 
-                ctx.dl_session, page, ctx.active_nodes, ctx.seen_hashes, 
-                ctx.seen_ids, force_download=(hr_status == 'danger')
-            )
-            
-            if success:
-                tid_info.update({"status": "PROTECTED", "retry_count": 0})
-            else:
-                tid_info.update({"status": "ERROR", "retry_count": tid_info.get("retry_count", 0) + 1})
-            
+                meta = await get_torrent_details_full(new_tab, base_url, details_url, torrent_id)
+                if meta.get('hash') and meta['hash'] != "UNKNOWN":
+                    tid_info["hash"] = meta['hash'].lower()
+                    await async_save_db(site_key, db)
+                else:
+                    tid_info["status"] = "ERROR"
+                    continue # ข้ามไปยังรายการถัดไปถ้าหา Hash ไม่ได้
+            finally:
+                if new_tab: await new_tab.close()
+    
+        # --- PHASE 2: ตรวจสอบความซ้ำซ้อน ---
+        hash_val = tid_info.get("hash")
+        if any(node_obj.is_torrent_exists(hash_val) for node_obj, _ in ctx.active_nodes):
+            tid_info.update({"status": "PROTECTED"})
             await async_save_db(site_key, db)
+            continue
+
+        # --- PHASE 3: ดาวน์โหลด ---
+        # ถ้า meta ยังไม่มีข้อมูล (เช่น ไม่ได้ผ่านการกู้คืน Hash มา) ให้ดึงข้อมูลรายละเอียดใหม่
+        if not meta.get('download_url'):
+            details_url = f"{base_url.rstrip('/')}/details.php?id={torrent_id}"
+            meta = await get_torrent_details_full(page, base_url, details_url, torrent_id)
+            
+        # ตรวจสอบอีกครั้งว่าได้ meta มาจริงๆ ก่อนเรียกดาวน์โหลด
+        if not meta.get('download_url'):
+            print(f"❌ [{site_key}] ID {torrent_id}: ไม่สามารถดึง Download URL ได้")
+            continue
+
+        success = await trigger_download_if_needed(
+            torrent_id, meta.get('name'), meta.get('size_gb'), 
+            details_url, meta.get('download_url'), site_key, 
+            ctx.dl_session, page, ctx.active_nodes, ctx.seen_hashes, 
+            ctx.seen_ids, force_download=(hr_status == 'danger')
+        )
+    
+        if success:
+            tid_info.update({"status": "PROTECTED", "retry_count": 0})
+        else:
+            tid_info.update({"status": "ERROR", "retry_count": tid_info.get("retry_count", 0) + 1})
+    
+        await async_save_db(site_key, db)
         
         if torrent_id in db:
             db[torrent_id]["hr_status"] = hr_status
