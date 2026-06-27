@@ -2359,8 +2359,8 @@ def smart_reclaim_process(node, required_gb, is_emergency=False):
                 if success:
                     reclaim_count += 1
                     # อัปเดตสถานะใน DB ถ้ามีระบบนี้อยู่
-                    if hasattr(self, '_update_db_status'):
-                        self._update_db_status(t_hash, "DELETED")
+                    if hasattr(node, '_update_db_status'):
+                        node._update_db_status(t_hash, "DELETED")
                 else:
                     print(f"⚠️ [RECLAIM] ลบไม่สำเร็จ (API Error): {t_hash}")
                     
