@@ -24,17 +24,9 @@ echo "📥 Checking/Installing dependencies..."
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# 4. ติดตั้ง/ตรวจสอบ Playwright Browsers
-# เช็คว่ามี browser หรือยัง ถ้าไม่มีให้ติดตั้ง
-if [ ! -d "$HOME/.cache/ms-playwright" ]; then
-    echo "🌐 Installing Playwright browsers (Chromium)..."
-    playwright install chromium
-    playwright install-deps chromium
-fi
-
 echo "✅ Environment is ready!"
 echo "----------------------------------------"
 
-# 5. รันสคริปต์ Python
+# 4. รันสคริปต์ Python
 # ใช้ python3 (ที่อยู่ใน venv) รัน
 python3 -u "$PYTHON_FILE" 2>&1 | tee -a "$LOG_FILE"

@@ -25,9 +25,6 @@ echo 📥 Installing Libraries...
 %PYTHON_EXE% -m pip install --upgrade pip
 %PYTHON_EXE% -m pip install -r requirements.txt
 
-echo 🌐 Installing Playwright Browser...
-%PYTHON_EXE% -m playwright install chromium
-
 echo ----------------------------------------
 echo 📝 Running %PYTHON_FILE%...
 
