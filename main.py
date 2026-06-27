@@ -2026,13 +2026,12 @@ class NodeCleaner:
         # 1. เช็คสถานะการเปิดใช้งาน
         node_enable = self.node_cfg.get('enable', self.node_cfg.get('ENABLE', None))
         global_enable = self.global_cfg.get('enable', self.global_cfg.get('ENABLE', False))
-        # ตรรกะ: ถ้า node_enable เป็น True -> เปิด ถ้า node_enable เป็น False หรือ None -> ใช้ค่า global_enable
         is_enabled = bool(node_enable) if node_enable is True else bool(global_enable)
 
-        print(f"⚙️ [Cleaner Engine] Node: {self.node.name} | Status: {'ACTIVE' if is_enabled else 'DISABLED'} (Node: {node_enable}, Global: {global_enable})")
+        print(f"⚙️ [Cleaner Engine] Node: {self.node.name} | Status: {'ACTIVE' if is_enabled else 'DISABLED'}")
 
         if not is_enabled:
-            print(f"💤 [Cleaner Bypass] Skipped [{self.node.name}] เพราะระบบปิดการใช้งาน")
+            print(f"💤 [Cleaner Bypass] Skipped [{self.node.name}]")
             return
 
         print(f"🔄 [{self.node.name}] เริ่มต้นรอบการทำงาน (Cycle Start)...")
@@ -2040,22 +2039,23 @@ class NodeCleaner:
         # 2. จัดการโหมด Emergency หรือ Normal
         current_free = self._get_node_free_gb()
         if force_emergency or (current_free < 10.0):
-            print(f"🚨 [{self.node.name}] สถานะวิกฤต: พื้นที่เหลือ {current_free:.2f} GB -> เริ่มโหมดกู้คืนด่วน")
+            print(f"🚨 [{self.node.name}] สถานะวิกฤต: พื้นที่เหลือ {current_free:.2f} GB")
+            # ใช้ self.smart_reclaim_process หากคุณย้ายมันเข้ามาเป็น Method แล้ว
+            #self.smart_reclaim_process(required_gb=10.0, is_emergency=True)
             smart_reclaim_process(self.node, required_gb=10.0, is_emergency=True)
             print(f"✅ [{self.node.name}] กู้คืนพื้นที่เสร็จสิ้น")
             return
 
-        # 3. โหมด Idle Cleanup
-        print(f"🔍 [{self.node.name}] เริ่มสแกน Idle Cleanup (โหมดปกติ)...")
-        class_name = self.node.__class__.__name__.lower()
-        grouped_logs = self._clean_qbit() if "qbit" in class_name else self._clean_rtorrent()
+        # 3. โหมด Idle Cleanup (ยุบรวมเหลือเมธอดเดียว)
+        print(f"🔍 [{self.node.name}] เริ่มสแกน Idle Cleanup...")
+        grouped_logs = self._clean_normal()
         
-        # ส่ง Notification
+        # 4. ส่ง Notification
         if grouped_logs:
             self._notify_results(grouped_logs)
             print(f"📝 [{self.node.name}] ส่งสรุปผลการลบเรียบร้อย")
         else:
-            print(f"ℹ️ [{self.node.name}] ไม่พบทอร์เรนต์ที่เข้าเงื่อนไขการลบในรอบนี้")
+            print(f"ℹ️ [{self.node.name}] ไม่พบทอร์เรนต์ที่เข้าเงื่อนไข")
             
         print(f"🏁 [{self.node.name}] จบรอบการทำงาน.")
 
@@ -2124,19 +2124,29 @@ class NodeCleaner:
 
         return False
 
-    def _clean_qbit(self):
+    def _clean_normal(self):
+        """
+        ยุบ _clean_qbit และ _clean_rtorrent รวมกัน 
+        โดยดึงข้อมูลผ่าน Unified Interface (get_all_torrents_info)
+        """
         res_grouped = {}
         try:
-            headers = {"Accept-Encoding": "gzip, deflate", "Connection": "keep-alive"}
-            r = self.node.s.get(f"{self.node.url}/api/v2/torrents/info", auth=self.node.auth, headers=headers, verify=False, timeout=15)
-            if r.status_code != 200: 
+            raw_torrents = self.node.get_all_torrents_info()
+            if not raw_torrents:
                 return {}
 
-            torrents = r.json()
             now = time.time()
-            for t in torrents:
+            for t in raw_torrents:
+                t_hash = t.get('hash')
+                if not t_hash:
+                    continue
+
+                # ดึงค่ากลางที่แปลงไว้แล้ว หรือใช้ .get() ดักไว้
                 progress = t.get('progress', 0)
-                if progress < 1 or t.get('completion_on', 0) <= 0: 
+                is_completed = (progress >= 0.99) or (t.get('amount_left', 1) == 0)
+                
+                # ถ้ายังโหลดไม่เสร็จ หรือไม่มีเวลาจบงาน ให้ข้าม
+                if not is_completed or t.get('completion_on', 0) <= 0: 
                     continue
 
                 try:
@@ -2151,10 +2161,9 @@ class NodeCleaner:
                 if remove_check:
                     reason_key, header_msg = remove_check
                     
-                    if self._hard_purge_sequence(t['hash']):
+                    if self._hard_purge_sequence(t_hash):
                         raw_name = t.get('name', 'Unknown')
                         name_safeguard = raw_name[:27] + "..." if len(raw_name) > 27 else raw_name
-                        # 🛠️ [FIX]: ลบอิโมจิ 💤 ตรงนี้ออก ให้เหลือข้อมูลรายชื่อเพียว ๆ
                         line = f"{name_safeguard} (R:{ratio:.2f}, {age_hours:.1f}h)"
                         
                         if reason_key not in res_grouped:
@@ -2162,96 +2171,7 @@ class NodeCleaner:
                         res_grouped[reason_key]["torrents"].append(line)
                         
         except Exception as e:
-            print(f"⚠️ [{self.node.name}] qBittorrent Fetch Error: {e}")
-        return res_grouped
-
-    def _clean_rtorrent(self):
-        if BeautifulSoup is None:
-            print(f"❌ [{self.node.name}] rTorrent Clean Failed: bs4 (BeautifulSoup) is not installed.")
-            return {}
-
-        res_grouped = {}
-        xml = (
-            '<?xml version="1.0"?><methodCall><methodName>d.multicall2</methodName>'
-            '<params><param><value><string></string></value></param>'
-            '<param><value><string>main</string></value></param>'
-            '<param><value><string>d.hash=</string></value></param>'
-            '<param><value><string>d.ratio=</string></value></param>'
-            '<param><value><string>d.timestamp.finished=</string></value></param>'
-            '<param><value><string>d.up.rate=</string></value></param>'
-            '<param><value><string>d.incomplete=</string></value></param>'
-            '<param><value><string>d.name=</string></value></param></params></methodCall>'
-        )
-
-        soup = None
-        try:
-            req_headers = getattr(self.node, 'headers', {}).copy()
-            if "Connection" not in req_headers:
-                req_headers["Connection"] = "close" 
-
-            r = self.node.s.post(self.node.url, data=xml, auth=self.node.auth, headers=req_headers, verify=False, timeout=15)
-            if r.status_code != 200: 
-                return {}
-
-            soup = BeautifulSoup(r.text, "xml")
-            items = soup.select("methodResponse > params > param > value > array > data > value")
-            if not items:
-                items = soup.select("value > array > data > value")
-
-            now = time.time()
-
-            for item in items:
-                t_data = item.find('data')
-                if not t_data:
-                    t_data = item.find('array') if item.find('array') else item
-                    
-                val_nodes = t_data.find_all('value', recursive=False)
-                vals = []
-                for v in val_nodes:
-                    inner_data = v.find(['string', 'i4', 'int'])
-                    if inner_data:
-                        vals.append(inner_data.get_text().strip())
-                    else:
-                        vals.append(v.get_text().strip())
-
-                if len(vals) < 6:
-                    continue
-
-                t_hash, t_ratio_raw, t_finish, t_uprate, t_leechers_raw, t_name = vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]
-
-                if not t_finish: 
-                    continue
-
-                try:
-                    ratio = int(t_ratio_raw) / 1000 if t_ratio_raw.isdigit() else 0.0
-                    ts_val = int(t_finish)
-                    if ts_val <= 0:
-                        age_hours = 9999.0  
-                    else:
-                        age_hours = (now - ts_val) / 3600
-                    up_speed = int(t_uprate) if t_uprate.isdigit() else 0
-                    leechers = int(t_leechers_raw) if t_leechers_raw.isdigit() else 0
-                except (ValueError, TypeError):
-                    continue
-
-                remove_check = self._should_remove(ratio, age_hours, up_speed, leechers)
-                if remove_check:
-                    reason_key, header_msg = remove_check
-                    
-                    if self._hard_purge_sequence(t_hash):
-                        name_safeguard = t_name[:27] + "..." if len(t_name) > 27 else t_name
-                        # 🛠️ [FIX]: ลบอิโมจิ 🧹 ตรงนี้ออก ให้ส่งกลับแค่สายอักขระข้อมูลดิบ
-                        line = f"{name_safeguard} (R:{ratio:.2f}, {age_hours:.1f}h)"
-                        
-                        if reason_key not in res_grouped:
-                            res_grouped[reason_key] = {"header": header_msg, "torrents": []}
-                        res_grouped[reason_key]["torrents"].append(line)
-
-        except Exception as e:
-            print(f"⚠️ [{self.node.name}] rTorrent Clean Error: {str(e)}")
-        finally:
-            if soup is not None:
-                soup.decompose()
+            print(f"⚠️ [{self.node.name}] Cleanup Fetch Error: {e}")
             
         return res_grouped
 
