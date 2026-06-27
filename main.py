@@ -1402,15 +1402,22 @@ class RtorrentNode:
                 values = item.findall("./value")
                 if len(values) < 9: continue 
 
-                def safe_get_text(val_node, tag_list=["./string", "./i4", "./int"]):
+                # ฟังก์ชันช่วยดึง text จาก node
+                def safe_get_text(val_node):
                     if val_node is None: return ""
-                    for tag in tag_list:
+                    for tag in ["./string", "./i4", "./int"]:
                         target = val_node.find(tag)
                         if target is not None and target.text is not None:
                             return target.text.strip()
                     return val_node.text.strip() if val_node.text else ""
 
+                # ดึงข้อมูลพร้อมแปลง hash เป็น lowercase ทันที
                 t_hash = safe_get_text(values[0]).lower()
+                
+                # หากไม่มี hash ให้ข้ามไป
+                if not t_hash:
+                    continue
+                    
                 t_ratio_str = safe_get_text(values[1])
                 t_complete_str = safe_get_text(values[2])
                 t_name = safe_get_text(values[3])
@@ -1431,7 +1438,10 @@ class RtorrentNode:
                         if ratio_val < 0: ratio_val = 0.0
                         size_bytes = int(t_size_str) if t_size_str.isdigit() else 0
                         ts_finished = int(t_ts_finished_str) if t_ts_finished_str.isdigit() else 0
-                        ts_init = int(t_ts_created_str) if t_ts_created_str.isdigit() else 0 # กำหนดค่าที่นี่
+                        ts_init = int(t_ts_created_str) if t_ts_created_str.isdigit() else 0
+                        
+                        if ts_init == 0:
+                            ts_init = int(time.time())
                     
                         if ts_finished <= 0:
                             age_hours = 99.0 
@@ -2041,8 +2051,7 @@ class NodeCleaner:
         if force_emergency or (current_free < 10.0):
             print(f"🚨 [{self.node.name}] สถานะวิกฤต: พื้นที่เหลือ {current_free:.2f} GB")
             # ใช้ self.smart_reclaim_process หากคุณย้ายมันเข้ามาเป็น Method แล้ว
-            #self.smart_reclaim_process(required_gb=10.0, is_emergency=True)
-            smart_reclaim_process(self.node, required_gb=10.0, is_emergency=True)
+            self.smart_reclaim_process(required_gb=10.0, is_emergency=True)
             print(f"✅ [{self.node.name}] กู้คืนพื้นที่เสร็จสิ้น")
             return
 
@@ -2125,10 +2134,6 @@ class NodeCleaner:
         return False
 
     def _clean_normal(self):
-        """
-        ยุบ _clean_qbit และ _clean_rtorrent รวมกัน 
-        โดยดึงข้อมูลผ่าน Unified Interface (get_all_torrents_info)
-        """
         res_grouped = {}
         try:
             raw_torrents = self.node.get_all_torrents_info()
@@ -2138,29 +2143,28 @@ class NodeCleaner:
             now = time.time()
             for t in raw_torrents:
                 t_hash = t.get('hash')
-                if not t_hash:
-                    continue
+                if not t_hash: continue
 
-                # ดึงค่ากลางที่แปลงไว้แล้ว หรือใช้ .get() ดักไว้
-                progress = t.get('progress', 0)
-                is_completed = (progress >= 0.99) or (t.get('amount_left', 1) == 0)
+                # ใช้ Key ที่คุณสร้างไว้ใน get_all_torrents_info คือ 'ts_finished'
+                is_completed = t.get('is_rt_complete', False)
+                ts_finished = t.get('ts_finished', 0)
                 
-                # ถ้ายังโหลดไม่เสร็จ หรือไม่มีเวลาจบงาน ให้ข้าม
-                if not is_completed or t.get('completion_on', 0) <= 0: 
+                # ถ้ายังไม่เสร็จ หรือไม่มีเวลาจบงาน ให้ข้าม
+                if not is_completed or ts_finished <= 0: 
                     continue
 
                 try:
-                    age_hours = (now - float(t['completion_on'])) / 3600
+                    age_hours = (now - float(ts_finished)) / 3600
                     ratio = float(t.get('ratio', 0))
-                    up_speed = float(t.get('upspeed', 0))      
-                    leechers = int(t.get('num_leechers', 0))
+                    # หมายเหตุ: ถ้าต้องการ up_speed/num_leechers ต้องดึงเพิ่มใน multicall2
+                    up_speed = 0 
+                    leechers = 0
                 except (ValueError, TypeError):
                     continue
 
                 remove_check = self._should_remove(ratio, age_hours, up_speed, leechers)
                 if remove_check:
                     reason_key, header_msg = remove_check
-                    
                     if self._hard_purge_sequence(t_hash):
                         raw_name = t.get('name', 'Unknown')
                         name_safeguard = raw_name[:27] + "..." if len(raw_name) > 27 else raw_name
@@ -2169,131 +2173,74 @@ class NodeCleaner:
                         if reason_key not in res_grouped:
                             res_grouped[reason_key] = {"header": header_msg, "torrents": []}
                         res_grouped[reason_key]["torrents"].append(line)
-                        
         except Exception as e:
             print(f"⚠️ [{self.node.name}] Cleanup Fetch Error: {e}")
-            
         return res_grouped
 
-# ========================= Smart Reclaim Space (Hardened Version) =========================
-
-GLOBAL_CACHE = None
-
-def get_global_protected_set():
-    global GLOBAL_CACHE
-    if GLOBAL_CACHE is None:
-        GLOBAL_CACHE = get_global_protected_hashes()
-    return GLOBAL_CACHE
-
-def get_global_protected_hashes():
-    """โหลดทุกไซต์และรวม Hash ที่ PROTECTED เข้ามาใน Set เดียว"""
-    all_dbs = load_all_db()
-    global_set = set()
-    
-    for site_key, db_data in all_dbs.items():
-        for data in db_data.values():
-            if data.get("status") == "PROTECTED":
-                h = data.get("hash")
-                if h:
-                    global_set.add(h.lower())
-    return global_set
-
-def smart_reclaim_process(node, required_gb, is_emergency=False):
-    """
-    เวอร์ชันบูรณาการ: ทำงานร่วมกับทุก Node ที่มี Method มาตรฐานเดียวกัน
-    """
-    try:
-        node.refresh_status()
-        buffer_gb = 5.0 if is_emergency else 2.5
-        target_free = required_gb + buffer_gb  
-        current_free = float(node.free_gb) if getattr(node, 'free_gb', None) is not None else 0.0
-        
-        if current_free >= target_free and not is_emergency:
-            print(f"✅ [{node.name}] พื้นที่ดิสก์เพียงพอ: {current_free:.2f} GB")
-            return True
-
-        # ดึงข้อมูลผ่านอินเตอร์เฟซเดียว (Unified Interface)
-        raw_torrents_data = node.get_all_torrents_info()
-        if not raw_torrents_data:
-            print(f"⚠️ [{node.name}] ไม่พบข้อมูลงาน")
-            return False
-
-        current_ts = int(time.time())
-        scannable_torrents = []
-        leeching_backups = []
-        
-        protected_hashes = get_global_protected_set()
-
-        for t in raw_torrents_data:
-            t_hash = t.get('hash')
-            if t_hash.lower() in protected_hashes:
-                continue
+    def smart_reclaim_process(self, required_gb, is_emergency=False):
+        """
+        ปรับปรุงเป็น Instance Method ของ NodeCleaner
+        เพื่อให้เข้าถึงระบบ Permission และ Hard Purge ได้โดยตรง
+        """
+        try:
+            self.node.refresh_status()
+            buffer_gb = 5.0 if is_emergency else 2.5
+            target_free = required_gb + buffer_gb
+            current_free = float(getattr(self.node, 'free_gb', 0.0))
             
-            # --- [🛡️ HARDENED SAFETY LOCK] ---
-            # ใช้ Key มาตรฐาน 'added_on' หรือ 'ts_init' ที่ต้องเตรียมไว้ใน Class นั้นๆ
-            ts_init = t.get('added_on', t.get('ts_init', 0))
-            if (current_ts - ts_init) < 2700: # 45 นาที
-                continue
+            if current_free >= target_free and not is_emergency:
+                return True
 
-            # การประมวลผล Logic ต่อไป...
-            t_size_gb = t.get('size_bytes', 0) / (1024**3)
-            t_ratio = t.get('ratio', 0.0)
-            state = str(t.get('state', '')).lower()
-            is_completed = (t.get('progress', 0) >= 0.99) or (t.get('amount_left', 1) == 0)
+            raw_torrents = self.node.get_all_torrents_info()
+            if not raw_torrents:
+                return False
 
-            t['_calculated_size_gb'] = t_size_gb
-            t['_calculated_ratio'] = t_ratio
+            # คัดกรองงานที่ลบได้
+            scannable_torrents = []
+            leeching_backups = []
+            current_ts = time.time()
 
-            if is_completed:
-                if (is_emergency and t_size_gb >= 1.0) or (t_ratio >= 1.0 and t_size_gb >= 1.0):
-                    scannable_torrents.append(t)
-            elif t_size_gb >= 2.0 and 'allocating' not in state:
-                leeching_backups.append(t)
+            for t in raw_torrents:
+                t_hash = t.get('hash')
+                # ใช้ระบบ Permission เดิมที่ตรวจสอบไว้แล้ว
+                if self.check_torrent_permission(t_hash) == "PROTECTED":
+                    continue
+                
+                # กรองเวลาเริ่มต้น (ป้องกันการลบงานใหม่เพิ่งเพิ่ม)
+                ts_init = t.get('added_on', t.get('ts_init', 0))
+                if (current_ts - ts_init) < 2700:
+                    continue
 
-        # จัดการกรณี Emergency
-        if not scannable_torrents and is_emergency and leeching_backups:
-            leeching_backups.sort(key=lambda x: -x['_calculated_size_gb'])
-            scannable_torrents = leeching_backups[:2]
+                t_size_gb = t.get('size_bytes', 0) / (1024**3)
+                t_ratio = t.get('ratio', 0.0)
+                is_completed = (t.get('progress', 0) >= 0.99) or (t.get('amount_left', 1) == 0)
 
-        if not scannable_torrents:
+                t['_calculated_size_gb'] = t_size_gb
+                t['_calculated_ratio'] = t_ratio
+
+                if is_completed:
+                    if (is_emergency and t_size_gb >= 1.0) or (t_ratio >= 1.0 and t_size_gb >= 1.0):
+                        scannable_torrents.append(t)
+                elif t_size_gb >= 2.0 and 'allocating' not in str(t.get('state', '')).lower():
+                    leeching_backups.append(t)
+
+            # กรณีฉุกเฉิน ยอมลบงานที่กำลังโหลดอยู่ (กรณีไม่มีงานเสร็จให้ลบ)
+            if not scannable_torrents and is_emergency and leeching_backups:
+                leeching_backups.sort(key=lambda x: -x['_calculated_size_gb'])
+                scannable_torrents = leeching_backups[:2]
+
+            # เลือกงานและลบผ่าน _hard_purge_sequence
+            scannable_torrents.sort(key=lambda x: (-x['_calculated_size_gb'], x['_calculated_ratio']))
+            targets = scannable_torrents[:15 if is_emergency else 6]
+            
+            for t in targets:
+                self._hard_purge_sequence(t['hash'])
+
+            return True
+        except Exception as e:
+            print(f"❌ [SMART RECLAIM] Error: {e}")
             return False
-
-        # --- [🚀 EXECUTION PHASE] ---
-        # เรียงลำดับงานที่จะลบ (เน้นลบไฟล์ใหญ่ก่อน)
-        scannable_torrents.sort(key=lambda x: (-x['_calculated_size_gb'], x['_calculated_ratio']))
         
-        # เลือกจำนวนงานที่ต้องการลบ (เช่น ไม่เกิน 15 งานถ้าฉุกเฉิน)
-        targets = scannable_torrents[:15 if is_emergency else 6]
-        
-        reclaim_count = 0
-        for t in targets:
-            t_hash = t['hash']
-            try:
-                print(f"🔄 [RECLAIM] กำลังลบ: {t.get('name', 'Unknown')} | Hash: {t_hash}")
-                
-                # ทำตาม Sequence ใหม่: Re-announce -> Stop -> Delete
-                node.reannounce_torrent(t_hash)
-                node.stop_torrent(t_hash)
-                success = node.delete_torrent(t_hash)
-                
-                if success:
-                    reclaim_count += 1
-                    # อัปเดตสถานะใน DB ถ้ามีระบบนี้อยู่
-                    if hasattr(node, '_update_db_status'):
-                        node._update_db_status(t_hash, "DELETED")
-                else:
-                    print(f"⚠️ [RECLAIM] ลบไม่สำเร็จ (API Error): {t_hash}")
-                    
-            except Exception as e:
-                print(f"❌ [RECLAIM] Error ลบรายตัว {t_hash}: {e}")
-                continue
-
-        return reclaim_count > 0
-
-    except Exception as e:
-        print(f"❌ Critical Reclaim Error: {e}")
-        return False
-
 # ========================= Global FUNCTIONS =========================
 
 stealth_args = {
@@ -2840,11 +2787,12 @@ async def ensure_dedbit_logged_in(page):
     return True
 
 class BotContext:
-    def __init__(self, active_nodes, dl_session, seen_hashes, seen_ids):
+    def __init__(self, active_nodes, dl_session, seen_hashes, seen_ids, global_clean):
         self.active_nodes = active_nodes
         self.dl_session = dl_session
         self.seen_hashes = seen_hashes
         self.seen_ids = seen_ids
+        self.global_clean = global_clean
         
 async def get_site_stats(page: uc.Tab, site_cfg: dict, ctx: BotContext) -> str:
     """
@@ -3390,7 +3338,7 @@ async def sync_hr_with_web(site_key, page, base_url, ctx):
             torrent_id, meta.get('name'), meta.get('size_gb'), 
             details_url, meta.get('download_url'), site_key, 
             ctx.dl_session, page, ctx.active_nodes, ctx.seen_hashes, 
-            ctx.seen_ids, force_download=(hr_status == 'danger')
+            ctx.seen_ids, ctx.global_clean,force_download=(hr_status == 'danger')
         )
     
         if success:
@@ -3506,7 +3454,7 @@ def extract_torrent_metadata(html_content):
             
     return t_name, t_size_gb
 
-async def trigger_download_if_needed(t_id, t_name, t_size_gb, details_url, download_url, site, dl_session, browser_instance, active_nodes, seen_hashes, seen_ids, force_download=False):
+async def trigger_download_if_needed(t_id, t_name, t_size_gb, details_url, download_url, site, dl_session, browser_instance, active_nodes, seen_hashes, seen_ids, global_clean, force_download=False):
     try:
         print(f"🚀 เริ่มดาวน์โหลดไฟล์: {t_id}")
         raw_data_bytes = None
@@ -3593,11 +3541,12 @@ async def trigger_download_if_needed(t_id, t_name, t_size_gb, details_url, downl
                     continue # Node นี้โหลดเต็มแล้ว
 
                 # เช็คพื้นที่และพยายาม Reclaim ถ้าจำเป็น
+                cleaner = NodeCleaner(node_obj, n_cfg, global_clean)
                 needed_gb = t_size_gb + 15.0
                 effective_free = node_obj.free_gb - node_obj.get_downloading_size()
                 
                 if effective_free < needed_gb:
-                    smart_reclaim_process(node_obj, required_gb=needed_gb, is_emergency=False)
+                    cleaner.smart_reclaim_process(required_gb=(t_size_gb + 15.0), is_emergency=False)
                     node_obj.refresh_status()
                     effective_free = node_obj.free_gb - node_obj.get_downloading_size()
                     if effective_free < (t_size_gb + 5.0): # ยอมลด Buffer ลงนิดหน่อยในกรณีจำเป็น
@@ -4502,7 +4451,7 @@ async def main():
                         except Exception as cookie_err:
                             print(f"⚠️ [{site}] ไม่สามารถดึงคุกกี้: {cookie_err}")
                             
-                        ctx = BotContext(active_nodes, dl_session, seen_hashes, seen_ids)
+                        ctx = BotContext(active_nodes, dl_session, seen_hashes, seen_ids, global_clean)
                         stats_data = await get_site_stats(site_page, site_cfg, ctx)
                         print(stats_data)
 
@@ -4789,13 +4738,16 @@ async def main():
                                                 if (current_load + task_weight) > dynamic_max_cap:
                                                     print(f" ⏳ [Queue Full] {node_obj.name} ลอง Node ถัดไป")
                                                     continue
-
+                                                
+                                                cleaner = NodeCleaner(node_obj, n_cfg, global_clean)
                                                 effective_free_gb = node_obj.free_gb - node_obj.get_downloading_size()
                                                 if effective_free_gb < (t_size_gb + 15.0):
-                                                    smart_reclaim_process(node_obj, required_gb=(t_size_gb + 15.0), is_emergency=False)
+                                                    cleaner.smart_reclaim_process(required_gb=(t_size_gb + 15.0), is_emergency=False)
                                                     node_obj.refresh_status()
                                                     effective_free_gb = node_obj.free_gb - node_obj.get_downloading_size()
-                                                    if effective_free_gb < (t_size_gb + 5.0): continue
+                                                    if effective_free_gb < (t_size_gb + 5.0):
+                                                        print(f"❌ [{node_obj.name}] พื้นที่กู้คืนไม่สำเร็จ (Remaining: {effective_free_gb:.1f} GB)")
+                                                        continue
 
                                                 try:
                                                     
