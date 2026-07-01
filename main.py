@@ -1933,6 +1933,12 @@ class NodeCleaner:
         self._db_cache = None
 
     @classmethod
+    def clear_cache(cls):
+        """ล้าง Cache ทั้งหมดเพื่อให้โหลดใหม่จากไฟล์ DB"""
+        cls._PROTECTED_CACHE_STORAGE = None
+        print("🧹 [NodeCleaner] Cache ได้รับการเคลียร์เรียบร้อยแล้ว")
+
+    @classmethod
     def get_global_protected_set(cls):
         """โหลดและแคชข้อมูล Hash ในระดับ Class"""
         if cls._PROTECTED_CACHE_STORAGE is None:
@@ -1945,27 +1951,23 @@ class NodeCleaner:
                         if h:
                             cls._PROTECTED_CACHE_STORAGE.add(h.lower())
         return cls._PROTECTED_CACHE_STORAGE
-
+    
     @classmethod
-    def clear_cache(cls):
-        """ล้าง Cache เมื่อมีการอัปเดต DB"""
-        cls._PROTECTED_CACHE_STORAGE = None
+    def update_protected_cache_item(cls, t_hash, status):
+        """
+        อัปเดตเฉพาะรายการที่มีการเปลี่ยนแปลง (Incremental Update)
+        ไม่ต้องโหลด DB ใหม่ทั้งหมด
+        """
+        if cls._PROTECTED_CACHE_STORAGE is None:
+            # ถ้ายังไม่มี Cache เลย ให้สั่งโหลดใหม่แบบปกติ
+            cls.get_global_protected_set()
+            return
 
-    def check_torrent_permission(self, t_hash):
-        # ใช้ Method ของคลาสในการดึงข้อมูล
-        protected_hashes = self.get_global_protected_set()
-        
-        # ตรวจสอบว่า Hash อยู่ในกลุ่ม Protected หรือไม่
-        if t_hash.lower() in protected_hashes:
-            return "PROTECTED"
-            
-        # ตรวจสอบสถานะใน DB ของตัวเอง
-        site_data = load_db(self.site_key)
-        for data in site_data.values():
-            if data.get("hash", "").lower() == t_hash.lower():
-                return data.get("status", "NOT_FOUND")
-        
-        return "NOT_FOUND"
+        h = t_hash.lower()
+        if status == "PROTECTED":
+            cls._PROTECTED_CACHE_STORAGE.add(h)
+        elif h in cls._PROTECTED_CACHE_STORAGE:
+            cls._PROTECTED_CACHE_STORAGE.remove(h)
 
     def _update_db_status(self, t_hash, new_status):
         db = load_db(self.site_key)
@@ -1979,8 +1981,22 @@ class NodeCleaner:
         
         if updated:
             save_db(self.site_key, db)
-            # เรียกใช้ Class Method เพื่อเคลียร์ Cache
-            NodeCleaner.clear_cache()
+            # อัปเดต Cache แบบ Active ทันทีโดยไม่ต้องเคลียร์ทิ้ง
+            NodeCleaner.update_protected_cache_item(t_hash, new_status)
+            print(f"🚀 [Cache] Active Sync: อัปเดต {t_hash} สถานะเป็น {new_status}")
+
+    def check_torrent_permission(self, t_hash):
+        protected_hashes = self.get_global_protected_set()
+        if t_hash.lower() in protected_hashes:
+            return "PROTECTED"
+        
+        site_data = load_db(self.site_key)
+        for data in site_data.values():
+            if data.get("hash", "").lower() == t_hash.lower():
+                # แปลงเป็นตัวพิมพ์ใหญ่เสมอเพื่อเปรียบเทียบง่ายขึ้น
+                return str(data.get("status", "NOT_FOUND")).upper()
+    
+        return "NOT_FOUND"
 
     def _get_node_free_gb(self):
         try:
@@ -1997,7 +2013,9 @@ class NodeCleaner:
         status = self.check_torrent_permission(t_hash)
 
         # 1. ตรวจสอบสถานะก่อนลบ
-        if status not in ["COMPLETED", "NOT_FOUND"]:
+        allowed_to_delete = ["COMPLETED", "NOT_FOUND"]
+    
+        if status not in allowed_to_delete:
             print(f"🔒 [GUARD] ปฏิเสธการลบ: สถานะคือ {status} - {t_hash}")
             return False
         
@@ -3373,6 +3391,9 @@ async def sync_hr_with_web(site_key, page, base_url, ctx):
 
     # บันทึกสถานะล่าสุดลง DB
     await async_save_db(site_key, db)
+    
+    # สั่งล้าง Cache ทั้งหมดเพื่อให้ NodeCleaner อ่านข้อมูลที่อัปเดตใหม่ในรอบถัดไป
+    NodeCleaner.clear_cache()
     
     # STEP 6: รายงานสรุปผล
     summary_msg = f"🏁 <b>SYNC SUMMARY: {site_key}</b>\n📋 Total: `{stats['total']}`\n🔍 Scanned: `{stats['scanned']}`\n⚠️ Warning/Danger: `{stats['warning']}`\n✅ Completed: `{stats['completed']}`"
