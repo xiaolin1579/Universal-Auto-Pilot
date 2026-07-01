@@ -3787,83 +3787,79 @@ def check_item_urgency(exp_time_str):
     except:
         return False
 
-RE_ITEM_ROW = re.compile(r"Item\s*Status|สถานะ\s*ไอเทม", re.I)
-RE_EXP_DATE = re.compile(r"(\d{2}[-/]\d{2}[-/]\d{4}\s+\d{2}:\d{2}:\d{2})")
-
 def get_bearbit_item_status(soup):
     try:
         active_item = "NONE"
         display_exp = "N/A"
         
-        # 1. ค้นหาเนื้อหาแบบจำกัดขอบเขต
-        target_element = soup.find(string=RE_ITEM_ROW)
-        clean_text = ""
+        # 1. ฟังก์ชันช่วยดึงวันที่จากตาราง
+        def get_date_from_table(label_pattern):
+            # ค้นหา label ด้วย regex
+            label_element = soup.find(string=re.compile(label_pattern, re.I))
+            if label_element:
+                # ขยับไปหา parent tr และดึง td ตัวที่สอง
+                parent = label_element.find_parent("tr")
+                if parent:
+                    tds = parent.find_all("td")
+                    if len(tds) > 1:
+                        date_text = tds[1].get_text(separator=" ", strip=True)
+                        # รองรับรูปแบบวันที่หลากหลาย
+                        match = re.search(r"(\d{4}[-/]\d{2}[-/]\d{2})\s+(\d{2}:\d{2}:\d{2})?", date_text)
+                        if match:
+                            return f"{match.group(1)} {match.group(2) if match.group(2) else '23:59:59'}"
+            return "N/A"
+
+        # 2. ตรวจสอบสถานะ Pause (Priority 1)
+        is_pause = soup.find("img", src=re.compile(r"Pause_big\.png", re.I))
         
-        # ค้นหาภาพไอเทมในขอบเขตเดียวกัน
-        img_src = ""
-        if target_element:
-            parent = target_element.find_parent(["tr", "table"])
-            if parent:
-                clean_text = " ".join(parent.get_text(" ", strip=True).split())
-                # ค้นหารูปภาพภายใน parent นั้น
-                img_tag = parent.find("img", src=re.compile(r"pic/item/item\d+\.gif", re.I))
-                if img_tag:
-                    img_src = img_tag.get('src', '')
-
-        # 2. ถ้าไม่เจอค่อยใช้ Fallback (ตรวจสอบภาพในทั้งหน้า)
-        if not img_src:
-            img_tag = soup.find("img", src=re.compile(r"pic/item/item\d+\.gif", re.I))
-            if img_tag:
-                img_src = img_tag.get('src', '')
-
-        # 3. ลอจิกไอเทม (รวมทั้ง Keyword และ Image Path)
-        # ตรวจสอบจาก img_src ก่อน ถ้าเจอให้ข้ามไปเลย
-        if "item1.gif" in img_src:
-            active_item = "FREELOAD_100"
-        elif "item3.gif" in img_src:
-            active_item = "FREELOAD_50"
-        elif "item5.gif" in img_src:
-            active_item = "FREELOAD_10"
-        elif "item6.gif" in img_src:
-            active_item = "FREELOAD_15"
+        # 3. กำหนด active_item
+        if is_pause:
+            active_item = "PAUSED_FREE"
+            display_exp = get_date_from_table(r"หมดอายุ\s*Pause\s*Download")
         else:
-            # ถ้าไม่เจอจากรูป ให้เช็คจาก Keyword (Fallback)
-            item_map = {
-                "FREELOAD_100": ["ซานตาคลอส", "100%", "Santa Claus"],
-                "FREELOAD_50": ["ตุ๊กตาซานต้า", "50%", "Santa Doll"], 
-                "FREELOAD_15": ["หยินหยาง", "15%", "Yin Yang"],
-                "FREELOAD_10": ["แหวนครองพิภพ", "10%", "One Ring"]
-            }
-            for key, keywords in item_map.items():
-                if any(k.lower() in clean_text.lower() for k in keywords):
-                    active_item = key
-                    break
+            # ตรวจสอบไอเทมฟรี (Priority 2)
+            item_img = soup.find("img", src=re.compile(r"pic/item/item\d+\.gif", re.I))
+            if item_img:
+                src = item_img.get('src', '')
+                mapping = {"item1.gif": "FREELOAD_100", "item3.gif": "FREELOAD_50", 
+                           "item5.gif": "FREELOAD_10", "item6.gif": "FREELOAD_15"}
+                active_item = next((v for k, v in mapping.items() if k in src), "NONE")
+            
+            # กรณีไม่มีรูป ใช้การอ่าน text ทั้งหน้า (Fallback)
+            if active_item == "NONE":
+                page_text = soup.get_text().lower()
+                item_map = {"FREELOAD_100": ["ซานตาคลอส"], "FREELOAD_50": ["ตุ๊กตาซานต้า"]} # เพิ่มคีย์เวิร์ดที่คุณใช้
+                for key, keywords in item_map.items():
+                    if any(k in page_text for k in keywords):
+                        active_item = key
+                        break
+            
+            if active_item.startswith("FREELOAD"):
+                display_exp = get_date_from_table(r"Item\s*Status|สถานะ\s*ไอเทม")
 
-        # 4. ดึงวันหมดอายุ (คงเดิม)
-        exp_match = RE_EXP_DATE.search(clean_text)
-        if exp_match:
-            display_exp = exp_match.group(1).replace("/", "-")
-            try:
-                if 'check_item_urgency' in globals() and check_item_urgency(display_exp):
-                    display_exp += " ⚠️"
-            except Exception: pass
-
-        # 5. อัปเดต Bot Config (คงเดิม)
+        # 4. ส่งค่าอัปเดต
         if active_item != "NONE" and 'update_bot_config' in globals():
-            try:
-                update_bot_config(active_item)
-            except Exception as e:
-                print(f"⚠️ [Config Update Warning] {e}")
+            update_bot_config(active_item)
 
         return f"{active_item} ({display_exp})"
 
     except Exception as e:
-        print(f"❌ [Critical Error in Parser] {e}")
+        print(f"❌ [Parser Error]: {e}")
         return "NONE"
 
 def update_bot_config(active_item):
     global CFG
     if not CFG or 'SETTING' not in CFG: return
+    
+    # เพิ่ม PAUSED_FREE เข้าไปในลอจิกการคำนวณ
+    if active_item == "PAUSED_FREE":
+        CFG['SETTING']['CURRENT_DISCOUNT'] = 100
+        CFG['SETTING']['FREELOAD_ENABLE'] = True
+        CFG['SETTING']['MIN_FREE_PERCENT'] = 0
+        CFG['SETTING']['EXCLUDE_WEB_FREE'] = False 
+        # เน้นว่าโหมดนี้ไม่ต้องสน Ratio เลย เพราะโหลดฟรีไม่หัก Download credit
+        print("⏸️ [PAUSE DOWNLOAD MODE]: ฟรีโควต้าดาวน์โหลด 100% | กวาดได้เต็มที่!")
+        return # จบการทำงานในเงื่อนไขพิเศษนี้
 
     discounts = {
         "FREELOAD_100": 100,
