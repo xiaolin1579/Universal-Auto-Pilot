@@ -514,10 +514,8 @@ async def launch_any_browser(sitename="default", custom_args=None):
         await asyncio.sleep(2)
 
     # 3. ใช้ Config ของ nodriver โดยเปลี่ยน Path ตามชื่อเว็บ
-    # เปลี่ยนชื่อ Folder ให้กระชับขึ้นตามชื่อ Site
     _current_profile_path = f"./profiles/{sitename}_uc_profile"
     
-    # [สำคัญ] ตรวจสอบว่ามีโฟลเดอร์รองรับหรือไม่ (ถ้าจำเป็น)
     import os
     if not os.path.exists("./profiles"):
         os.makedirs("./profiles")
@@ -525,13 +523,22 @@ async def launch_any_browser(sitename="default", custom_args=None):
     config = Config(
         browser_executable_path=get_universal_browser_path(),
         user_data_dir=_current_profile_path,
-        headless=False
+        headless=False  # จำเป็นต้อง False เพราะรันคู่กับ Xvfb/nodriver
     )
 
     config.sandbox = False 
-    config.no_sandbox = True # เพิ่มตัวนี้เพื่อกัน Error connect
-    config.add_argument("--disable-dev-shm-usage")
-    config.add_argument("--disable-gpu")
+    config.no_sandbox = True 
+    
+    # --- 🚀 บล็อกอาร์กิวเมนต์รีดไขมัน ลดโหลด CPU ให้ VPS ---
+    config.add_argument("--disable-dev-shm-usage") # กันปัญหาแรมแชร์เต็ม
+    config.add_argument("--disable-gpu")           # ปิดการประมวลผลการ์ดจอจำลอง
+    config.add_argument("--blink-settings=imagesEnabled=false") # [โคตรสำคัญ] ห้ามโหลดรูปภาพในเว็บบิท ช่วยลด CPU/Net ทันที 50%
+    config.add_argument("--disable-gl-extensions") # ปิดการโหลด WebGL
+    config.add_argument("--disable-software-rasterizer") # ปิดซอฟต์แวร์ประมวลผลภาพ 3D
+    config.add_argument("--disable-extensions")    # ปิด Extension ทั้งหมดใน Chrome
+    config.add_argument("--disable-background-networking") # ปิดการเช็คอัปเดตเบื้องหลังของ Chrome
+    config.add_argument("--mute-audio")            # ปิดระบบเสียง
+    # --------------------------------------------------
     
     if isinstance(custom_args, list):
         for arg in custom_args:
@@ -3814,7 +3821,7 @@ def get_bearbit_item_status(soup):
         
         # 3. กำหนด active_item
         if is_pause:
-            active_item = "PAUSED_FREE"
+            active_item = "PAUSE_DOWNLOAD"
             display_exp = get_date_from_table(r"หมดอายุ\s*Pause\s*Download")
         else:
             # ตรวจสอบไอเทมฟรี (Priority 2)
@@ -3851,8 +3858,8 @@ def update_bot_config(active_item):
     global CFG
     if not CFG or 'SETTING' not in CFG: return
     
-    # เพิ่ม PAUSED_FREE เข้าไปในลอจิกการคำนวณ
-    if active_item == "PAUSED_FREE":
+    # เพิ่ม PAUSE_DOWNLOAD เข้าไปในลอจิกการคำนวณ
+    if active_item == "PAUSE_DOWNLOAD":
         CFG['SETTING']['CURRENT_DISCOUNT'] = 100
         CFG['SETTING']['FREELOAD_ENABLE'] = True
         CFG['SETTING']['MIN_FREE_PERCENT'] = 0
