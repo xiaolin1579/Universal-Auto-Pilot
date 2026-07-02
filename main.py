@@ -361,57 +361,27 @@ def parse_size(size_str):
         return 0.0
 
 def check_freeload_status(row):
-    row_html = str(row)
-    row_html_lower = row_html.lower()
-    cells = row.find_all("td")
-    
-    # --- 1. ตรวจสอบจากรูปภาพไอคอน (ครอบคลุมเกือบทุกเว็บ) ---
-    # ใช้ชื่อไฟล์ภาพเป็นตัวตัดสินหลัก เพราะเป็น Static Asset ที่เปลี่ยนยาก
-    free_images = [
-        "freeload.png", "freedownload.gif", "free_download", 
-        "s-free", "free.gif", "free.png", "gold.gif", "free_silver.gif"
-    ]
-    if any(icon in row_html_lower for icon in free_images):
-        return 100
-
-    # --- 2. ตรวจสอบจาก CSS Class (Bootstrap Badge / Custom Tag) ---
-    # เช่น TorrentDD หรือเว็บสมัยใหม่ที่ใช้ Badge
-    if 'badge' in row_html_lower and 'free' in row_html_lower:
-        # เช็คสีของ Badge (มักจะเป็น success, green, หรือสีทอง)
-        if any(c in row_html_lower for c in ['success', 'green', 'gold']):
-            return 100
-
-    # --- 3. สแกนหาเปอร์เซ็นต์แบบ "ข้ามคอลัมน์ชื่อไฟล์" (สำคัญมาก) ---
-    # เราจะวนลูปเช็คทุก Cell แต่จะใช้วิธี "กรองคอลัมน์ต้องสงสัย" ออก
-    for i, cell in enumerate(cells):
-        # ข้ามคอลัมน์ 0, 1, 2 (มักเป็น รูปหมวดหมู่, ตัวเลือก, และชื่อไฟล์)
-        # ตัวเลข % โปรโมชั่นมักจะเริ่มที่คอลัมน์ 3 เป็นต้นไป ( index 3 )
-        if i <= 2: 
-            continue 
-            
-        cell_str = str(cell).lower()
-        cell_text = cell.get_text(strip=True)
-        
-        # ก) เช็คจาก "สีข้อความ" (Inline Style)
-        # ถ้าเจอตัวเลข % ที่อยู่ใน Tag สีเขียว ให้สันนิษฐานว่าเป็นค่า Free
-        is_active_color = any(c in cell_str for c in ['color="green"', 'color: green', '#00ff00', 'success'])
-        
-        # ข) สกัดตัวเลข %
-        pct_match = re.search(r"(\d+)\s*%", cell_text)
+    # 1. เช็คจาก Badge class โดยตรง (แม่นยำที่สุดสำหรับ UI ใหม่)
+    badge = row.find("span", class_="bb-badge bb-free")
+    if badge:
+        text = badge.get_text().lower()
+        # ใช้ regex สกัดตัวเลขจาก "free 95%" หรือ "100%"
+        pct_match = re.search(r"(\d+)\s*%", text)
         if pct_match:
-            val = int(pct_match.group(1))
-            # ใส่ Sanity Check: เปอร์เซ็นต์ฟรีต้องไม่เกิน 100 (ป้องกันเลขตอน One Piece 1044)
-            if val <= 100:
-                # ถ้าเป็นสีเขียวด้วย ให้มั่นใจได้ 100%
-                if is_active_color:
-                    return val
-                # ถ้าไม่ใช่สีเขียว แต่อยู่ในคอลัมน์โปรโมชั่น (3-8) ก็ยังพอเชื่อถือได้
-                if 3 <= i <= 8:
-                    return val
+            return int(pct_match.group(1))
+    
+    # 2. กรณีไม่มี Badge ให้เช็คจาก td ที่มี class="bb-promo-col" (ส่วนแสดง % ชัดเจน)
+    promo_col = row.find("td", class_="bb-promo-col")
+    if promo_col:
+        text = promo_col.get_text().strip()
+        pct_match = re.search(r"(\d+)\s*%", text)
+        if pct_match:
+            return int(pct_match.group(1))
 
-        # ค) เช็ค Keyword "Free" หรือ "ฟรี" ที่เป็นสีเขียว (กรณีไม่มีตัวเลข %)
-        if is_active_color and any(w in cell_text for w in ["ฟรี", "free"]):
-            return 100
+    # 3. Fallback: ใช้รูปภาพ (เผื่อบางไฟล์ยังใช้ระบบเก่า)
+    row_html_lower = str(row).lower()
+    if any(icon in row_html_lower for icon in ["freeload.png", "free.gif", "free.png"]):
+        return 100
 
     return 0
 
