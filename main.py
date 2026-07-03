@@ -1,7 +1,9 @@
 from fake_useragent import UserAgent
 from urllib.parse import urljoin, unquote
 import xmlrpc.client
+import aiohttp
 import random
+import inspect
 import httpx
 import cloudscraper
 import threading
@@ -2996,15 +2998,18 @@ def extract_digit(tag):
         return 0
 
 # แยก Regex ออกมาให้ชัดเจน
-ID_REGEX = re.compile(r"details\.php\?id=(\d+)", re.I)
+ID_REGEX = re.compile(r"id=(\d+)", re.I)
 DL_REGEX = re.compile(r"download(new)?\.php", re.I)
 BAD_LINK_PATTERN = re.compile(r"ndonatedn|vip|donate|/nDonatedN\.php", re.I)
+SIZE_PATTERN = re.compile(r"(\d+\.?\d*\s*(?:MB|GB|TB))", re.I)
 
 async def extract_torrent_data(row, base_url, dl_session=None, headers=None, checked_cache=None):
     if row is None: return None
     
-    # 1. สกัด ID & Title พร้อมป้องกัน Error
-    title_tag = row.find("a", href=ID_REGEX)
+   # 1. สกัด ID & Title โดยใช้ Regex ค้นหาใน tag <a> ที่อยู่ใน td.bb-titlecell
+    title_cell = row.find("td", class_="bb-titlecell")
+    title_tag = title_cell.find("a", href=re.compile(r"details\.php")) if title_cell else None
+    
     t_id, title, details_url = None, "Unknown File", None
     
     if title_tag:
@@ -3014,14 +3019,28 @@ async def extract_torrent_data(row, base_url, dl_session=None, headers=None, che
             t_id = match.group(1)
             details_url = f"{base_url.rstrip('/')}/details.php?id={t_id}"
 
-    # 2. เข้าถึง TD (คงเดิม)
+    # 2. ปรับการดึงข้อมูลตัวเลข: ใช้วิธีหา td ตามลำดับที่แท้จริง
+    # จาก HTML ใหม่: [0:Cat][1:Poster][2:Title][3:Promo][4:Promo][5:FileNum][6:Date][7:Seed][8:Leech][9:Complete]
+    # ปรับดัชนีให้ตรงกับโครงสร้างใหม่
     tds = row.select("td")
-    if len(tds) < 12: return None
+    if len(tds) < 10: return None
 
-    # ดึงข้อมูลตัวเลข (สมมติว่าฟังก์ชัน extract_digit ถูกนิยามไว้ที่อื่นแล้ว)
-    c, s, l = extract_digit(tds[9]), extract_digit(tds[10]), extract_digit(tds[11])
+    # ดึงค่าตามลำดับใหม่จาก Log HTML ของคุณ
+    # tds[6] = Date, tds[7] = Seed, tds[8] = Leech (หรือข้อมูลดาวน์โหลด)
+    # แนะนำให้เช็ค text ของ tds[7] ว่าคือตัวเลขหรือไม่ก่อน extract_digit
+    completed = extract_digit(tds[7])
+    seeders = extract_digit(tds[8]) 
+    leechers = extract_digit(tds[9])
 
-    # 3. ตรวจสอบ Action ลิงก์ (คงเดิม)
+    # 3. ดึง Size จาก action_div (ใช้ของเดิมที่ทำไว้ดีแล้ว)
+    action_div = row.find("div", class_="bb-file-actions")
+    size_str = "0 B"
+    if action_div:
+        match = SIZE_PATTERN.search(action_div.get_text())
+        size_str = match.group(0) if match else "0 B"
+
+    
+    # 4. ตรวจสอบ Action ลิงก์ (คงเดิม)
     download_url = None
     action_div = row.find("div", class_="bb-file-actions")
     if action_div:
@@ -3063,7 +3082,6 @@ async def extract_torrent_data(row, base_url, dl_session=None, headers=None, che
                     # เพิ่มหลังประกาศ soup = BeautifulSoup(content, 'lxml')
                     #print(f"DEBUG: จำนวนลิงก์ <a> ทั้งหมดที่พบ: {len(soup.find_all('a'))}")
                     # ลองพิมพ์ HTML เฉพาะจุดที่น่าจะมีปุ่มออกมาดู
-                    
                     # 1. ค้นหาจาก Text "ดาวน์โหลด" หรือคำที่มีความหมายในทุกๆ <a> (แม่นยำที่สุด)
                     dl_tag = soup.find("a", string=re.compile(r"ดาวน์โหลด", re.I))
 
@@ -3106,11 +3124,11 @@ async def extract_torrent_data(row, base_url, dl_session=None, headers=None, che
     return {
         "id": t_id, 
         "title": title, 
-        "seeders": s, 
-        "leechers": l,
-        "completed": c, 
-        "size_str": tds[8].get_text(strip=True) if len(tds) > 8 else "0", 
-        "raw_date": tds[7].get_text(strip=True) if len(tds) > 7 else "N/A",
+        "seeders": seeders, 
+        "leechers": leechers,
+        "completed": completed, 
+        "size_str": size_str, 
+        "raw_date": tds[6].get_text(strip=True) if len(tds) > 6 else "N/A",
         "download_url": download_url, 
         "details_url": details_url
     }
@@ -3122,41 +3140,48 @@ class ResponseWrapper:
         self.url = url
         self.headers = {} # ถ้าต้องใช้ headers ให้ดึงมาใส่ด้วย
 
-async def download_torrent_via_browser(tab, details_url, download_url):
-    # 1. ไปหน้า details เพื่อให้ Browser สร้าง Session/Cookie ให้สมบูรณ์
-    await tab.get(details_url)
-    await tab.wait(2) # รอแค่แป๊บเดียวพอ
+async def download_torrent_smart(tab, details_url, download_url):
+    # 1. เข้าลิงค์ Download
+    await tab.get(download_url)
+    await asyncio.sleep(2)
     
-    # 2. ดึงคุกกี้จาก Browser ผ่าน JS
-    cookie_str = await tab.evaluate("document.cookie")
-    cookies_dict = {}
-    if isinstance(cookie_str, str):
-        for item in cookie_str.split("; "):
-            if '=' in item:
-                key, val = item.split("=", 1)
-                cookies_dict[key.strip()] = val.strip()
-
-    # 3. ใช้ download_url ที่ได้รับมา (แทนที่จะไปกดปุ่ม)
-    # เราใช้ download_url ที่บอทส่งมาให้ในตัวแปร details_url หรือพารามิเตอร์อื่น
-    # ตรงนี้สมมติว่า download_url คือ URL ของปุ่มโหลดที่คุณมีอยู่แล้ว
-    # หากยังไม่มี ต้องดึงออกมาจาก details_url หรือระบุเข้ามา
+    # 2. ตรวจสอบว่ามี AdGate หรือไม่
+    is_adgate = await tab.evaluate("!!document.getElementById('bbDlBtn')")
     
-    print(f"🚀 เริ่มดาวน์โหลดตรงจาก URL: {download_url}") # ใช้ download_url ที่คุณมี
+    # สมาชิกปกติที่ต้องผ่าน AdGate
+    if is_adgate:
+        print("🛡️ ตรวจพบระบบ AdGate (สมาชิกปกติ)... กำลังดำเนินการผ่านเงื่อนไข")
+        
+        # รอจนกว่าปุ่มจะเลิก disabled
+        for i in range(10):
+            is_locked = await tab.evaluate("document.getElementById('bbDlBtn').classList.contains('bb-disabled')")
+            if not is_locked:
+                break
+            await asyncio.sleep(1)
+        
+        # ดึง URL ที่ถูกปลดล็อกแล้ว (เป็น Absolute URL)
+        download_url = await tab.evaluate("document.getElementById('bbDlBtn').href")
+    else:
+        print("🚀 สมาชิก VIP หรือไม่ต้องผ่าน AdGate... ดำเนินการดาวน์โหลด")
 
+    # 3. เตรียมดาวน์โหลด (ดึง Session ที่ถูกต้องเสมอ)
+    cookies_data = await tab.send(cdp.network.get_cookies())
+    cookies_dict = {c.name: c.value for c in cookies_data}
+    user_agent = await tab.evaluate("navigator.userAgent")
+    
+    # 4. ดาวน์โหลดไฟล์
     import aiohttp
     async with aiohttp.ClientSession(cookies=cookies_dict) as session:
-        headers = {
-            'Referer': details_url,
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/120.0.0.0'
-        }
+        headers = {'Referer': details_url, 'User-Agent': user_agent}
         async with session.get(download_url, headers=headers) as resp:
-            if resp.status == 200:
-                return await resp.read()
+            content = await resp.read()
+            if resp.status == 200 and (content.startswith(b'd8:') or 'bittorrent' in resp.headers.get('Content-Type', '')):
+                print("✅ ดาวน์โหลดสำเร็จ!")
+                return content
             else:
-                print(f"❌ ดาวน์โหลดตรงล้มเหลว Status: {resp.status}")
-    
-    return None
-                
+                print(f"❌ ดาวน์โหลดล้มเหลว Status: {resp.status}")
+                return None
+
 def format_site_stats_report(all_nodes):
     # โครงสร้างใหม่: { 'Site_Name': { 'Node_Name': { 'up_gb': X, 'speed_mb': Y, 'count': Z } } }
     combined_stats = {}
@@ -3269,160 +3294,115 @@ def format_site_stats_report(all_nodes):
 
 async def sync_hr_with_web(site_key, page, base_url, ctx):
     print(f"🔄 [{site_key}] เริ่มต้นกระบวนการ Sync H&R...")
-    hr_url = f"{base_url.rstrip('/')}/myhr.php"
-    await page.get(hr_url)
+    await page.get(f"{base_url.rstrip('/')}/myhr.php")
     await asyncio.sleep(2)
     
     content = await page.get_content()
-    soup = BeautifulSoup(content, 'html.parser')
-
-    # --- เพิ่มส่วนตรวจสอบสถานะ VIP / หน้าว่าง ---
-    # ถ้าเจอ class 'vipbox' แสดงว่าไม่มีภาระ H&R ให้ประมวลผล
-    if soup.find('div', class_='vipbox'):
-        print(f"✨ [{site_key}] สถานะ VIP ตรวจพบ: ไม่มีภาระ H&R ที่ต้องจัดการ")
-        
-        # ปรับสถานะงานค้างเก่าใน DB ให้เป็น COMPLETED ทั้งหมดเพื่อเคลียร์พื้นที่
-        db = await async_load_db(site_key)
-        updated = False
-        for tid in db:
-            if db[tid].get("status") != "COMPLETED":
-                db[tid].update({"status": "COMPLETED", "completed_at": get_now().strftime("%Y-%m-%d %H:%M")})
-                updated = True
-        
-        if updated:
-            await async_save_db(site_key, db)
-            NodeCleaner.clear_cache()
-            # เพิ่มการแจ้งเตือนเมื่อระบบทำการเคลียร์งานให้โดยอัตโนมัติ
-            await send_notify(f"✨ <b>[{site_key}] VIP Status Detected:</b> ระบบได้ทำการเคลียร์งานค้าง H&R ทั้งหมดเป็น COMPLETED เรียบร้อยแล้ว")
-            print(f"✅ [{site_key}] อัปเดตงานค้างใน DB เป็น COMPLETED เรียบร้อย")
-        return
-
+    soup = BeautifulSoup(content, 'lxml')
     db = await async_load_db(site_key)
-    rows = soup.find_all('tr')
-    print(f"📄 [{site_key}] พบรายการทั้งหมด {len(rows)} รายการ")
+
+    is_empty = soup.find('td', class_='empty') is not None
+    is_vip = soup.find('div', class_='vipbox') is not None
     
     stats = {"total": 0, "scanned": 0, "warning": 0, "completed": 0}
     current_ids_on_web = []
-    
-    # STEP 2 : ประมวลผลและอัปเดตสถานะ
-    for row in rows:
-        meta = {}
-        stats["total"] += 1  # นับ Total ทันทีที่พบ
-        
-        links = row.find_all('a', href=re.compile(r'details\.php\?id='))
-        valid_link = next((l for l in links if 'userdetails.php' not in l['href']), None)
-        if not valid_link: continue
-        
-        torrent_id = re.search(r'id=(\d+)', valid_link['href']).group(1)
-        current_ids_on_web.append(torrent_id)
-        hr_status = extract_hr_status(row)
-        
-        if hr_status in ['warning', 'danger']:
-            stats["warning"] += 1
 
-        # การลงทะเบียนรายการใหม่
-        if torrent_id not in db:
-            db[torrent_id] = {"status": "PROTECTED", "hash": "UNKNOWN", "hr_status": hr_status, "added_at": get_now().strftime("%Y-%m-%d %H:%M"), "retry_count": 0}
-            await async_save_db(site_key, db)
-
-        tid_info = db[torrent_id]
-        tid_info["hr_status"] = hr_status # อัปเดตสถานะล่าสุดเสมอ
-
-        # STEP 3: ตรวจสอบสถานะการทำงาน (ปรับปรุง)
-        # 1. ถ้า COMPLETED แล้ว ข้ามทันที
-        if tid_info.get("status") == "COMPLETED":
-            continue
-    
-        # 2. คำนวณความจำเป็นในการ Deep Scan
-        is_unknown_hash = (tid_info.get("hash") == "UNKNOWN")
-        needs_deep_scan = is_unknown_hash or (hr_status in ['warning', 'danger'])
-    
-        # 3. ถ้าเป็น PROTECTED แต่ไม่ได้ต้องการ Deep Scan ให้ข้าม
-        if tid_info.get("status") == "PROTECTED" and not needs_deep_scan:
-            continue
-        
-        # 4. หากผ่านจุดนี้ แสดงว่าต้องสแกนแน่นอน
-        stats["scanned"] += 1 
-    
-        # --- PHASE 1: กู้คืน Hash ---
-        if is_unknown_hash:
-            new_tab = await page.browser.get("about:blank", new_tab=True)
-            try:
-                details_url = f"{base_url.rstrip('/')}/details.php?id={torrent_id}"
-                meta = await get_torrent_details_full(new_tab, base_url, details_url, torrent_id)
-                if meta.get('hash') and meta['hash'] != "UNKNOWN":
-                    tid_info["hash"] = meta['hash'].lower()
-                    await async_save_db(site_key, db)
-                else:
-                    tid_info["status"] = "ERROR"
-                    continue # ข้ามไปยังรายการถัดไปถ้าหา Hash ไม่ได้
-            finally:
-                if new_tab: await new_tab.close()
-    
-        # --- PHASE 2: ตรวจสอบความซ้ำซ้อน ---
-        hash_val = tid_info.get("hash")
-        if any(node_obj.is_torrent_exists(hash_val) for node_obj, _ in ctx.active_nodes):
-            tid_info.update({"status": "PROTECTED"})
-            await async_save_db(site_key, db)
-            continue
-
-        # --- PHASE 3: ดาวน์โหลด ---
-        # ถ้า meta ยังไม่มีข้อมูล (เช่น ไม่ได้ผ่านการกู้คืน Hash มา) ให้ดึงข้อมูลรายละเอียดใหม่
-        if not meta.get('download_url'):
-            details_url = f"{base_url.rstrip('/')}/details.php?id={torrent_id}"
-            meta = await get_torrent_details_full(page, base_url, details_url, torrent_id)
+    if not is_empty and not is_vip:
+        rows = soup.select('table.t tr')
+        for row in rows:
+            # ข้าม Header และแถวที่ว่าง
+            if row.find('th') or row.find('td', class_='empty'): continue
             
-        # ตรวจสอบอีกครั้งว่าได้ meta มาจริงๆ ก่อนเรียกดาวน์โหลด
-        if not meta.get('download_url'):
-            print(f"❌ [{site_key}] ID {torrent_id}: ไม่สามารถดึง Download URL ได้")
-            continue
+            # ดึง ID ครั้งเดียวให้ถูกต้อง
+            links = row.find_all('a', href=re.compile(r'details\.php\?id='))
+            valid_link = next((l for l in links if 'userdetails.php' not in l['href']), None)
+            if not valid_link: continue
+            
+            torrent_id = re.search(r'id=(\d+)', valid_link['href']).group(1)
+            current_ids_on_web.append(torrent_id)
+            stats["total"] += 1
+            
+            # ดึงข้อมูลสถานะ
+            hr_status = extract_hr_status(row)
+            if hr_status in ['warning', 'danger']: stats["warning"] += 1
 
-        success = await trigger_download_if_needed(
-            torrent_id, meta.get('name'), meta.get('size_gb'), 
-            details_url, meta.get('download_url'), site_key, 
-            ctx.dl_session, page, ctx.active_nodes, ctx.seen_hashes, 
-            ctx.seen_ids, ctx.global_clean,force_download=(hr_status == 'danger')
+            # เตรียม DB
+            if torrent_id not in db:
+                db[torrent_id] = {"status": "PROTECTED", "hash": "UNKNOWN", "hr_status": hr_status, "added_at": get_now().strftime("%Y-%m-%d %H:%M"), "retry_count": 0}
+                await async_save_db(site_key, db)
+            
+            tid_info = db[torrent_id]
+            tid_info["hr_status"] = hr_status 
+
+            # ข้ามถ้า COMPLETED แล้ว
+            if tid_info.get("status") == "COMPLETED": continue
+    
+            # ตรวจสอบว่าต้องสแกนไหม
+            is_unknown_hash = (tid_info.get("hash") == "UNKNOWN")
+            needs_deep_scan = is_unknown_hash or (hr_status in ['warning', 'danger'])
+            if tid_info.get("status") == "PROTECTED" and not needs_deep_scan: continue
+            
+            stats["scanned"] += 1
+            
+            # --- PHASE 1: กู้คืน Hash ---
+            if is_unknown_hash:
+                new_tab = await page.browser.get("about:blank", new_tab=True)
+                try:
+                    details_url = f"{base_url.rstrip('/')}/details.php?id={torrent_id}"
+                    meta = await get_torrent_details_full(new_tab, base_url, details_url, torrent_id)
+                    if meta.get('hash') and meta['hash'] != "UNKNOWN":
+                        tid_info["hash"] = meta['hash'].lower()
+                        await async_save_db(site_key, db)
+                    else:
+                        tid_info["status"] = "ERROR"
+                        continue # ข้ามไปยังรายการถัดไปถ้าหา Hash ไม่ได้
+                finally:
+                    if new_tab: await new_tab.close()
+    
+            # --- PHASE 2: ตรวจสอบความซ้ำซ้อน ---
+            hash_val = tid_info.get("hash")
+            if any(node_obj.is_torrent_exists(hash_val) for node_obj, _ in ctx.active_nodes):
+                tid_info.update({"status": "PROTECTED"})
+                await async_save_db(site_key, db)
+                continue
+
+            # --- PHASE 3: ดาวน์โหลด ---
+            # ถ้า meta ยังไม่มีข้อมูล (เช่น ไม่ได้ผ่านการกู้คืน Hash มา) ให้ดึงข้อมูลรายละเอียดใหม่
+            if not meta.get('download_url'):
+                details_url = f"{base_url.rstrip('/')}/details.php?id={torrent_id}"
+                meta = await get_torrent_details_full(page, base_url, details_url, torrent_id)
+            
+            # ตรวจสอบอีกครั้งว่าได้ meta มาจริงๆ ก่อนเรียกดาวน์โหลด
+            if not meta.get('download_url'):
+                print(f"❌ [{site_key}] ID {torrent_id}: ไม่สามารถดึง Download URL ได้")
+                continue
+
+            success = await trigger_download_if_needed(
+                torrent_id, meta.get('name'), meta.get('size_gb'), 
+                details_url, meta.get('download_url'), site_key, 
+                ctx.dl_session, page, ctx.active_nodes, ctx.seen_hashes, 
+                ctx.seen_ids, ctx.global_clean,force_download=(hr_status == 'danger')
         )
     
-        if success:
-            tid_info.update({"status": "PROTECTED", "retry_count": 0})
-        else:
-            tid_info.update({"status": "ERROR", "retry_count": tid_info.get("retry_count", 0) + 1})
+            if success:
+                tid_info.update({"status": "PROTECTED", "retry_count": 0})
+            else:
+                tid_info.update({"status": "ERROR", "retry_count": tid_info.get("retry_count", 0) + 1})
     
-        await async_save_db(site_key, db)
+            await async_save_db(site_key, db)
         
-        if torrent_id in db:
-            db[torrent_id]["hr_status"] = hr_status
+            if torrent_id in db:
+                db[torrent_id]["hr_status"] = hr_status
             
-    # STEP 5: การสรุปงาน Cleanup
-    print(f"🧹 [{site_key}] กำลังตรวจสอบไฟล์ที่ต้องเปลี่ยนสถานะเป็น COMPLETED...")
-    
-    # ดึงรายชื่อ ID ที่มีอยู่ใน DB ทั้งหมดมาตรวจสอบ
-    all_stored_ids = list(db.keys())
-    
-    for tid in all_stored_ids:
-        # เงื่อนไข: ถ้า ID นั้นไม่อยู่ในรายการหน้าเว็บปัจจุบัน และสถานะยังไม่เป็น COMPLETED
-        if tid not in current_ids_on_web:
-            current_status = db[tid].get("status")
-            
-            if current_status != "COMPLETED":
-                # ปรับสถานะเป็น COMPLETED
-                db[tid]["status"] = "COMPLETED"
-                # บันทึกเวลาที่เปลี่ยนสถานะ เพื่อให้ระบบ Auto Clean ใช้เป็นจุดอ้างอิงในการลบไฟล์
-                db[tid]["completed_at"] = get_now().strftime("%Y-%m-%d %H:%M")
-                db[tid]["hr_status"] = db[tid].get("hr_status", "unknown")
-                stats["completed"] += 1
-                print(f"✅ [{site_key}] ID {tid}: เปลี่ยนสถานะเป็น COMPLETED (พร้อมสำหรับ Auto Clean)")
+    else:
+        status_msg = "สถานะ VIP" if is_vip else "สถานะปกติ (ว่าง)"
+        print(f"✨ [{site_key}] {status_msg}: ข้ามขั้นตอนประมวลผลรายตัว")
 
-    # บันทึกสถานะล่าสุดลง DB
-    await async_save_db(site_key, db)
-    
-    # สั่งล้าง Cache ทั้งหมดเพื่อให้ NodeCleaner อ่านข้อมูลที่อัปเดตใหม่ในรอบถัดไป
-    NodeCleaner.clear_cache()
-    
-    # STEP 6: รายงานสรุปผล
-    summary_msg = f"🏁 <b>SYNC SUMMARY: {site_key}</b>\n📋 Total: `{stats['total']}`\n🔍 Scanned: `{stats['scanned']}`\n⚠️ Warning/Danger: `{stats['warning']}`\n✅ Completed: `{stats['completed']}`"
-    
+    # ปิดท้ายด้วย Cleanup ตัวเดียว
+    stats["completed"] = await perform_cleanup(site_key, db, current_ids_on_web)
+
+    # ส่ง Notify
+    summary_msg = f"🏁 <b>SYNC SUMMARY: {site_key}</b>\n📋 Total: `{stats['total']}`\n🔍 Scanned: `{stats['scanned']}`\n✅ Completed: `{stats['completed']}`"
     await send_notify(summary_msg)
     print(f"📧 [{site_key}] สรุปผลเรียบร้อย: {stats}")
 
@@ -3443,6 +3423,29 @@ def extract_hr_status(row):
         
     return 'normal'
 
+async def perform_cleanup(site_key, db, current_ids_on_web):
+    """ฟังก์ชันเคลียร์งานค้าง (ใช้ภายนอกคลาส)"""
+    updated = False
+    stats_completed = 0
+    
+    all_stored_ids = list(db.keys())
+    for tid in all_stored_ids:
+        # ถ้า ID ไม่อยู่ในหน้าเว็บปัจจุบัน และยังไม่ COMPLETED
+        if tid not in current_ids_on_web and db[tid].get("status") != "COMPLETED":
+            db[tid].update({
+                "status": "COMPLETED",
+                "completed_at": get_now().strftime("%Y-%m-%d %H:%M"),
+                "hr_status": "none"
+            })
+            updated = True
+            stats_completed += 1
+            print(f"✅ [{site_key}] ID {tid}: เปลี่ยนสถานะเป็น COMPLETED")
+
+    if updated:
+        await async_save_db(site_key, db)
+        NodeCleaner.clear_cache()
+    return stats_completed
+
 async def get_torrent_details_full(page, base_url, details_url, torrent_id):
     """ฟังก์ชันใหม่: ดึงข้อมูลครบจบในที่เดียว"""
     await page.get(details_url)
@@ -3460,7 +3463,7 @@ async def get_torrent_details_full(page, base_url, details_url, torrent_id):
     # ดึง Hash
     real_hash = "UNKNOWN"
     if download_url:
-        raw_data = await download_torrent_via_browser(page, details_url, download_url)
+        raw_data = await download_torrent_smart(page, details_url, download_url)
         if raw_data and raw_data.startswith(b'd'):
             real_hash = extract_info_hash(raw_data).lower()
             
@@ -3529,7 +3532,7 @@ async def trigger_download_if_needed(t_id, t_name, t_size_gb, details_url, downl
         else:
             # 3. โหมดกู้คืน (Recovery) - ทำงานเมื่อโหลดปกติไม่สำเร็จ
             print(f"🔄 เข้าสู่โหมดกู้คืนผ่าน Browser สำหรับ ID: {t_id}")
-            raw_content = await download_torrent_via_browser(browser_instance, details_url, download_url)
+            raw_content = await download_torrent_smart(browser_instance, details_url, download_url)
             
             if raw_content and raw_content.startswith(b'd8:'):
                 raw_data_bytes = raw_content
@@ -4140,27 +4143,20 @@ def is_fresh_and_racing(data, max_age_hours=24):
 
         # 3. 🛠 จัดการฟอร์แมตและแปลงเป็น datetime
         try:
-            clean_time = time_str.strip().replace('/', '-').replace('.', '-')
-            
-            if ' ' not in clean_time and len(clean_time) <= 10:
-                clean_time += " 00:00:00"
-            
-            clean_time = clean_time[:19]
-            
-            date_blocks = clean_time.split(' ')[0].split('-')
-            if len(date_blocks[0]) == 4:
-                fmt = '%Y-%m-%d %H:%M:%S'
-            elif len(date_blocks[-1]) == 4:
-                fmt = '%d-%m-%Y %H:%M:%S'
-            elif len(date_blocks[0]) == 2 and int(date_blocks[0]) > 12:
-                fmt = '%y-%m-%d %H:%M:%S'
-            else:
-                fmt = '%d-%m-%y %H:%M:%S'
-            
-            naive_time = datetime.strptime(clean_time, fmt)
+            # 1. ล้าง HTML Tag ออกให้หมด
+            raw_clean = re.sub(r'<[^>]+>', ' ', time_str) 
+    
+            # 2. จัดรูปแบบให้เป็น DD-MM-YYYY HH:MM:SS
+            # ใช้ re.sub เพื่อแทรกช่องว่างระหว่างปีกับเวลา (ถ้าไม่มี)
+            formatted_time = re.sub(r'(\d{4})(\d{2}:\d{2}:\d{2})', r'\1 \2', raw_clean)
+            formatted_time = formatted_time.strip().replace('/', '-').replace('.', '-')
+    
+            # 3. แปลงเป็น datetime
+            naive_time = datetime.strptime(formatted_time, '%d-%m-%Y %H:%M:%S')
             upload_time = tz.localize(naive_time)
-            
-        except Exception:
+    
+        except Exception as e:
+            print(f"⚠️ แปลงเวลาพลาด: {e} | ข้อมูลดิบ: {time_str}")
             upload_time = now
 
         # 4. Racing Logic (คำนวณอายุจากตารางวันลงที่แท้จริง)
@@ -4727,7 +4723,7 @@ async def main():
                                             print(f"🔄 พบปัญหาการดาวน์โหลด (URL: {current_url}), กำลังเข้าสู่โหมดกู้คืนการคลิกผ่าน Browser...")
     
                                             # เรียกใช้ฟังก์ชันคลิกปุ่มผ่าน tab ที่มี Session ล็อกอินอยู่แล้ว
-                                            raw_content = await download_torrent_via_browser(
+                                            raw_content = await download_torrent_smart(
                                                 dl_session.browser.main_tab, 
                                                 details_url, 
                                                 download_url
@@ -4936,7 +4932,6 @@ async def main():
                 try:
                     if hasattr(active_browser, 'stop'):
                         # ตรวจสอบว่าเป็น coroutine หรือไม่ก่อนจะ await
-                        import inspect
                         if inspect.iscoroutinefunction(active_browser.stop):
                             await asyncio.shield(active_browser.stop())
                         else:
