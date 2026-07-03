@@ -3270,23 +3270,33 @@ def format_site_stats_report(all_nodes):
 async def sync_hr_with_web(site_key, page, base_url, ctx):
     print(f"🔄 [{site_key}] เริ่มต้นกระบวนการ Sync H&R...")
     hr_url = f"{base_url.rstrip('/')}/myhr.php"
-    
-    # STEP 1: การดึงข้อมูล
-    print(f"📡 [{site_key}] กำลังโหลดหน้า H&R: {hr_url}")
     await page.get(hr_url)
     await asyncio.sleep(2)
     
     content = await page.get_content()
-    
-    if not content or len(content) < 500:
-        print(f"❌ [{site_key}] หน้าเว็บว่างเปล่า ข้ามการ Sync")
+    soup = BeautifulSoup(content, 'html.parser')
+
+    # --- เพิ่มส่วนตรวจสอบสถานะ VIP / หน้าว่าง ---
+    # ถ้าเจอ class 'vipbox' แสดงว่าไม่มีภาระ H&R ให้ประมวลผล
+    if soup.find('div', class_='vipbox'):
+        print(f"✨ [{site_key}] สถานะ VIP ตรวจพบ: ไม่มีภาระ H&R ที่ต้องจัดการ")
+        
+        # ปรับสถานะงานค้างเก่าใน DB ให้เป็น COMPLETED ทั้งหมดเพื่อเคลียร์พื้นที่
+        db = await async_load_db(site_key)
+        updated = False
+        for tid in db:
+            if db[tid].get("status") != "COMPLETED":
+                db[tid].update({"status": "COMPLETED", "completed_at": get_now().strftime("%Y-%m-%d %H:%M")})
+                updated = True
+        
+        if updated:
+            await async_save_db(site_key, db)
+            NodeCleaner.clear_cache()
+            # เพิ่มการแจ้งเตือนเมื่อระบบทำการเคลียร์งานให้โดยอัตโนมัติ
+            await send_notify(f"✨ <b>[{site_key}] VIP Status Detected:</b> ระบบได้ทำการเคลียร์งานค้าง H&R ทั้งหมดเป็น COMPLETED เรียบร้อยแล้ว")
+            print(f"✅ [{site_key}] อัปเดตงานค้างใน DB เป็น COMPLETED เรียบร้อย")
         return
 
-    if "myhr" not in content.lower() and "details" not in content.lower():
-        print(f"❌ [{site_key}] โครงสร้างหน้าไม่ถูกต้อง ข้ามการ Sync")
-        return
-    
-    soup = BeautifulSoup(content, 'html.parser')
     db = await async_load_db(site_key)
     rows = soup.find_all('tr')
     print(f"📄 [{site_key}] พบรายการทั้งหมด {len(rows)} รายการ")
