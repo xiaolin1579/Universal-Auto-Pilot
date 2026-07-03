@@ -922,6 +922,8 @@ class QbitNode:
                     'progress': t.get('progress', 0.0),
                     'state': t.get('state', 'unknown'),
                     'added_on': t.get('added_on'),
+                    'leechers': t.get('num_leechs', 0),       # จำนวน Leechers
+                    'up_speed': t.get('upspeed', 0),
                     'ts_finished': t.get('completion_on', 0),
                     'ts_init': t.get('added_on', 0),
                     'is_rt_complete': t.get('progress', 0) >= 1.0
@@ -1354,6 +1356,8 @@ class RtorrentNode:
                 <param><value><string>d.left_bytes=</string></value></param>
                 <param><value><string>d.timestamp.finished=</string></value></param>
                 <param><value><string>d.state=</string></value></param>
+                <param><value><string>d.up.rate=</string></value></param>
+                <param><value><string>d.peers_leeching=</string></value></param>
                 <param><value><string>d.creation_date=</string></value></param> 
             </params>
             </methodCall>'''
@@ -1403,6 +1407,8 @@ class RtorrentNode:
                 t_ts_finished_str = safe_get_text(values[6])
                 t_state_str = safe_get_text(values[7]) if len(values) > 7 else "1"
                 t_ts_created_str = safe_get_text(values[8])
+                t_up_rate_str = safe_get_text(values[9]) 
+                t_leechers_str = safe_get_text(values[10])
 
                 # 🎯 ปลดล็อก: ส่งข้อมูลดิบออกไปทั้งหมด ไม่ใช้คำสั่ง continue เตะงานทิ้งกลางคัน
                 # ย้ายการตัดสินใจเรื่องความเสร็จสมบูรณ์ไปให้ฟังก์ชันสลัดดิสก์ภายนอกจัดการ
@@ -1446,6 +1452,8 @@ class RtorrentNode:
                         'added_on': ts_finished, # ใช้ ts_finished เป็นตัวแทนเมื่อไม่มี added_on
                         'ts_finished': ts_finished,
                         'ts_init': ts_init,     # เพิ่ม ts_init เพื่อ Safety Gate
+                        'up_speed': int(t_up_rate_str) if t_up_rate_str.isdigit() else 0,
+                        'leechers': int(t_leechers_str) if t_leechers_str.isdigit() else 0,
                         'is_rt_complete': is_complete_flag
                     })
                 
@@ -2152,8 +2160,8 @@ class NodeCleaner:
                     age_hours = (now - float(ts_finished)) / 3600
                     ratio = float(t.get('ratio', 0))
                     # หมายเหตุ: ถ้าต้องการ up_speed/num_leechers ต้องดึงเพิ่มใน multicall2
-                    up_speed = 0 
-                    leechers = 0
+                    up_speed = float(t.get('up_speed', 0)) 
+                    leechers = float(t.get('leechers', 0))
                 except (ValueError, TypeError):
                     continue
 
@@ -2197,25 +2205,39 @@ class NodeCleaner:
 
             for t in raw_torrents:
                 t_hash = t.get('hash')
-                # ใช้ระบบ Permission เดิมที่ตรวจสอบไว้แล้ว
                 if self.check_torrent_permission(t_hash) == "PROTECTED":
                     continue
-                
-                # กรองเวลาเริ่มต้น (ป้องกันการลบงานใหม่เพิ่งเพิ่ม)
+    
+                # 1. กรองเวลาเริ่มต้น (Grace Period)
                 ts_init = t.get('added_on', t.get('ts_init', 0))
                 if (current_ts - ts_init) < 2700:
                     continue
 
+                # 2. ดึงค่าสถานะไฟล์
                 t_size_gb = t.get('size_bytes', 0) / (1024**3)
                 t_ratio = t.get('ratio', 0.0)
                 is_completed = (t.get('progress', 0) >= 0.99) or (t.get('amount_left', 1) == 0)
+    
+                # ดึงค่าความนิ่ง (ใช้ Default เป็น 0 หาก API ไม่ส่งมา)
+                upspeed = float(t.get('up_speed', 0))
+                leechers = float(t.get('leechers', 0))
+    
+                # --- เพิ่มเงื่อนไขไฟล์นิ่งสนิท ---
+                is_stagnant = (upspeed == 0 and leechers == 0)
 
                 t['_calculated_size_gb'] = t_size_gb
                 t['_calculated_ratio'] = t_ratio
 
                 if is_completed:
-                    if (is_emergency and t_size_gb >= 1.0) or (t_ratio >= 1.0 and t_size_gb >= 1.0):
+                    # เงื่อนไขการลบ: 
+                    # ต้องมีขนาดไฟล์ถึงเกณฑ์ + (เป็นโหมดฉุกเฉิน หรือ ได้ Ratio แล้ว หรือ ไฟล์นิ่งสนิท)
+                    can_remove_completed = (is_emergency and t_size_gb >= 1.0) or \
+                                           (t_ratio >= 1.0 and t_size_gb >= 1.0) or \
+                                           (is_stagnant and t_size_gb >= 1.0) # ไฟล์นิ่งก็ลบได้
+        
+                    if can_remove_completed:
                         scannable_torrents.append(t)
+            
                 elif t_size_gb >= 2.0 and 'allocating' not in str(t.get('state', '')).lower():
                     leeching_backups.append(t)
 
@@ -2224,11 +2246,27 @@ class NodeCleaner:
                 leeching_backups.sort(key=lambda x: -x['_calculated_size_gb'])
                 scannable_torrents = leeching_backups[:2]
 
-            # เลือกงานและลบผ่าน _hard_purge_sequence
-            scannable_torrents.sort(key=lambda x: (-x['_calculated_size_gb'], x['_calculated_ratio']))
+            # 3. ให้คะแนนความคุ้มค่า (Scoring) เพื่อจัดลำดับการลบ
+            def get_priority_score(t):
+                # คะแนนพื้นฐานคือขนาดไฟล์ (ยิ่งใหญ่ยิ่งได้เปรียบในการคืนพื้นที่)
+                score = t['_calculated_size_gb']
+                
+                # ถ้าไฟล์นิ่งสนิท (Stagnant) ให้คะแนนพิเศษเพิ่ม 10 เท่า
+                # เพื่อดันไฟล์นิ่งขึ้นมาอยู่ต้น List การถูกลบเสมอ
+                if (t.get('up_speed', 0) == 0 and t.get('leechers', 0) == 0):
+                    score *= 10.0
+                
+                return score
+
+            # เรียงลำดับจากคะแนนที่คำนวณได้ (จากมากไปน้อย)
+            scannable_torrents.sort(key=get_priority_score, reverse=True)
+            
+            # เลือกเป้าหมาย
             targets = scannable_torrents[:15 if is_emergency else 6]
             
+            # 4. ดำเนินการลบ
             for t in targets:
+                print(f"🗑️ [PURGE] Removing: {t.get('name', 'Unknown')} | Size: {t['_calculated_size_gb']:.2f}GB")
                 self._hard_purge_sequence(t['hash'])
 
             return True
