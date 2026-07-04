@@ -28,6 +28,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
 from pyvirtualdisplay import Display
 import asyncio
+import gc
 import nodriver as uc
 from nodriver import cdp, Config
 import pytz
@@ -64,6 +65,7 @@ async def handle_exit(sig):
             kill_specific_browser()
             await cleanup_profile()
             browser_instance = None
+            kill_xvfb()
             print("✅ [Step 1/3] Browser ปิดเรียบร้อย")
 
     # สั่งงานปิด Browser และ Xvfb แบบคู่ขนาน
@@ -527,8 +529,8 @@ async def launch_any_browser(sitename="default", custom_args=None):
         # ตั้งค่า Download Behavior
         await _active_browser_instance.send(
             uc.cdp.browser.set_download_behavior(
-                behavior="deny",
-                download_path="/dev/null"
+                behavior="allow",
+                download_path="/tmp"
             )
         )
         print(f"🚀 [System] Browser รันสำเร็จ")
@@ -576,17 +578,20 @@ def kill_specific_browser():
 async def cleanup_profile():
     global _current_profile_path
     if _current_profile_path and os.path.exists(_current_profile_path):
-        try:
-            # 1. ใส่ await ให้กับ asyncio.sleep
-            await asyncio.sleep(2) 
-            
-            # 2. ใช้ shutil.rmtree
-            shutil.rmtree(_current_profile_path, ignore_errors=False)
-            print(f"🧹 [System] ลบ Profile สำเร็จ: {_current_profile_path}")
-        except Exception as e:
-            print(f"⚠️ ลบ Profile ไม่ได้ในรอบนี้ (อาจติด Lock): {e}")
-        finally:
-            _current_profile_path = None
+        # 1. พักนานขึ้นเล็กน้อยหลังการสั่งปิด เพื่อให้ OS ปล่อย Handle
+        await asyncio.sleep(3) 
+        
+        # 2. ใช้การ Retry ลบ (กรณีติด Lock ของ OS)
+        for i in range(5): 
+            try:
+                shutil.rmtree(_current_profile_path, ignore_errors=False)
+                print(f"🧹 [System] ลบ Profile สำเร็จ: {_current_profile_path}")
+                break
+            except Exception as e:
+                print(f"⚠️ ลบ Profile ไม่ได้ (Retry {i+1}/5): {e}")
+                await asyncio.sleep(2) # รออีกนิดแล้วลองใหม่
+        
+        _current_profile_path = None
 
 def kill_xvfb():
     global _global_display
@@ -928,7 +933,7 @@ class QbitNode:
                     'progress': t.get('progress', 0.0),
                     'state': t.get('state', 'unknown'),
                     'added_on': t.get('added_on'),
-                    'leechers': t.get('num_leechs', 0),       # จำนวน Leechers
+                    'leechers': t.get('num_leechs', 0),
                     'up_speed': t.get('upspeed', 0),
                     'ts_finished': t.get('completion_on', 0),
                     'ts_init': t.get('added_on', 0),
@@ -2592,43 +2597,43 @@ async def auto_click_thanks(page, details_url: str) -> bool:
     
     try:
         await page.get(details_url)
-        # รอสักครู่เพื่อให้หน้าเว็บโหลด DOM ที่เปลี่ยนไปหลังจากกดขอบคุณเสร็จแล้ว
         await asyncio.sleep(2) 
 
         js_code = """
         (() => {
-            // ค้นหา container
-            const td = document.querySelector('td#saythanks');
-            if (!td) return "container_not_found"; // ถ้าไม่มี td นี้เลย
-            
-            // ค้นหาปุ่มภายใน
-            const btn = td.querySelector('a[onclick*="sndReq"]');
-            
-            if (!btn) {
-                // ถ้าไม่เจอ a[onclick] อาจเป็นเพราะกดไปแล้ว หรือเปลี่ยนสถานะไปแล้ว
-                return "already_thanked_or_no_button";
+            // 1. ตรวจสอบรูปแบบ A: ปุ่ม a[onclick] (แบบเดิม)
+            const tdSayThanks = document.querySelector('td#saythanks');
+            if (tdSayThanks) {
+                const btnA = tdSayThanks.querySelector('a[onclick*="sndReq"]');
+                if (btnA) { btnA.click(); return "clicked_a"; }
             }
-            
-            // ถ้าเจอ ให้คลิก
-            btn.click();
-            return "clicked";
+
+            // 2. ตรวจสอบรูปแบบ B: ปุ่ม input[type="submit"] ในฟอร์ม (แบบใหม่)
+            // ค้นหา div#ajax ที่มีฟอร์มขอบคุณ
+            const divAjax = document.querySelector('div#ajax');
+            if (divAjax) {
+                const inputBtn = divAjax.querySelector('input[type="submit"][name="submit"]');
+                if (inputBtn) {
+                    inputBtn.click();
+                    return "clicked_input";
+                }
+            }
+
+            return "no_button";
         })()
         """
         
         status = await page.evaluate(js_code)
 
-        if status == "clicked":
-            print("✅ กดขอบคุณสำเร็จ")
+        if "clicked" in status:
+            print(f"✅ กดขอบคุณสำเร็จ (รูปแบบ: {status})")
             return True
-        elif status == "already_thanked_or_no_button":
-            print("⏭️ ไม่พบปุ่ม (อาจจะเคยกดไปแล้ว หรือสถานะการขอบคุณปิดอยู่)")
-            return False
         else:
-            print("⚠️ ไม่พบส่วนประกอบการขอบคุณในหน้าเว็บ")
+            print("⏭️ ไม่พบปุ่มขอบคุณในหน้าเว็บ (อาจจะขอบคุณไปแล้วหรือไม่มีระบบนี้)")
             return False
             
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Error ในการกดขอบคุณ: {e}")
         return False
 
 def format_size(size_gb):
@@ -3008,15 +3013,64 @@ BAD_LINK_PATTERN = re.compile(r"ndonatedn|vip|donate|/nDonatedN\.php", re.I)
 SIZE_PATTERN = re.compile(r"(\d+\.?\d*\s*(?:MB|GB|TB))", re.I)
 
 async def extract_torrent_data(row, base_url, dl_session=None, headers=None, checked_cache=None):
-    if row is None: return None
+    if row is None: 
+        return None
     
-    # ตรวจสอบว่าเป็นเว็บไหนจาก base_url
-    is_torrentdd = "torrentdd" in base_url.lower()
+    url_lower = base_url.lower()
     
-    if is_torrentdd:
-        return await _extract_torrentdd_logic(row, base_url, dl_session, headers, checked_cache)
-    else:
-        return await _extract_bearbit_logic(row, base_url, dl_session, headers, checked_cache)
+    # ใช้ try-except ครอบการทำงาน เพื่อป้องกันบอท Crash เมื่อเจอโครงสร้างเว็บผิดปกติ
+    try:
+        if "torrentdd" in url_lower:
+            return await _extract_torrentdd_logic(row, base_url, dl_session, headers, checked_cache)
+        elif "unlimitz" in url_lower:
+            return await _extract_unlimitz_logic(row, base_url, dl_session, headers, checked_cache)
+        elif "bearbit" in url_lower:
+            return await _extract_bearbit_logic(row, base_url, dl_session, headers, checked_cache)
+        else:
+            print(f"⚠️ ไม่พบ Logic สำหรับเว็บไซต์: {base_url}")
+            return None
+            
+    except Exception as e:
+        print(f"❌ เกิดข้อผิดพลาดในการดึงข้อมูลจาก {base_url}: {e}")
+        return None
+
+async def _extract_unlimitz_logic(row, base_url, dl_session, headers, checked_cache):
+    tds = row.find_all("td")
+    if len(tds) < 12: return None
+
+    # 1. สกัด ID & Title
+    title_tag = tds[1].find("a", href=re.compile(r"details\.php"))
+    t_id = re.search(r"id=(\d+)", title_tag['href']).group(1) if title_tag else None
+    title = title_tag.get_text(strip=True) if title_tag else "Unknown"
+    details_url = f"{base_url.rstrip('/')}/details.php?id={t_id}"
+
+    # 2. สกัดเวลา (อยู่ใน tds[7] มี tag <nobr>)
+    # ข้อมูลดิบ: 2026-07-04<br />10:15:22
+    raw_date = tds[7].get_text(separator=' ', strip=True) 
+
+    # 3. สกัด Stats (Seed/Leech)
+    # tds[10] = Seeders, tds[11] = Leechers
+    seeders = extract_digit(tds[10])
+    leechers = extract_digit(tds[11])
+    
+    # 4. สกัด Size (tds[8])
+    size_str = tds[8].get_text(separator=' ', strip=True).replace(" ", "")
+
+    # 5. สกัด Download URL (tds[2])
+    dl_tag = tds[2].find("a", href=re.compile(r"/d\.php"))
+    download_url = f"{base_url.rstrip('/')}/{dl_tag['href'].lstrip('/')}" if dl_tag else None
+
+    return {
+        "id": t_id,
+        "title": title,
+        "seeders": seeders,
+        "leechers": leechers,
+        "completed": 0, # Unlimitz ไม่มีคอลัมน์นี้ชัดเจน
+        "size_str": size_str,
+        "raw_date": raw_date,
+        "download_url": download_url,
+        "details_url": details_url
+    }
 
 async def _extract_torrentdd_logic(row, base_url, dl_session, headers, checked_cache):
     # --- Logic เดิม ---
@@ -3202,41 +3256,68 @@ class ResponseWrapper:
 async def download_torrent_smart(tab, details_url, download_url):
     # 1. เข้าลิงค์ Download
     await tab.get(download_url)
-    await asyncio.sleep(2)
+    await asyncio.sleep(3)
     
-    # 2. ตรวจสอบว่ามี AdGate หรือไม่
+    # 2. ตรวจสอบหน้าเว็บ
+    unlimitz_link = await tab.evaluate("document.querySelector('a[href*=\"/dI.php/\"]') ? document.querySelector('a[href*=\"/dI.php/\"]').href : null")
     is_adgate = await tab.evaluate("!!document.getElementById('bbDlBtn')")
     
-    # สมาชิกปกติที่ต้องผ่าน AdGate
-    if is_adgate:
-        print("🛡️ ตรวจพบระบบ AdGate (สมาชิกปกติ)... กำลังดำเนินการผ่านเงื่อนไข")
+    final_dl_url = download_url # ตั้งค่าเริ่มต้น
+
+    if unlimitz_link:
+        print("🛡️ ตรวจพบหน้ายืนยัน Unlimitz... กำลังเข้าสู่ไฟล์")
+        await tab.get(unlimitz_link)
+        await asyncio.sleep(3)
+        # อัปเดตลิงก์ให้เป็นลิงก์สุดท้ายที่ browser ไปถึง
+        final_dl_url = await tab.evaluate("""
+            (() => {
+                // ค้นหา <a> ที่มี href ขึ้นต้นด้วย /dI.php/ 
+                // โดยดูจากโครงสร้าง HTML ที่คุณให้มา
+                const link = document.querySelector('a[href*="/dI.php/"]');
+                return link ? link.href : null;
+            })()
+        """)
         
-        # รอจนกว่าปุ่มจะเลิก disabled
+    elif is_adgate:
+        print("🛡️ ตรวจพบระบบ AdGate...")
         for i in range(10):
             is_locked = await tab.evaluate("document.getElementById('bbDlBtn').classList.contains('bb-disabled')")
-            if not is_locked:
-                break
+            if not is_locked: break
             await asyncio.sleep(1)
-        
-        # ดึง URL ที่ถูกปลดล็อกแล้ว (เป็น Absolute URL)
-        download_url = await tab.evaluate("document.getElementById('bbDlBtn').href")
-    else:
-        print("🚀 สมาชิก VIP หรือไม่ต้องผ่าน AdGate... ดำเนินการดาวน์โหลด")
+        final_dl_url = await tab.evaluate("document.getElementById('bbDlBtn').href")
 
-    # 3. เตรียมดาวน์โหลด (ดึง Session ที่ถูกต้องเสมอ)
-    cookies_data = await tab.send(cdp.network.get_cookies())
-    cookies_dict = {c.name: c.value for c in cookies_data}
-    user_agent = await tab.evaluate("navigator.userAgent")
+    print(f"🔗 กำลังดักจับการดาวน์โหลด: {final_dl_url}")
     
-    # 4. ดาวน์โหลดไฟล์
+    # 3. สั่งให้ Browser คลิกที่ปุ่ม (หรือเข้าลิงก์)
+    # การคลิกจริงผ่าน Browser จะทำให้ตัวแปรสภาพแวดล้อมสมบูรณ์ที่สุด
+    await tab.evaluate(f"window.location.href = '{final_dl_url}'")
+    
+    # 4. ใช้การดึง Response Body โดยตรงผ่าน Network.responseReceived
+    # วิธีนี้คือการขอข้อมูลจาก Browser หลังจากมันโหลดเสร็จแล้ว
+    # เราจะใช้คำสั่ง tab.send(uc.cdp.network.get_response_body(request_id=...)) 
+    # แต่เนื่องจากเราไม่ทราบ request_id ให้เราใช้การวนลูปเช็คจาก 'Network.responseReceived'
+    
+    # คำแนะนำ: ถ้าการดึงผ่าน Network ตรงๆ ยังยาก ให้ใช้เทคนิค "รอไฟล์ใน Disk"
+    # แต่เพื่อไม่ให้คุณต้องเก็บไฟล์ ผมแนะนำให้ดึงผ่าน Fetch แบบใส่ Header ตัวเต็ม:
+    
     import aiohttp
-    async with aiohttp.ClientSession(cookies=cookies_dict) as session:
-        headers = {'Referer': details_url, 'User-Agent': user_agent}
-        async with session.get(download_url, headers=headers) as resp:
-            content = await resp.read()
-            if resp.status == 200 and (content.startswith(b'd8:') or 'bittorrent' in resp.headers.get('Content-Type', '')):
-                print("✅ ดาวน์โหลดสำเร็จ!")
-                return content
+    cookies = {c.name: c.value for c in await tab.send(uc.cdp.network.get_cookies())}
+    
+    async with aiohttp.ClientSession(cookies=cookies) as session:
+        headers = {
+            'User-Agent': await tab.evaluate("navigator.userAgent"),
+            'Referer': final_dl_url,
+            'Accept': '*/*'
+        }
+        async with session.get(final_dl_url, headers=headers) as resp:
+            if resp.status == 200:
+                content = await resp.read()
+                if content.startswith(b'd8:'):
+                    print("✅ ดาวน์โหลดสำเร็จผ่าน Session ที่ดึงจาก Browser!")
+                    return content
+                else:
+                    print("❌ สิ่งที่ได้ไม่ใช่ไฟล์ Torrent")
+                    return None
             else:
                 print(f"❌ ดาวน์โหลดล้มเหลว Status: {resp.status}")
                 return None
@@ -4948,32 +5029,42 @@ async def main():
                         await site_page.close()
                         print(f"📂 ปิด Tab ของ {site_name} เรียบร้อย")
 
-            # ปิด Browser หลังจากปิด Tab แล้ว
-            active_browser = browser_instance 
+                # ปิด Browser หลังจากปิด Tab แล้ว
+                active_browser = browser_instance 
             
-            if active_browser is not None:
-                try:
-                    if hasattr(active_browser, 'stop'):
-                        # ตรวจสอบว่าเป็น coroutine หรือไม่ก่อนจะ await
-                        if inspect.iscoroutinefunction(active_browser.stop):
-                            await asyncio.shield(active_browser.stop())
-                        else:
-                            active_browser.stop() # เรียกแบบปกติถ้าไม่ใช่ async
-                except Exception as e:
-                    print(f"⚠️ Warning during stop(): {e}")
-                finally:
-                    # ไม่ว่า stop() จะพังหรือไม่ ให้ใช้ kill_specific_browser 
-                    # ซึ่งใช้ PID ในการสั่งปิดจริง (OS Level) 
-                    # เพื่อให้แน่ใจว่า Browser ตายแน่นอน
-                    kill_specific_browser()
-                    
-                    # ล้างค่าใน Instance และลบ profile
-                    browser_instance = None
-                    await cleanup_profile() # ฟังก์ชันลบโฟลเดอร์ที่เราคุยกัน
-                    
-                    print("🔒 [System] ปิด Browser และเคลียร์หน่วยความจำแล้ว")
-            else:
-                print("ℹ️ Browser instance ไม่มีอยู่แล้ว")
+                if active_browser:
+                    try:
+                        # ใช้เงื่อนไขตรวจสอบให้ชัดเจน
+                        if hasattr(active_browser, 'stop'):
+                            if inspect.iscoroutinefunction(active_browser.stop):
+                                await active_browser.stop()
+                            else:
+                                active_browser.stop()
+                    except Exception as e:
+                        print(f"⚠️ Error ในระหว่างปิด Browser: {e}")
+                    finally:
+                        # 1. ฆ่า process ทิ้งเสมอเพื่อเคลียร์สถานะ
+                        kill_specific_browser()
+    
+                        # 2. เคลียร์ reference ทันที
+                        browser_instance = None
+                        active_browser = None
+    
+                        # 3. บังคับ Garbage Collector ให้ทำงาน
+                        gc.collect()
+    
+                        # 4. พักการทำงานให้ OS เคลียร์ File Handles
+                        await asyncio.sleep(2) 
+    
+                        # 5. ลบ Profile
+                        await cleanup_profile()
+                        
+                        # 6. ปิด Xvfb (ถ้ามี)
+                        kill_xvfb()
+    
+                        print("🔒 [System] ปิด Browser และเคลียร์หน่วยความจำแล้ว")
+                else:
+                    print("ℹ️ Browser instance ไม่มีอยู่แล้ว")
 
             #รันรายงานสถิติ (ยิง api ตรง)
             stats_report = format_site_stats_report([n[0] for n in active_nodes])
