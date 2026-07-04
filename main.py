@@ -2356,6 +2356,9 @@ def clear_and_fill(page, selector, text):
     page.wait_for_timeout(1000)
 
 async def ensure_site_logged_in(page: uc.Tab, site_cfg: dict) -> bool:
+    if page is None:
+        print("🚨 ตรวจพบ page เป็น None, ส่งสัญญาณรีเซ็ต...")
+        return False # ลูปหลักจะได้รับค่านี้แล้วไปสร้าง instance ใหม่
     site_key = site_cfg['name']
     base_url = site_cfg.get('base_url', '').rstrip('/')
     target_list = site_cfg.get('target_urls', [])
@@ -3472,7 +3475,8 @@ async def sync_hr_with_web(site_key, page, base_url, ctx):
                 await async_save_db(site_key, db)
             
             tid_info = db[torrent_id]
-            tid_info["hr_status"] = hr_status 
+            tid_info["hr_status"] = hr_status
+            meta = {}
 
             # ข้ามถ้า COMPLETED แล้ว
             if tid_info.get("status") == "COMPLETED": continue
@@ -4278,9 +4282,16 @@ def is_fresh_and_racing(data, max_age_hours=24):
         total_hours = age_delta.total_seconds() / 3600
         
         # เงื่อนไขกรองไฟล์
-        if age_delta.total_seconds() < -300: return False # ป้องกันเวลาในเว็บเพี้ยน
-        if total_hours > max_age_hours: return False
-        if data['leechers'] < 1: return False
+        short_title = data['title'][:30]
+        print(f" 📊 System Date: {short_title}.. (Seeders:{data['seeders']} Leechers:{data['leechers']} Age:{total_hours:.1f}ชม.)")
+        if age_delta.total_seconds() < -300: 
+            return False # ป้องกันเวลาในเว็บเพี้ยน
+        if total_hours > max_age_hours: 
+            print(f" ⏭️ ข้าม: [เก่าเกิน {max_age_hours} ชม.]")
+            return False
+        if data['leechers'] < 1: 
+            print(f" ⏭️ ข้าม: [ไม่มีคนโหลด]")
+            return False
             
         return True
     except Exception as e:
@@ -4502,38 +4513,7 @@ async def main():
             # =================================================================
             # 2. BROWSER SECTION (nodriver Implementation)
             # =================================================================
-            
-            if 'site' not in locals():
-                site = "initial_boot"
 
-            # ตรวจสอบว่ามี instance หรือไม่ และยังเชื่อมต่ออยู่หรือไม่ (Is connected?)
-            is_browser_healthy = False
-            if browser_instance is not None:
-                try:
-                    await browser_instance.target.get_targets()
-                    is_browser_healthy = True
-                
-                except Exception:
-                    print("⚠️ ตรวจพบการเชื่อมต่อ Browser ขัดข้อง, กำลังรีเซ็ต...")
-                    browser_instance = None
-                    # รีเซ็ตตัวแปรที่เกี่ยวข้องไปด้วยเพื่อให้มั่นใจว่าต้องสร้างใหม่
-                    site_page = None
-                    dl_session = None
-
-            if not is_browser_healthy:
-                # ใช้ค่า site ที่กำหนดไว้แล้ว หากยังไม่มีค่าในลูปให้ใช้ 'system_init'
-                target_site = site if 'site' in locals() else "system_init"
-                print(f"🌐 กำลังเริ่ม Browser instance ใหม่สำหรับ: {target_site}...")
-                browser_instance = await launch_any_browser(target_site, stealth_args)
-    
-                site_page = await browser_instance.get("about:blank", new_tab=True)
-                dl_session = BrowserSessionWrapper(browser_instance)
-            
-            # กรณีที่ Browser ปกติ แต่เรายังไม่มี site_page หรือ dl_session (รอบแรก)
-            elif 'site_page' not in locals():
-                site_page = await browser_instance.get("about:blank", new_tab=True)
-                dl_session = BrowserSessionWrapper(browser_instance)
-            
             target_sites_cfg = [s for s in CFG.get('SITE', []) if s.get('enable', True)]
             print(f"📡 Detected Sites: {[s['name'] for s in target_sites_cfg]}")
 
@@ -4547,13 +4527,52 @@ async def main():
                 data_saved = False
         
                 try:
-                    if site_page is None:
-                        print(f"❌ [{site}] ไม่สามารถสร้าง Tab ใหม่ได้")
-                        continue
+                   # ตรวจสอบว่ามี instance หรือไม่ และยังเชื่อมต่ออยู่หรือไม่ (Is connected?)
+                    is_browser_healthy = False
+                    if browser_instance is not None:
+                        try:
+                            await browser_instance.target.get_targets()
+                            is_browser_healthy = True
+                        
+                        except Exception:
+                            print("⚠️ ตรวจพบการเชื่อมต่อ Browser ขัดข้อง, กำลังรีเซ็ต...")
+                            browser_instance = None
+                            # รีเซ็ตตัวแปรที่เกี่ยวข้องไปด้วยเพื่อให้มั่นใจว่าต้องสร้างใหม่
+                            site_page = None
+                            dl_session = None
+
+                    if not is_browser_healthy:
+                        # ใช้ค่า site ที่กำหนดไว้แล้ว หากยังไม่มีค่าในลูปให้ใช้ 'system_init'
+                        target_site = site if 'site' in locals() else "system_init"
+                        print(f"🌐 กำลังเริ่ม Browser instance ใหม่สำหรับ: {target_site}...")
+                        browser_instance = await launch_any_browser(target_site, stealth_args)
+            
+                        site_page = await browser_instance.get("about:blank", new_tab=True)
+                        dl_session = BrowserSessionWrapper(browser_instance)
+                    
+                    # กรณีที่ Browser ปกติ แต่เรายังไม่มี site_page หรือ dl_session (รอบแรก)
+                    elif 'site_page' not in locals():
+                        site_page = await browser_instance.get("about:blank", new_tab=True)
+                        dl_session = BrowserSessionWrapper(browser_instance)
+
                     login_result = await safe_await(ensure_site_logged_in(site_page, site_cfg), "SiteLogin")
                     if login_result is True:
                         try:
-                            cookies = await site_page.send(cdp.network.get_cookies())
+                            # 1. เช็คก่อนว่า Tab ยังเปิดอยู่หรือไม่
+                            if site_page is None:
+                                print(f"⚠️ [{site}] site_page เป็น None, กำลังกู้คืน...")
+                                # พยายามสร้างใหม่ทันที
+                                site_page = await browser_instance.get("about:blank", new_tab=True)
+                                # รอให้หน้าเว็บโหลดสักนิดก่อนไปต่อ
+                                await asyncio.sleep(1)
+
+                            # 2. เพิ่มการรอ Network ให้เงียบก่อนสั่งดึง Cookie
+                            # (จำเป็นมากเพื่อเลี่ยงการดึงขณะหน้าเว็บกำลังเปลี่ยนสถานะ)
+                            await asyncio.sleep(1.5) 
+                            
+                            # 3. ดึง Cookie โดยใช้ Timeout ป้องกันการค้าง
+                            cookies = await asyncio.wait_for(site_page.send(cdp.network.get_cookies()), timeout=5)
+
                             # ในบาง library ผลลัพธ์ที่ได้อาจอยู่ใน ['cookies']
                             if isinstance(cookies, dict) and 'cookies' in cookies:
                                 cookies = cookies['cookies']
@@ -4590,9 +4609,21 @@ async def main():
                                 } for c in cookies if target_domain in (c.domain if hasattr(c, 'domain') else c['domain'])]
                                 json.dump(cookie_list, f)
 
-                        except Exception as cookie_err:
-                            print(f"⚠️ [{site}] ไม่สามารถดึงคุกกี้: {cookie_err}")
+                        except (asyncio.TimeoutError, Exception) as cookie_err:
+                            print(f"⚠️ [{site}] ดึงคุกกี้ล้มเหลว: {cookie_err}")
                             
+                            # ถ้าเจอ error เกี่ยวกับ Session หรือ WebSocket ให้ถือว่า Tab นี้พัง
+                            if "-32001" in str(cookie_err) or "no close frame" in str(cookie_err).lower():
+                                print(f"🔄 [{site}] Session พัง, กำลังสร้าง Tab ใหม่...")
+                                try:
+                                    site_page = await browser_instance.get("about:blank", new_tab=True)
+                                    # หลังจากสร้างใหม่ ต้องลอง Login อีกรอบ
+                                    await ensure_site_logged_in(site_page, site_cfg)
+                                    await asyncio.sleep(2)
+                                except Exception as e:
+                                    print(f"❌ ไม่สามารถกู้คืน Tab ได้: {e}")
+                                    continue # ข้ามไซต์นี้ไปเลย
+
                         ctx = BotContext(active_nodes, dl_session, seen_hashes, seen_ids, global_clean)
                         stats_data = await get_site_stats(site_page, site_cfg, ctx)
                         print(stats_data)
@@ -4718,16 +4749,7 @@ async def main():
                                             f.write(resp.text)
                                         print(f" ⚠️ [{t_id}] ข้าม: ไม่พบลิงก์ดาวน์โหลด")
                                         continue
-
-                                    if not is_fresh_and_racing(data):
-                                        count_skip += 1
-                                        continue  
-
-                                    if t_id in seen_ids:
-                                        print(f" ❌ ข้าม: เคยเพิ่มไปแล้ว (ใน {site})")
-                                        count_skip += 1
-                                        continue
-
+                                    
                                     safe_title = clean_name(raw_title)
                                     is_stat = any(word in safe_title.lower() for word in ['ratio', 'bonus', 'upload', 'download'])
                                         
@@ -4737,6 +4759,15 @@ async def main():
                                         t_name = f"Torrent_ID_{t_id}"
 
                                     print(f"🔍 [{site.upper()}] Checking: {t_name[:50]}... (ID: {t_id})")
+                                    
+                                    if not is_fresh_and_racing(data):
+                                        count_skip += 1
+                                        continue  
+
+                                    if t_id in seen_ids:
+                                        print(f" ❌ ข้าม: เคยเพิ่มไปแล้ว (ใน {site})")
+                                        count_skip += 1
+                                        continue
 
                                     t_size_gb = parse_size(data['size_str'])
                                     if not (SET.get('MIN_SIZE_GB', 0) <= t_size_gb <= SET.get('MAX_SIZE_GB', 999)):
@@ -5029,42 +5060,42 @@ async def main():
                         await site_page.close()
                         print(f"📂 ปิด Tab ของ {site_name} เรียบร้อย")
 
-                # ปิด Browser หลังจากปิด Tab แล้ว
-                active_browser = browser_instance 
+                    # ปิด Browser หลังจากปิด Tab แล้ว
+                    active_browser = browser_instance 
             
-                if active_browser:
-                    try:
-                        # ใช้เงื่อนไขตรวจสอบให้ชัดเจน
-                        if hasattr(active_browser, 'stop'):
-                            if inspect.iscoroutinefunction(active_browser.stop):
-                                await active_browser.stop()
-                            else:
-                                active_browser.stop()
-                    except Exception as e:
-                        print(f"⚠️ Error ในระหว่างปิด Browser: {e}")
-                    finally:
-                        # 1. ฆ่า process ทิ้งเสมอเพื่อเคลียร์สถานะ
-                        kill_specific_browser()
+                    if active_browser:
+                        try:
+                            # ใช้เงื่อนไขตรวจสอบให้ชัดเจน
+                            if hasattr(active_browser, 'stop'):
+                                if inspect.iscoroutinefunction(active_browser.stop):
+                                    await active_browser.stop()
+                                else:
+                                    active_browser.stop()
+                        except Exception as e:
+                            print(f"⚠️ Error ในระหว่างปิด Browser: {e}")
+                        finally:
+                            # 1. ฆ่า process ทิ้งเสมอเพื่อเคลียร์สถานะ
+                            kill_specific_browser()
     
-                        # 2. เคลียร์ reference ทันที
-                        browser_instance = None
-                        active_browser = None
+                            # 2. เคลียร์ reference ทันที
+                            browser_instance = None
+                            active_browser = None
     
-                        # 3. บังคับ Garbage Collector ให้ทำงาน
-                        gc.collect()
+                            # 3. บังคับ Garbage Collector ให้ทำงาน
+                            gc.collect()
     
-                        # 4. พักการทำงานให้ OS เคลียร์ File Handles
-                        await asyncio.sleep(2) 
+                            # 4. พักการทำงานให้ OS เคลียร์ File Handles
+                            await asyncio.sleep(2) 
     
-                        # 5. ลบ Profile
-                        await cleanup_profile()
+                            # 5. ลบ Profile
+                            await cleanup_profile()
                         
-                        # 6. ปิด Xvfb (ถ้ามี)
-                        kill_xvfb()
+                            # 6. ปิด Xvfb (ถ้ามี)
+                            kill_xvfb()
     
-                        print("🔒 [System] ปิด Browser และเคลียร์หน่วยความจำแล้ว")
-                else:
-                    print("ℹ️ Browser instance ไม่มีอยู่แล้ว")
+                            print("🔒 [System] ปิด Browser และเคลียร์หน่วยความจำแล้ว")
+                    else:
+                        print("ℹ️ Browser instance ไม่มีอยู่แล้ว")
 
             #รันรายงานสถิติ (ยิง api ตรง)
             stats_report = format_site_stats_report([n[0] for n in active_nodes])
