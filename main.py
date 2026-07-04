@@ -363,16 +363,20 @@ def parse_size(size_str):
         return 0.0
 
 def check_freeload_status(row):
-    # 1. เช็คจาก Badge class โดยตรง (แม่นยำที่สุดสำหรับ UI ใหม่)
+    # 1. เช็ค TorrentDD: มองหา <label class="badge badge-outline-success">Free</label>
+    torrentdd_badge = row.find("label", class_="badge-outline-success")
+    if torrentdd_badge and "free" in torrentdd_badge.get_text().lower():
+        return 100
+
+    # 2. เช็ค BearBIT (Badge/Promo Col)
     badge = row.find("span", class_="bb-badge bb-free")
     if badge:
         text = badge.get_text().lower()
-        # ใช้ regex สกัดตัวเลขจาก "free 95%" หรือ "100%"
         pct_match = re.search(r"(\d+)\s*%", text)
         if pct_match:
             return int(pct_match.group(1))
     
-    # 2. กรณีไม่มี Badge ให้เช็คจาก td ที่มี class="bb-promo-col" (ส่วนแสดง % ชัดเจน)
+    # 3. กรณีไม่มี Badge ให้เช็คจาก td ที่มี class="bb-promo-col" (ส่วนแสดง % ชัดเจน)
     promo_col = row.find("td", class_="bb-promo-col")
     if promo_col:
         text = promo_col.get_text().strip()
@@ -380,7 +384,7 @@ def check_freeload_status(row):
         if pct_match:
             return int(pct_match.group(1))
 
-    # 3. Fallback: ใช้รูปภาพ (เผื่อบางไฟล์ยังใช้ระบบเก่า)
+    # 4. Fallback: ใช้รูปภาพ (Icon)
     row_html_lower = str(row).lower()
     if any(icon in row_html_lower for icon in ["freeload.png", "free.gif", "free.png"]):
         return 100
@@ -3006,7 +3010,62 @@ SIZE_PATTERN = re.compile(r"(\d+\.?\d*\s*(?:MB|GB|TB))", re.I)
 async def extract_torrent_data(row, base_url, dl_session=None, headers=None, checked_cache=None):
     if row is None: return None
     
-   # 1. สกัด ID & Title โดยใช้ Regex ค้นหาใน tag <a> ที่อยู่ใน td.bb-titlecell
+    # ตรวจสอบว่าเป็นเว็บไหนจาก base_url
+    is_torrentdd = "torrentdd" in base_url.lower()
+    
+    if is_torrentdd:
+        return await _extract_torrentdd_logic(row, base_url, dl_session, headers, checked_cache)
+    else:
+        return await _extract_bearbit_logic(row, base_url, dl_session, headers, checked_cache)
+
+async def _extract_torrentdd_logic(row, base_url, dl_session, headers, checked_cache):
+    # --- Logic เดิม ---
+    t_id, title, details_url = None, "Unknown File", None
+    
+    title_tag = row.find("a", href=re.compile(r"details\.php\?id=\d+"))
+    if title_tag:
+        title = title_tag.get_text(strip=True)
+        t_id = re.search(r"id=(\d+)", title_tag['href']).group(1)
+        details_url = f"{base_url.rstrip('/')}/details.php?id={t_id}"
+
+    # --- เพิ่ม: การดึงเวลาที่ถูกต้องจาก span class="text-muted" ---
+    date_tag = row.find("span", class_="text-muted")
+    raw_date = date_tag.get_text(strip=True) if date_tag else None
+
+    # ดึง Stats จาก div.dp-show-2
+    stats = row.find("div", class_="dp-show-2")
+    spans = stats.find_all("span") if stats else []
+    completed = extract_digit(spans[2]) if len(spans) > 2 else 0
+    seeders = extract_digit(spans[0]) if len(spans) > 0 else 0
+    leechers = extract_digit(spans[1]) if len(spans) > 1 else 0
+
+    # ดึง Size จาก div.dp-show-1
+    size_span = row.find("span", class_="text-info")
+    size_str = size_span.get_text(strip=True).replace("ขนาด:", "").strip() if size_span else "0 B"
+
+    # ดึง Download URL จากปุ่ม button (onclick)
+    btn = row.find("button", onclick=True)
+    download_url = None
+    if btn:
+        match = re.search(r"'(.*?)'", btn['onclick'])
+        if match:
+            url = match.group(1)
+            download_url = url if url.startswith('http') else f"{base_url.rstrip('/')}/{url.lstrip('/')}"
+
+    return { 
+        "id": t_id, 
+        "title": title, 
+        "seeders": seeders, 
+        "leechers": leechers, 
+        "completed": completed, 
+        "size_str": size_str, 
+        "raw_date": raw_date,
+        "download_url": download_url, 
+        "details_url": details_url 
+    }
+
+async def _extract_bearbit_logic(row, base_url, dl_session, headers, checked_cache):    
+    # 1. สกัด ID & Title โดยใช้ Regex ค้นหาใน tag <a> ที่อยู่ใน td.bb-titlecell
     title_cell = row.find("td", class_="bb-titlecell")
     title_tag = title_cell.find("a", href=re.compile(r"details\.php")) if title_cell else None
     
@@ -4111,72 +4170,36 @@ def is_fresh_and_racing(data, max_age_hours=24):
         if not data or not data.get('id'): return False
         
         now = get_now()
-        short_title = data['title'][:30]
-        raw_text = data.get('raw_text', '') 
-        
         # 1. เช็ค Locked
-        if data.get('is_locked'):
-            print(f" ⏭️ ข้าม: [Locked/Banned] {short_title}")
-            return False
+        if data.get('is_locked'): return False
 
-        # 2. 🔥 ยุทธศาสตร์สกัดเวลา: โฟกัสตารางวันลงของระบบเว็บอย่างเดียว (Pure System Date)
-        time_str = ""
-        
-        # กฎข้อที่ 1: ตรวจจับ 'วันนี้/เมื่อวาน' ของระบบบอร์ดก่อน (เป็นระเบียบและแน่นอนที่สุด)
-        if 'วันนี้' in raw_text:
-            t_match = re.search(r'(\d{2}:\d{2}:\d{2})', raw_text)
-            time_part = t_match.group(1) if t_match else now.strftime('%H:%M:%S')
-            time_str = f"{now.strftime('%Y-%m-%d')} {time_part}"
-        elif 'เมื่อวาน' in raw_text:
-            yesterday = now - timedelta(days=1)
-            t_match = re.search(r'(\d{2}:\d{2}:\d{2})', raw_text)
-            time_part = t_match.group(1) if t_match else "00:00:00"
-            time_str = f"{yesterday.strftime('%Y-%m-%d')} {time_part}"
-        
-        # กฎข้อที่ 2: ใช้ค่า raw_date จากคอลัมน์วันลงในระบบตารางที่คัดกรองชื่อไฟล์ออกไปแล้ว
-        if not time_str:
-            time_str = data.get('raw_date', '')
+        # 2. 🔥 ยุทธศาสตร์ใหม่: ยึด raw_date เป็นหลัก
+        # หาก raw_date ไม่มี (เผื่อกรณีฉุกเฉิน) ค่อยใช้ now เป็น fallback
+        time_str = data.get('raw_date') or now.strftime('%Y-%m-%d %H:%M:%S')
 
-        # กฎข้อที่ 3: มาตรการเซฟตี้สุดท้าย
-        if not time_str:
-            time_str = now.strftime('%Y-%m-%d %H:%M:%S')
-
-        # 3. 🛠 จัดการฟอร์แมตและแปลงเป็น datetime
+        # 3. 🛠 แปลงเป็น datetime (ด้วยฟังก์ชันเดียวที่รองรับทุก Format)
         try:
-            # 1. ล้าง HTML Tag ออกให้หมด
-            raw_clean = re.sub(r'<[^>]+>', ' ', time_str) 
-    
-            # 2. จัดรูปแบบให้เป็น DD-MM-YYYY HH:MM:SS
-            # ใช้ re.sub เพื่อแทรกช่องว่างระหว่างปีกับเวลา (ถ้าไม่มี)
-            formatted_time = re.sub(r'(\d{4})(\d{2}:\d{2}:\d{2})', r'\1 \2', raw_clean)
-            formatted_time = formatted_time.strip().replace('/', '-').replace('.', '-')
-    
-            # 3. แปลงเป็น datetime
-            naive_time = datetime.strptime(formatted_time, '%d-%m-%Y %H:%M:%S')
+            # ล้างค่าให้สะอาด
+            formatted_time = re.sub(r'(\d{4})(\d{2}:\d{2}:\d{2})', r'\1 \2', time_str.replace('/', '-').replace('.', '-'))
+            
+            # ใช้ Logic ตรวจ Format เดียวกับที่เราทำไว้
+            if re.match(r'^\d{4}-\d{2}-\d{2}', formatted_time):
+                naive_time = datetime.strptime(formatted_time, '%Y-%m-%d %H:%M:%S')
+            else:
+                naive_time = datetime.strptime(formatted_time, '%d-%m-%Y %H:%M:%S')
+            
             upload_time = tz.localize(naive_time)
-    
-        except Exception as e:
-            print(f"⚠️ แปลงเวลาพลาด: {e} | ข้อมูลดิบ: {time_str}")
+        except:
             upload_time = now
 
-        # 4. Racing Logic (คำนวณอายุจากตารางวันลงที่แท้จริง)
+        # 4. คำนวณอายุ
         age_delta = now - upload_time
         total_hours = age_delta.total_seconds() / 3600
         
-        if age_delta.total_seconds() < -300: return False
-
-        demand_ratio = data['leechers'] / max(1, data['seeders'])
-
-        print(f" 📊 System Date: {short_title}.. (S:{data['seeders']} L:{data['leechers']} Age:{total_hours:.1f}ชม.)")
-
-        # --- เงื่อนไขการกรอง ---
-        if total_hours > max_age_hours:
-            print(f" ⏭️ ข้าม: [เก่าเกิน {max_age_hours} ชม.]")
-            return False
-
-        if data['leechers'] < 1:
-            print(f" ⏭️ ข้าม: [ไม่มีคนโหลด]")
-            return False
+        # เงื่อนไขกรองไฟล์
+        if age_delta.total_seconds() < -300: return False # ป้องกันเวลาในเว็บเพี้ยน
+        if total_hours > max_age_hours: return False
+        if data['leechers'] < 1: return False
             
         return True
     except Exception as e:
