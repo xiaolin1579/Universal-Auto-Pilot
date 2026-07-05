@@ -3024,7 +3024,7 @@ def extract_digit(tag):
 ID_REGEX = re.compile(r"id=(\d+)", re.I)
 DL_REGEX = re.compile(r"download(new)?\.php", re.I)
 BAD_LINK_PATTERN = re.compile(r"ndonatedn|vip|donate|/nDonatedN\.php", re.I)
-SIZE_PATTERN = re.compile(r"(\d+\.?\d*\s*(?:MB|GB|TB))", re.I)
+SIZE_PATTERN = re.compile(r"(\d+(?:\.\d+)?\s*(?:MB|GB|TB))", re.I)
 
 async def extract_torrent_data(row, base_url, dl_session=None, headers=None, checked_cache=None):
     if row is None: 
@@ -3153,18 +3153,32 @@ async def _extract_bearbit_logic(row, base_url, dl_session, headers, checked_cac
     if len(tds) < 10: return None
 
     # ดึงค่าตามลำดับใหม่จาก Log HTML ของคุณ
-    # tds[6] = Date, tds[7] = Seed, tds[8] = Leech (หรือข้อมูลดาวน์โหลด)
-    # แนะนำให้เช็ค text ของ tds[7] ว่าคือตัวเลขหรือไม่ก่อน extract_digit
     completed = extract_digit(tds[8])
     seeders = extract_digit(tds[9]) 
     leechers = extract_digit(tds[10])
 
-    # 3. ดึง Size จาก action_div (ใช้ของเดิมที่ทำไว้ดีแล้ว)
-    action_div = row.find("div", class_="bb-file-actions")
+    # 3. ดึง Size ด้วยระบบ Fallback (ตาราง TD -> ปุ่มดาวน์โหลดใน action_div)
     size_str = "0 B"
-    if action_div:
-        match = SIZE_PATTERN.search(action_div.get_text())
-        size_str = match.group(0) if match else "0 B"
+    
+    # [แผนที่ 1] ดึงจาก <td> คอลัมน์ที่ 8 (สังเกตจาก HTML คือคอลัมน์ที่มีเนื้อหา 449.60 GB)
+    # เราจะหา td ที่มี nowrap และมีข้อความรูปแบบ Size
+    all_tds = row.find_all("td", nowrap=True)
+    for td in all_tds:
+        text = td.get_text(strip=True)
+        if SIZE_PATTERN.search(text):
+            size_str = text
+            break
+            
+    # [แผนที่ 2] หากไม่เจอใน <td> ให้ลองดึงจาก attribute ในปุ่มดาวน์โหลด (กรณีตารางซ่อนค่า)
+    if size_str == "0 B":
+        # ค้นหา <a> ภายใน bb-file-actions ที่มี onclick ซึ่งมีชื่อฟังก์ชัน bbBrowserDownloadClick
+        dl_link = row.find("a", class_=lambda x: x and "download" in x)
+        if dl_link and dl_link.has_attr('onclick'):
+            # ใช้ Regex ดึงค่าจาก arguments ใน onclick
+            onclick_text = dl_link['onclick']
+            match = re.search(r"['\"](\d+(?:\.\d+)?\s*(?:MB|GB|TB))['\"]", onclick_text, re.I)
+            if match:
+                size_str = match.group(0).replace("'", "")
 
     
     # 4. ตรวจสอบ Action ลิงก์ (คงเดิม)
