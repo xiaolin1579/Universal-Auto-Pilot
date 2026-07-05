@@ -486,29 +486,37 @@ async def launch_any_browser(sitename="default", custom_args=None):
     # 2. Xvfb Setup
     xvfb_exists = shutil.which("Xvfb") is not None
     if xvfb_exists and _global_display is None:
-        print("🖥️ [System] กำลังเปิด Display เสมือน")
+        os.system("pkill -9 -f Xvfb")
         _global_display = Display(visible=0, size=(1920, 1080))
         _global_display.start()
         await asyncio.sleep(2)
 
-    # 3. ใช้ Config ของ nodriver โดยเปลี่ยน Path ตามชื่อเว็บ
-    _current_profile_path = f"./profiles/{sitename}_uc_profile"
+    # 3. เตรียม Profile Path และล้าง Lock Files
+    _current_profile_path = os.path.abspath(f"./profiles/{sitename}_uc_profile")
+    if not os.path.exists(_current_profile_path):
+        os.makedirs(_current_profile_path, exist_ok=True)
     
-    import os
-    if not os.path.exists("./profiles"):
-        os.makedirs("./profiles")
-    
+    # ล้างไฟล์ Lock ของ Chrome ที่ทำให้เปิด browser ไม่ขึ้น
+    for lock_file in ["SingletonLock", "SingletonCookie", "Singleton"]:
+        path = os.path.join(_current_profile_path, lock_file)
+        if os.path.exists(path):
+            try: os.remove(path)
+            except: pass
+
+    # 4. ตั้งค่า Config
     config = Config(
         browser_executable_path=get_universal_browser_path(),
         user_data_dir=_current_profile_path,
-        headless=False  # จำเป็นต้อง False เพราะรันคู่กับ Xvfb/nodriver
+        headless=False
     )
-
+    
     config.sandbox = False 
     config.no_sandbox = True 
+    config.connection_timeout = 30
     
     # --- 🚀 บล็อกอาร์กิวเมนต์รีดไขมัน ลดโหลด CPU ให้ VPS ---
-    config.add_argument("--disable-dev-shm-usage") # กันปัญหาแรมแชร์เต็ม
+    config.add_argument("--disable-dev-shm-usage")
+    config.add_argument("--no-zygote")
     config.add_argument("--disable-gpu")           # ปิดการประมวลผลการ์ดจอจำลอง
     config.add_argument("--blink-settings=imagesEnabled=false") # [โคตรสำคัญ] ห้ามโหลดรูปภาพในเว็บบิท ช่วยลด CPU/Net ทันที 50%
     config.add_argument("--disable-gl-extensions") # ปิดการโหลด WebGL
@@ -516,6 +524,9 @@ async def launch_any_browser(sitename="default", custom_args=None):
     config.add_argument("--disable-extensions")    # ปิด Extension ทั้งหมดใน Chrome
     config.add_argument("--disable-background-networking") # ปิดการเช็คอัปเดตเบื้องหลังของ Chrome
     config.add_argument("--mute-audio")            # ปิดระบบเสียง
+    config.add_argument("--disable-features=VizDisplayCompositor") # บางทีบน VPS ไม่มี GPU ต้องปิดตัวนี้
+    config.add_argument("--disable-seccomp-filter-sandbox")       # ปิดการกรอง syscall ของ Kernel
+    config.add_argument("--disable-gpu-sandbox")                 # ปิด Sandbox เฉพาะ GPU
     # --------------------------------------------------
     
     if isinstance(custom_args, list):
@@ -3144,9 +3155,9 @@ async def _extract_bearbit_logic(row, base_url, dl_session, headers, checked_cac
     # ดึงค่าตามลำดับใหม่จาก Log HTML ของคุณ
     # tds[6] = Date, tds[7] = Seed, tds[8] = Leech (หรือข้อมูลดาวน์โหลด)
     # แนะนำให้เช็ค text ของ tds[7] ว่าคือตัวเลขหรือไม่ก่อน extract_digit
-    completed = extract_digit(tds[7])
-    seeders = extract_digit(tds[8]) 
-    leechers = extract_digit(tds[9])
+    completed = extract_digit(tds[8])
+    seeders = extract_digit(tds[9]) 
+    leechers = extract_digit(tds[10])
 
     # 3. ดึง Size จาก action_div (ใช้ของเดิมที่ทำไว้ดีแล้ว)
     action_div = row.find("div", class_="bb-file-actions")
@@ -5058,44 +5069,41 @@ async def main():
                     # ปิด Tab ของไซต์นี้ทันทีเมื่อสแกนจบ (ไม่ว่าจะพังหรือไม่)
                     if site_page:
                         await site_page.close()
-                        print(f"📂 ปิด Tab ของ {site_name} เรียบร้อย")
+                        print(f"📂 ปิด Tab ของ {site} เรียบร้อย")
 
-                    # ปิด Browser หลังจากปิด Tab แล้ว
-                    active_browser = browser_instance 
+            # ปิด Browser หลังจากปิด Tab แล้ว
+            active_browser = browser_instance 
             
-                    if active_browser:
-                        try:
-                            # ใช้เงื่อนไขตรวจสอบให้ชัดเจน
-                            if hasattr(active_browser, 'stop'):
-                                if inspect.iscoroutinefunction(active_browser.stop):
-                                    await active_browser.stop()
-                                else:
-                                    active_browser.stop()
-                        except Exception as e:
-                            print(f"⚠️ Error ในระหว่างปิด Browser: {e}")
-                        finally:
-                            # 1. ฆ่า process ทิ้งเสมอเพื่อเคลียร์สถานะ
-                            kill_specific_browser()
+            if active_browser:
+                try:
+                    # ใช้เงื่อนไขตรวจสอบให้ชัดเจน
+                    if hasattr(active_browser, 'stop'):
+                        if inspect.iscoroutinefunction(active_browser.stop):
+                            await active_browser.stop()
+                        else:
+                            active_browser.stop()
+                except Exception as e:
+                    print(f"⚠️ Error ในระหว่างปิด Browser: {e}")
+                finally:
+                    # 1. ฆ่า process ทิ้งเสมอเพื่อเคลียร์สถานะ
+                    kill_specific_browser()
     
-                            # 2. เคลียร์ reference ทันที
-                            browser_instance = None
-                            active_browser = None
+                    # 2. เคลียร์ reference ทันที
+                    browser_instance = None
+                    active_browser = None
     
-                            # 3. บังคับ Garbage Collector ให้ทำงาน
-                            gc.collect()
+                    # 3. บังคับ Garbage Collector ให้ทำงาน
+                    gc.collect()
     
-                            # 4. พักการทำงานให้ OS เคลียร์ File Handles
-                            await asyncio.sleep(2) 
+                    # 4. พักการทำงานให้ OS เคลียร์ File Handles
+                    await asyncio.sleep(2) 
     
-                            # 5. ลบ Profile
-                            await cleanup_profile()
+                    # 5. ลบ Profile
+                    await cleanup_profile()
                         
-                            # 6. ปิด Xvfb (ถ้ามี)
-                            kill_xvfb()
-    
-                            print("🔒 [System] ปิด Browser และเคลียร์หน่วยความจำแล้ว")
-                    else:
-                        print("ℹ️ Browser instance ไม่มีอยู่แล้ว")
+                    print("🔒 [System] ปิด Browser และเคลียร์หน่วยความจำแล้ว")
+            else:
+                print("ℹ️ Browser instance ไม่มีอยู่แล้ว")
 
             #รันรายงานสถิติ (ยิง api ตรง)
             stats_report = format_site_stats_report([n[0] for n in active_nodes])
