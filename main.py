@@ -3133,6 +3133,10 @@ async def _extract_torrentdd_logic(row, base_url, dl_session, headers, checked_c
     }
 
 async def _extract_bearbit_logic(row, base_url, dl_session, headers, checked_cache):    
+    t_id, title, details_url, download_url = None, "Unknown File", None, None
+    completed, seeders, leechers = 0, 0, 0
+    size_str = "0 B"
+
     # 1. สกัด ID & Title โดยใช้ Regex ค้นหาใน tag <a> ที่อยู่ใน td.bb-titlecell
     title_cell = row.find("td", class_="bb-titlecell")
     title_tag = title_cell.find("a", href=re.compile(r"details\.php")) if title_cell else None
@@ -3146,20 +3150,21 @@ async def _extract_bearbit_logic(row, base_url, dl_session, headers, checked_cac
             t_id = match.group(1)
             details_url = f"{base_url.rstrip('/')}/details.php?id={t_id}"
 
-    # 2. ปรับการดึงข้อมูลตัวเลข: ใช้วิธีหา td ตามลำดับที่แท้จริง
-    # จาก HTML ใหม่: [0:Cat][1:Poster][2:Title][3:Promo][4:Promo][5:FileNum][6:Date][7:Seed][8:Leech][9:Complete]
-    # ปรับดัชนีให้ตรงกับโครงสร้างใหม่
-    tds = row.select("td")
-    if len(tds) < 10: return None
-
-    # ดึงค่าตามลำดับใหม่จาก Log HTML ของคุณ
-    completed = extract_digit(tds[8])
-    seeders = extract_digit(tds[9]) 
-    leechers = extract_digit(tds[10])
-
-    # 3. ดึง Size ด้วยระบบ Fallback (ตาราง TD -> ปุ่มดาวน์โหลดใน action_div)
-    size_str = "0 B"
+    # 2. ปรับการดึงข้อมูลตัวเลข
+    tds = row.find_all("td")
     
+    # ลองเปลี่ยนฟังก์ชัน extract_digit ให้เคลียร์ค่าให้ชัวร์
+    def extract_digit_debug(text):
+        # แทนที่จะดึงเลขอย่างเดียว ให้เอาทุกอย่างที่เป็นเลขมารวมกัน
+        import re
+        match = re.search(r'\d+', text)
+        return int(match.group()) if match else 0
+
+    completed = extract_digit_debug(tds[-4].get_text(strip=True))
+    seeders = extract_digit_debug(tds[-3].get_text(strip=True))
+    leechers = extract_digit_debug(tds[-2].get_text(strip=True))
+    
+    # 3. ดึง Size ด้วยระบบ Fallback (ตาราง TD -> ปุ่มดาวน์โหลดใน action_div)
     # [แผนที่ 1] ดึงจาก <td> คอลัมน์ที่ 8 (สังเกตจาก HTML คือคอลัมน์ที่มีเนื้อหา 449.60 GB)
     # เราจะหา td ที่มี nowrap และมีข้อความรูปแบบ Size
     all_tds = row.find_all("td", nowrap=True)
@@ -4308,7 +4313,7 @@ def is_fresh_and_racing(data, max_age_hours=24):
         
         # เงื่อนไขกรองไฟล์
         short_title = data['title'][:30]
-        print(f" 📊 System Date: {short_title}.. (Seeders:{data['seeders']} Leechers:{data['leechers']} Age:{total_hours:.1f}ชม.)")
+        print(f" 📊 System Date: {short_title}.. (Completed:{data['completed']} Seeders:{data['seeders']} Leechers:{data['leechers']} Age:{total_hours:.1f}ชม.)")
         if age_delta.total_seconds() < -300: 
             return False # ป้องกันเวลาในเว็บเพี้ยน
         if total_hours > max_age_hours: 
