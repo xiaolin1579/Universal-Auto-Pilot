@@ -4181,8 +4181,8 @@ def get_node_dynamic_cap(node, disk_type):
     base_caps = {
         'NVME': 30,   # เดิม 15
         'SSD': 20,    # เดิม 10
-        'HYBRID': 12,
-        'HDD': 8
+        'HYBRID': 15,
+        'HDD': 10
     }
     base = base_caps.get(disk_type, 5)
     start = time.time()
