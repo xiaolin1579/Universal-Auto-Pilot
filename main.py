@@ -470,6 +470,7 @@ def get_universal_browser_path():
 _global_display = None
 _active_browser_instance = None #ตัวแปรเพื่อติดตาม instance
 _current_profile_path = None #ตัวแปรเก็บ pathpath
+os.environ["CHROME_DEVEL_SANDBOX"] = ""
 
 async def launch_any_browser(sitename="default", custom_args=None):
     global _global_display, _active_browser_instance, _current_profile_path
@@ -511,7 +512,6 @@ async def launch_any_browser(sitename="default", custom_args=None):
     )
     
     config.sandbox = False 
-    config.no_sandbox = True 
     config.connection_timeout = 30
     
     # --- 🚀 บล็อกอาร์กิวเมนต์รีดไขมัน ลดโหลด CPU ให้ VPS ---
@@ -525,8 +525,6 @@ async def launch_any_browser(sitename="default", custom_args=None):
     config.add_argument("--disable-background-networking") # ปิดการเช็คอัปเดตเบื้องหลังของ Chrome
     config.add_argument("--mute-audio")            # ปิดระบบเสียง
     config.add_argument("--disable-features=VizDisplayCompositor") # บางทีบน VPS ไม่มี GPU ต้องปิดตัวนี้
-    config.add_argument("--disable-seccomp-filter-sandbox")       # ปิดการกรอง syscall ของ Kernel
-    config.add_argument("--disable-gpu-sandbox")                 # ปิด Sandbox เฉพาะ GPU
     # --------------------------------------------------
     
     if isinstance(custom_args, list):
