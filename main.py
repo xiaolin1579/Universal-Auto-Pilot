@@ -3148,6 +3148,20 @@ async def _extract_bearbit_logic(row, base_url, dl_session, headers, checked_cac
             t_id = match.group(1)
             details_url = f"{base_url.rstrip('/')}/details.php?id={t_id}"
 
+    is_locked = False
+    
+    # วิธีที่ 1: ตรวจสอบจาก Class หรือ Text ภายใน title_cell
+    if title_cell:
+        cell_text = title_cell.get_text().lower()
+        # เพิ่ม Keyword ที่บ่งบอกว่าไฟล์ล็อค
+        lock_keywords = ["locked"]
+        if any(keyword in cell_text for keyword in lock_keywords):
+            is_locked = True
+        
+        # วิธีที่ 2: ตรวจสอบรูปภาพสถานะ (เช่น icon กุญแจ)
+        if title_cell.find("img", src=re.compile(r"(lock|restricted)", re.I)):
+            is_locked = True
+
     # 2. ปรับการดึงข้อมูลตัวเลข
     tds = row.find_all("td")
     
@@ -3274,7 +3288,8 @@ async def _extract_bearbit_logic(row, base_url, dl_session, headers, checked_cac
         "size_str": size_str, 
         "raw_date": tds[6].get_text(strip=True) if len(tds) > 6 else "N/A",
         "download_url": download_url, 
-        "details_url": details_url
+        "details_url": details_url,
+        "is_locked": is_locked
     }
 
 class ResponseWrapper:
@@ -4282,43 +4297,44 @@ def is_fresh_and_racing(data, max_age_hours=24):
     try:
         if not data or not data.get('id'): return False
         
+        # 1. เตรียมข้อมูลพื้นฐาน
         now = get_now()
-        # 1. เช็ค Locked
-        if data.get('is_locked'): return False
-
-        # 2. 🔥 ยุทธศาสตร์ใหม่: ยึด raw_date เป็นหลัก
-        # หาก raw_date ไม่มี (เผื่อกรณีฉุกเฉิน) ค่อยใช้ now เป็น fallback
         time_str = data.get('raw_date') or now.strftime('%Y-%m-%d %H:%M:%S')
-
-        # 3. 🛠 แปลงเป็น datetime (ด้วยฟังก์ชันเดียวที่รองรับทุก Format)
+        
+        # 2. แปลงเวลา (Clean & Parse)
         try:
-            # ล้างค่าให้สะอาด
-            formatted_time = re.sub(r'(\d{4})(\d{2}:\d{2}:\d{2})', r'\1 \2', time_str.replace('/', '-').replace('.', '-'))
-            
-            # ใช้ Logic ตรวจ Format เดียวกับที่เราทำไว้
-            if re.match(r'^\d{4}-\d{2}-\d{2}', formatted_time):
-                naive_time = datetime.strptime(formatted_time, '%Y-%m-%d %H:%M:%S')
-            else:
-                naive_time = datetime.strptime(formatted_time, '%d-%m-%Y %H:%M:%S')
-            
-            upload_time = tz.localize(naive_time)
+            formatted = re.sub(r'(\d{4})(\d{2}:\d{2}:\d{2})', r'\1 \2', time_str.replace('/', '-').replace('.', '-'))
+            fmt = '%Y-%m-%d %H:%M:%S' if re.match(r'^\d{4}-\d{2}-\d{2}', formatted) else '%d-%m-%Y %H:%M:%S'
+            upload_time = tz.localize(datetime.strptime(formatted, fmt))
         except:
             upload_time = now
 
-        # 4. คำนวณอายุ
+        # 3. คำนวณสถานะไฟล์
         age_delta = now - upload_time
-        total_hours = age_delta.total_seconds() / 3600
+        total_minutes = age_delta.total_seconds() / 60
+        s = int(data.get('seeders', 0) or 0)
+        l = int(data.get('leechers', 0) or 0)
+        efficiency_ratio = (l + 1) / (s + 1)
         
-        # เงื่อนไขกรองไฟล์
-        short_title = data['title'][:30]
-        print(f" 📊 System Date: {short_title}.. (Completed:{data['completed']} Seeders:{data['seeders']} Leechers:{data['leechers']} Age:{total_hours:.1f}ชม.)")
-        if age_delta.total_seconds() < -300: 
-            return False # ป้องกันเวลาในเว็บเพี้ยน
-        if total_hours > max_age_hours: 
+        # 4. ตรวจสอบเงื่อนไขคัดออก (Fail-fast strategy)
+        if age_delta.total_seconds() < -300: return False # เวลาเพี้ยน
+        if (age_delta.total_seconds() / 3600) > max_age_hours: 
             print(f" ⏭️ ข้าม: [เก่าเกิน {max_age_hours} ชม.]")
+            return False 
+        if data.get('is_locked'): 
+            print(f" ⏭️ ข้าม: ไฟล์โดนล็อค")
             return False
-        if data['leechers'] < 1: 
+        
+        # 5. เงื่อนไขข้อยกเว้นสำหรับไฟล์ใหม่มาก (Grace Period)
+        if total_minutes < 10: return True
+        
+        # 6. เงื่อนไขคัดกรองไฟล์ปกติ
+        if l < 1: 
             print(f" ⏭️ ข้าม: [ไม่มีคนโหลด]")
+            return False # ไม่มีคนโหลด
+        if s < 1 and total_minutes > 30: return False # ไฟล์ตาย
+        if efficiency_ratio < 0.5: # ไม่นิยม
+            print(f" ⏭️ ข้าม: ไม่ได้รับความนิยม Ratio:{efficiency_ratio:.2f}")
             return False
             
         return True
