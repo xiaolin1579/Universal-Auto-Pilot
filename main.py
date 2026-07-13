@@ -415,25 +415,38 @@ async def check_pending_status(session, details_url):
 
 # ========================= BROWSER ENGINE =========================
 
-def get_universal_browser_path():
-    """ค้นหาตำแหน่งการติดตั้งเบราว์เซอร์ตระกูล Chromium ภายในเครื่องอย่างละเอียด"""
+def get_browser_path_or_fail(override_path=None):
+    path = get_universal_browser_path(override_path)
+    if not path:
+        raise FileNotFoundError(
+            "ไม่พบ Browser (Chromium/Chrome/Edge/Brave) ในระบบนี้ "
+            "กรุณาติดตั้ง Browser หรือระบุ path ผ่านตัวแปร BROWSER_PATH"
+        )
+    return path
+
+def get_universal_browser_path(override_path=None):
+    # 1. ลำดับความสำคัญสูงสุด: Override หรือ Environment Variable
+    if override_path and os.path.exists(override_path):
+        return override_path
+    
+    env_path = os.environ.get("BROWSER_PATH")
+    if env_path and os.path.exists(env_path):
+        return env_path
+
     current_os = platform.system().lower()
     
+    # 2. กรณี Windows
     if current_os == "windows":
-        # ดึง Environment Variables ที่จำเป็นแบบปลอดภัย
         program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
         program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
         local_app_data = os.environ.get("LOCALAPPDATA", os.path.expanduser(r"~\AppData\Local"))
         
         search_paths = [
-            # Google Chrome
             os.path.join(program_files, "Google", "Application", "chrome.exe"),
             os.path.join(program_files_x86, "Google", "Application", "chrome.exe"),
             os.path.join(local_app_data, "Google", "Chrome", "Application", "chrome.exe"),
-            # Microsoft Edge
             os.path.join(program_files, "Microsoft", "Edge", "Application", "msedge.exe"),
             os.path.join(program_files_x86, "Microsoft", "Edge", "Application", "msedge.exe"),
-            # Brave Browser
             os.path.join(program_files, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
             os.path.join(local_app_data, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
         ]
@@ -442,29 +455,33 @@ def get_universal_browser_path():
             if os.path.exists(path):
                 return path
 
-    else: # Linux (Ubuntu, Debian, Mint, etc.)
-        # 1. ลองหาผ่านระบบ PATH ของ OS ก่อน (ยืดหยุ่นที่สุด)
-        executables = ["google-chrome-stable", "google-chrome", "chromium-browser", "chromium", "brave-browser"]
-        for exe in executables:
-            path = shutil.which(exe)
-            if path:
-                # ใช้ realpath เพื่อตาม Link ไปยังไฟล์ Binary จริงๆ
-                real_path = os.path.realpath(path)
-                if os.access(real_path, os.X_OK):
-                    return real_path
-        
-        # 2. Fallback เผื่อไว้ในกรณีที่ PATH ไม่ครอบคลุม
-        fallback_paths = [
-            "/usr/bin/google-chrome-stable",
-            "/usr/bin/google-chrome",
-            "/usr/bin/chromium-browser",
-            "/usr/bin/brave-browser",
-            "/snap/bin/chromium", # เผื่อเป็น Ubuntu Snap pack
-        ]
-        for path in fallback_paths:
-            if os.path.exists(path):
-                return path
-                
+    # 3. กรณี Linux/Unix 
+    executables = ["chromium", "chromium-browser", "google-chrome-stable", "google-chrome", "brave-browser"]
+    
+    for exe in executables:
+        path = shutil.which(exe)
+        if path:
+            real_path = os.path.realpath(path)
+            # เพิ่มการเช็ค: ต้องไม่ใช่ไฟล์ snapd หรือไฟล์ระบบทั่วไป
+            if "snap" in real_path and "chromium" not in real_path:
+                continue 
+            if os.access(real_path, os.X_OK):
+                return real_path
+    
+    # ค้นหาใน Snap/Flatpak เพิ่มเติม (เช็คความถูกต้องก่อน return)
+    extra_paths = [
+        "/snap/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/lib/chromium-browser/chromium-browser"
+    ]
+    for path in extra_paths:
+        # ตรวจสอบว่าเป็นไฟล์จริง และต้องมีคำว่า chromium/chrome/brave ใน path ถึงจะผ่าน
+        if os.path.exists(path) and os.path.isfile(path) and os.access(path, os.X_OK):
+            # ตรวจสอบว่าไม่ใช่ไฟล์ตัวรัน snapd เอง
+            if "snap" in path and not any(name in path.lower() for name in ["chromium", "chrome", "brave"]):
+                continue
+            return path
+
     return None
 
 _global_display = None
@@ -506,34 +523,58 @@ async def launch_any_browser(sitename="default", custom_args=None):
 
     # 4. ตั้งค่า Config
     config = Config(
-        browser_executable_path=get_universal_browser_path(),
+        browser_executable_path=get_browser_path_or_fail(),
         user_data_dir=_current_profile_path,
         headless=False
     )
     
+    # ตั้งค่าผ่าน Attribute โดยตรง (ไม่ต้องใส่ใน add_argument)
     config.sandbox = False 
     config.connection_timeout = 30
     
-    # --- 🚀 บล็อกอาร์กิวเมนต์รีดไขมัน ลดโหลด CPU ให้ VPS ---
-    config.add_argument("--disable-dev-shm-usage")
-    config.add_argument("--no-zygote")
-    config.add_argument("--disable-gpu")           # ปิดการประมวลผลการ์ดจอจำลอง
-    config.add_argument("--blink-settings=imagesEnabled=false") # [โคตรสำคัญ] ห้ามโหลดรูปภาพในเว็บบิท ช่วยลด CPU/Net ทันที 50%
-    config.add_argument("--disable-gl-extensions") # ปิดการโหลด WebGL
-    config.add_argument("--disable-software-rasterizer") # ปิดซอฟต์แวร์ประมวลผลภาพ 3D
-    config.add_argument("--disable-extensions")    # ปิด Extension ทั้งหมดใน Chrome
-    config.add_argument("--disable-background-networking") # ปิดการเช็คอัปเดตเบื้องหลังของ Chrome
-    config.add_argument("--mute-audio")            # ปิดระบบเสียง
-    config.add_argument("--disable-features=VizDisplayCompositor") # บางทีบน VPS ไม่มี GPU ต้องปิดตัวนี้
-    # --------------------------------------------------
+    # บล็อกอาร์กิวเมนต์รีดไขมัน (ลบ no-sandbox ออกจากลิสต์นี้!)
+    performance_args = [
+        "--disable-dev-shm-usage",
+        "--disable-breakpad",
+        "--disable-component-update",
+        "--disable-infobars",
+        "--no-zygote",
+        "--disable-gpu",
+        "--blink-settings=imagesEnabled=false",
+        "--disable-gl-extensions",
+        "--disable-software-rasterizer",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--mute-audio",
+        "--disable-features=VizDisplayCompositor",
+        "--disk-cache-dir=/dev/null"
+    ]
+    
+    for arg in performance_args:
+        config.add_argument(arg)
     
     if isinstance(custom_args, list):
         for arg in custom_args:
             config.add_argument(arg)
 
-    # 4. รัน Browser
+    # 5. รัน Browser
     try:
-        _active_browser_instance = await uc.start(config=config)
+        selected_path = config.browser_executable_path
+    
+        browser_type = "Unknown"
+        if "chromium" in selected_path.lower():
+            browser_type = "Chromium"
+        elif "chrome" in selected_path.lower():
+            browser_type = "Google Chrome"
+        elif "msedge" in selected_path.lower():
+            browser_type = "Microsoft Edge"
+        elif "brave" in selected_path.lower():
+            browser_type = "Brave Browser"
+
+        print(f"🔍 [System] กำลังเริ่มทำงานโดยเลือกใช้: {browser_type}")
+        print(f"📂 [System] Path ที่ตรวจพบและใช้งาน: {selected_path}")
+
+        _active_browser_instance = await uc.start(config=config, no_sandbox=True)
         
         # ตั้งค่า Download Behavior
         await _active_browser_instance.send(
@@ -3739,7 +3780,7 @@ async def trigger_download_if_needed(t_id, t_name, t_size_gb, details_url, downl
             # ตรวจสอบ Hash ซ้ำ
             if not force_download and t_hash in seen_hashes:
                 print(f" ❌ ข้าม: Hash {t_hash} ซ้ำในระบบ")
-                seen_ids.add(t_id)
+                seen_hashes.add(t_hash)
                 download_ready = False
             else:
                 is_already_in_node = False
@@ -3752,7 +3793,7 @@ async def trigger_download_if_needed(t_id, t_name, t_size_gb, details_url, downl
         
                 if is_already_in_node:
                     print(f" ❌ ข้าม: ตรวจพบ Hash [...{t_hash[-5:]}] วิ่งอยู่ใน {target_node_name}")
-                    seen_ids.add(t_id)
+                    seen_hashes.add(t_hash)
                     download_ready = False
 
         # จัดการส่งเข้า Node
@@ -4922,7 +4963,7 @@ async def main():
                                             # ตรวจสอบ Hash ซ้ำ
                                             if t_hash in seen_hashes:
                                                 print(f" ❌ ข้าม: Hash {t_hash} ซ้ำในระบบ")
-                                                seen_ids.add(t_id)
+                                                seen_hashes.add(t_hash)
                                                 download_ready = False
                                             else:
                                                 is_already_in_node = False
@@ -4935,7 +4976,9 @@ async def main():
         
                                                 if is_already_in_node:
                                                     print(f" ❌ ข้าม: ตรวจพบ Hash [...{t_hash[-5:]}] วิ่งอยู่ใน {target_node_name}")
-                                                    seen_ids.add(t_id)
+                                                    seen_hashes.add(t_hash)
+                                                    # กดปุ่ม Thanks
+                                                    await handle_thanks_click(browser_instance, details_url)
                                                     count_skip += 1
                                                     download_ready = False
 
@@ -4985,22 +5028,7 @@ async def main():
                                                             success_node = node_obj
             
                                                             # กดปุ่ม Thanks
-                                                            if details_url:
-                                                                new_tab = None 
-                                                                try:
-                                                                    # nodriver ใช้ .get(url, new_tab=True) เพื่อสร้าง Tab ใหม่และไปที่ URL ทันที
-                                                                    new_tab = await browser_instance.get(details_url, new_tab=True)
-        
-                                                                    # ส่ง new_tab เข้าไปทำงานต่อ
-                                                                    await auto_click_thanks(new_tab, details_url)
-        
-                                                                except Exception as e:
-                                                                    print(f"⚠️ ไม่สามารถกดปุ่ม Thanks ได้: {e}")
-        
-                                                                finally:
-                                                                    # ปิด Tab หลังจากทำงานเสร็จ
-                                                                    if new_tab:
-                                                                        await new_tab.close()
+                                                            await handle_thanks_click(browser_instance, details_url)
             
                                                             break # ส่งเข้า Node สำเร็จแล้ว ให้หยุด Loop
                                                     else:
