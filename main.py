@@ -848,48 +848,48 @@ class QbitNode:
             except Exception:
                 return False
             
-            # 3. คำนวณข้อมูล (ลอจิกเดิมของคุณ)
-            used_bytes = 0
+            # 3. ปรับปรุงการคำนวณ used_gb ให้ตรงกับ Disk จริง 100%
+            # ดึงขนาดดิสก์รวมและพื้นที่ว่างจาก server_state (ได้จาก maindata)
+            total_disk_bytes = server_state.get('total_size_bytes', 0)
+            free_disk_bytes = server_state.get('free_space_on_disk', 0)
+            
+            # คำนวณ used_gb จาก Disk จริง (Total - Free)
+            # วิธีนี้จะทำให้ได้เลขใกล้เคียงกับ du -sh ที่คุณรันครับ
+            used_gb = (total_disk_bytes - free_disk_bytes) / (1024**3)
+            
+            # นับ Active Torrents จากรายการ info (ยังคงใช้เหมือนเดิม)
             active_count = 0
             inactive_states = {'pausedDL', 'pausedUP', 'queuedDL', 'queuedUP', 'checkingResumeData', 'stalledUP'}
-            downloading_states = {'downloading', 'stalledDL', 'metaDL', 'allocating', 'forcedDL'}
-            
             for t in torrents:
-                state = t.get('state', '')
-                size = t.get('total_size', t.get('size', 0))
-                completed_bytes = t.get('completed', 0)
-                
-                # คิดขนาดพื้นที่จริง
-                if 'checking' in state.lower():
-                    current_on_disk = size
-                elif state in downloading_states:
-                    current_on_disk = completed_bytes
-                else:
-                    current_on_disk = size
-
-                used_bytes += current_on_disk
-                if state not in inactive_states:
+                if t.get('state', '') not in inactive_states:
                     active_count += 1
-
-            used_gb = used_bytes / (1024**3)
+            
             safety_buffer = 15.0
 
-            # 4. คำนวณพื้นที่ว่าง (ลอจิกเดิม)
-            if self.quota_gb > 0:
-                my_quota_free = max(0, self.quota_gb - used_gb)
-                display_free = my_quota_free
-                self.free_gb = max(0, my_quota_free - safety_buffer)
-            else:
-                real_disk_free = server_state.get('free_space_on_disk', 0) / (1024**3)
-                display_free = real_disk_free
-                self.free_gb = max(0, real_disk_free - safety_buffer)
+            # 4. Hybrid Logic: คำนวณพื้นที่และเตรียมข้อความ
+            real_disk_free_gb = server_state.get('free_space_on_disk', 0) / (1024**3)
+            safety_buffer = 15.0
 
-            # 5. ประกอบร่างข้อความ
             if self.quota_gb > 0:
-                self.stat_msg = f"FREE: {display_free:.1f}GB | A: {active_count} | Used: {used_gb:.1f}G / {self.quota_gb:.0f}G | Safe: {self.free_gb:.1f}G"
-            else:
-                self.stat_msg = f"FREE: {display_free:.1f}GB | A: {active_count} | Used: {used_gb:.1f}G | Safe: {self.free_gb:.1f}G"
+                quota_free_gb = max(0, self.quota_gb - used_gb)
+                display_free = min(quota_free_gb, real_disk_free_gb)
                 
+                # กำหนด stat_msg ให้ชัดเจนรอบเดียว
+                self.stat_msg = (
+                    f"FREE(Q): {quota_free_gb:.1f}GB | FREE(D): {real_disk_free_gb:.1f}GB | "
+                    f"A: {active_count} | Used: {used_gb:.1f}G / {self.quota_gb:.0f}G | "
+                    f"Safe: {max(0, display_free - safety_buffer):.1f}G"
+                )
+            else:
+                display_free = real_disk_free_gb
+                self.stat_msg = (
+                    f"FREE: {display_free:.1f}GB | A: {active_count} | "
+                    f"Used: {used_gb:.1f}G | Safe: {max(0, display_free - safety_buffer):.1f}G"
+                )
+
+            # เก็บค่าสุดท้ายไว้สำหรับ Logic ส่วนอื่นของบอท
+            self.free_gb = max(0, display_free - safety_buffer)
+            
             return True
             
         except Exception as e:
@@ -1361,39 +1361,52 @@ class RtorrentNode:
             used_gb = used_bytes / (1024**3)
             safety_buffer = 15.0
 
-            # 3. คำนวณพื้นที่ว่างและการดึงข้อมูล Disk Free อิงตามโควตา
-            if self.quota_gb > 0:
-                my_quota_free = max(0, self.quota_gb - used_gb)
-                display_free = my_quota_free
-            
-                # 🎯 สูตรสายซิ่ง: หักแค่บัฟเฟอร์กันตาย 15GB ไม่หัก pending_gb ซ้ำซ้อน
-                self.free_gb = max(0, my_quota_free - safety_buffer)
-            else:
-                xml_disk = '<?xml version="1.0"?><methodCall><methodName>network.disk_free_4gb</methodName></methodCall>'
-                r_free = None
-                for attempt in range(3):
+            # 3. Hybrid Logic: คำนวณพื้นที่ว่างจากทั้ง 2 แหล่ง
+            # แหล่งที่ 1: คำนวณจาก Quota ของคุณ (ถ้ามี)
+            quota_free_gb = max(0, self.quota_gb - used_gb) if self.quota_gb > 0 else float('inf')
+
+            # แหล่งที่ 2: ดึงจาก Disk จริง (คงลอจิกดึง r_free ของคุณไว้)
+            xml_disk = '<?xml version="1.0"?><methodCall><methodName>network.disk_free_4gb</methodName></methodCall>'
+            r_free = None
+            for attempt in range(3):
+                try:
+                    r_free = self.s.post(self.url, data=xml_disk, auth=self.auth, headers=self.headers, timeout=10, verify=False)
+                    break
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                    if attempt < 2: time.sleep(1.0)
+                    else: return True
+
+            real_free = 0.0
+            if r_free:
+                free_soup = BeautifulSoup(r_free.text, "xml")
+                free_node = free_soup.find(["i8", "int", "i4", "value"])
+                if free_node:
                     try:
-                        r_free = self.s.post(self.url, data=xml_disk, auth=self.auth, headers=self.headers, timeout=10, verify=False)
-                        break
-                    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-                        if attempt < 2: time.sleep(1.0)
-                        else: return True
-
-                real_free = 0.0
-                if r_free:
-                    free_soup = BeautifulSoup(r_free.text, "xml")
-                    free_node = free_soup.find(["i8", "int", "i4", "value"])
-                    if free_node:
-                        try:
-                            real_free = (int(free_node.get_text().strip()) * 4096) / (1024**3)
-                        except Exception:
-                            pass
+                        real_free = (int(free_node.get_text().strip()) * 4096) / (1024**3)
+                    except Exception:
+                        pass
             
-                display_free = real_free
-                self.free_gb = max(0, real_free - safety_buffer)
+            real_free_gb = real_free # ค่าที่คำนวณได้จาก XML ในขั้นตอนก่อนหน้า
 
-            # 4. ประกอบร่างข้อความแสดงผลใหม่มาตรฐานเดียวกัน
-            self.stat_msg = f"FREE: {display_free:.1f}GB | A: {active} | Used: {used_gb:.1f}G / {self.quota_gb:.0f}G | Safe: {self.free_gb:.1f}G"
+            # 🎯 จุดเปลี่ยน: เลือกค่าที่น้อยที่สุด (Conservative Estimate) เพื่อความปลอดภัยสูงสุด
+            # ถ้าไม่มี Quota ให้ยึด Disk จริง ถ้ามี Quota ให้เลือกตัวที่หมดเร็วกว่า
+            if self.quota_gb > 0:
+                display_free = min(max(0, quota_free_gb), max(0, real_free_gb))
+            else:
+                display_free = real_free_gb
+
+            self.free_gb = max(0, display_free - safety_buffer)
+
+            # 4. ประกอบร่างข้อความแสดงผล
+            if self.quota_gb > 0:
+                self.stat_msg = (
+                    f"FREE(Q): {quota_free_gb:.1f}GB | FREE(D): {real_free_gb:.1f}GB | "
+                    f"A: {active} | Used: {used_gb:.1f}G / {self.quota_gb:.0f}G | "
+                    f"Safe: {self.free_gb:.1f}G"
+                )
+            else:
+                self.stat_msg = f"FREE: {display_free:.1f}GB | A: {active} | Used: {used_gb:.1f}G | Safe: {self.free_gb:.1f}G"
+                
             return True
         
         except Exception as e:
