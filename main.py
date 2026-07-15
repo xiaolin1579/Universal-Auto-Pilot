@@ -839,55 +839,31 @@ class QbitNode:
 
             # 2. ดึงลิสต์ทอร์เรนต์ทั้งหมด
             r_torrents = self._execute_request('GET', f"{self.url}/api/v2/torrents/info", timeout=15)
-            
             if r_torrents is None or r_torrents.status_code in [401, 403]:
                 return self.login() and self.refresh_status()
-
-            try:
-                torrents = r_torrents.json()
-            except Exception:
-                return False
             
-            # 3. ปรับปรุงการคำนวณ used_gb ให้ตรงกับ Disk จริง 100%
-            # ดึงขนาดดิสก์รวมและพื้นที่ว่างจาก server_state (ได้จาก maindata)
-            total_disk_bytes = server_state.get('total_size_bytes', 0)
-            free_disk_bytes = server_state.get('free_space_on_disk', 0)
+            torrents = r_torrents.json()
             
-            # คำนวณ used_gb จาก Disk จริง (Total - Free)
-            # วิธีนี้จะทำให้ได้เลขใกล้เคียงกับ du -sh ที่คุณรันครับ
-            used_gb = (total_disk_bytes - free_disk_bytes) / (1024**3)
+            # --- ปรับแก้: นับจำนวนทอร์เรนต์ทั้งหมดโดยไม่สนใจสถานะ ---
+            active_count = len(torrents) 
             
-            # นับ Active Torrents จากรายการ info (ยังคงใช้เหมือนเดิม)
-            active_count = 0
-            inactive_states = {'pausedDL', 'pausedUP', 'queuedDL', 'queuedUP', 'checkingResumeData', 'stalledUP'}
-            for t in torrents:
-                if t.get('state', '') not in inactive_states:
-                    active_count += 1
-            
-            safety_buffer = 15.0
-
-            # 4. Hybrid Logic: คำนวณพื้นที่และเตรียมข้อความ
+            # 3. คำนวณพื้นที่ (ใช้ตัวแปรเหมือนเดิม)
+            capacity_limit_gb = getattr(self, 'total_disk_gb', self.quota_gb) 
             real_disk_free_gb = server_state.get('free_space_on_disk', 0) / (1024**3)
+            used_gb = max(0, capacity_limit_gb - real_disk_free_gb)
+            quota_free_gb = max(0, self.quota_gb - used_gb)
+            
+            # 4. สรุปผล
             safety_buffer = 15.0
+            display_free = min(quota_free_gb, real_disk_free_gb)
+            
+            # ในส่วนของ stat_msg จะแสดงผล A (All) แทน A (Active) เพื่อความชัดเจน
+            self.stat_msg = (
+                f"FREE(Q): {quota_free_gb:.1f}GB | FREE(D): {real_disk_free_gb:.1f}GB | "
+                f"Total: {active_count} | Used: {used_gb:.1f}G / {self.quota_gb:.0f}G | "
+                f"Safe: {max(0, display_free - safety_buffer):.1f}G"
+            )
 
-            if self.quota_gb > 0:
-                quota_free_gb = max(0, self.quota_gb - used_gb)
-                display_free = min(quota_free_gb, real_disk_free_gb)
-                
-                # กำหนด stat_msg ให้ชัดเจนรอบเดียว
-                self.stat_msg = (
-                    f"FREE(Q): {quota_free_gb:.1f}GB | FREE(D): {real_disk_free_gb:.1f}GB | "
-                    f"A: {active_count} | Used: {used_gb:.1f}G / {self.quota_gb:.0f}G | "
-                    f"Safe: {max(0, display_free - safety_buffer):.1f}G"
-                )
-            else:
-                display_free = real_disk_free_gb
-                self.stat_msg = (
-                    f"FREE: {display_free:.1f}GB | A: {active_count} | "
-                    f"Used: {used_gb:.1f}G | Safe: {max(0, display_free - safety_buffer):.1f}G"
-                )
-
-            # เก็บค่าสุดท้ายไว้สำหรับ Logic ส่วนอื่นของบอท
             self.free_gb = max(0, display_free - safety_buffer)
             
             return True
@@ -1287,7 +1263,7 @@ class RtorrentNode:
     def refresh_status(self):
         if not self.is_connected: return False
         try:
-            # 1. ยิง XML-RPC ดึง 3 ฟิลด์สำคัญ
+            # 1. ยิง XML-RPC ดึง 4 ฟิลด์ (เพิ่ม d.hash= เพื่อใช้นับจำนวนทั้งหมด)
             xml = (
                 '<?xml version="1.0"?>'
                 '<methodCall>'
@@ -1298,114 +1274,82 @@ class RtorrentNode:
                 '<param><value><string>d.is_active=</string></value></param>'
                 '<param><value><string>d.size_bytes=</string></value></param>'
                 '<param><value><string>d.bytes_done=</string></value></param>'
+                '<param><value><string>d.hash=</string></value></param>'
                 '</params>'
                 '</methodCall>'
             )
         
-            # 🔥 วนลูป Retry สั้นป้องกัน Timeout
+            # 🔥 วนลูป Retry
             r = None
             for attempt in range(3):
                 try:
                     r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=10, verify=False)
                     break
                 except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-                    if attempt < 2:
-                        time.sleep(1.0)
-                    else:
-                        print(f"⚠️ [{self.name}] อัปเดตโหลดไม่สำเร็จเนื่องจากเน็ตเวิร์กขัดข้อง (ใช้ค่าสถานะเดิมชั่วคราว)")
-                        return True 
+                    if attempt < 2: time.sleep(1.0)
+                    else: return True 
         
             if r.status_code in [401, 403]:
-                print(f" 🔄 [{self.name}] rTorrent Session expired ({r.status_code}), re-logging in...")
                 if self.login(): return False
         
             soup = BeautifulSoup(r.text, "xml")
-        
+            
             active = 0
+            total_count = 0  # เพิ่มตัวแปรสำหรับนับทอร์เรนต์ทั้งหมด
             used_bytes = 0
-            raw_vals = []
         
+            # หาโหนดข้อมูล
             torrent_nodes = soup.find_all("data")
             if len(torrent_nodes) > 1:
                 for node in torrent_nodes[1:]:
                     items = node.find_all("value", recursive=False)
-                    if len(items) == 3:
+                    if len(items) >= 4: # มี 4 ฟิลด์แล้ว
                         try:
-                            val_active = int(items[0].get_text().strip())
-                            val_size   = int(items[1].get_text().strip())
-                            val_done   = int(items[2].get_text().strip())
-                            raw_vals.extend([val_active, val_size, val_done])
+                            is_active = int(items[0].get_text().strip())
+                            bytes_done = int(items[2].get_text().strip())
+                            
+                            if is_active == 1:
+                                active += 1
+                            total_count += 1 # นับทอร์เรนต์ทั้งหมด
+                            used_bytes += bytes_done
                         except ValueError:
                             pass
         
-            if not raw_vals:
-                for val in soup.find_all("value"):
-                    if not val.find():
-                        try:
-                            raw_vals.append(int(val.get_text().strip()))
-                        except ValueError:
-                            pass
-    
-            for i in range(0, len(raw_vals), 3):
-                vals = raw_vals[i:i+3]
-                if len(vals) == 3:
-                    is_active  = vals[0]
-                    bytes_done = vals[2]
-                
-                    if is_active == 1:
-                        active += 1
-                    
-                    used_bytes += bytes_done
-
-            # แปลงหน่วยปริมาณทอร์เรนต์ในเครื่องเป็น GB
             used_gb = used_bytes / (1024**3)
             safety_buffer = 15.0
 
-            # 3. Hybrid Logic: คำนวณพื้นที่ว่างจากทั้ง 2 แหล่ง
-            # แหล่งที่ 1: คำนวณจาก Quota ของคุณ (ถ้ามี)
-            quota_free_gb = max(0, self.quota_gb - used_gb) if self.quota_gb > 0 else float('inf')
-
-            # แหล่งที่ 2: ดึงจาก Disk จริง (คงลอจิกดึง r_free ของคุณไว้)
+            # 2. ดึง Disk Free
             xml_disk = '<?xml version="1.0"?><methodCall><methodName>network.disk_free_4gb</methodName></methodCall>'
-            r_free = None
-            for attempt in range(3):
-                try:
-                    r_free = self.s.post(self.url, data=xml_disk, auth=self.auth, headers=self.headers, timeout=10, verify=False)
-                    break
-                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-                    if attempt < 2: time.sleep(1.0)
-                    else: return True
-
+            r_free = self.s.post(self.url, data=xml_disk, auth=self.auth, headers=self.headers, timeout=10, verify=False)
+            
             real_free = 0.0
-            if r_free:
+            if r_free.status_code == 200:
                 free_soup = BeautifulSoup(r_free.text, "xml")
                 free_node = free_soup.find(["i8", "int", "i4", "value"])
                 if free_node:
-                    try:
-                        real_free = (int(free_node.get_text().strip()) * 4096) / (1024**3)
-                    except Exception:
-                        pass
+                    real_free = (int(free_node.get_text().strip()) * 4096) / (1024**3)
             
-            real_free_gb = real_free # ค่าที่คำนวณได้จาก XML ในขั้นตอนก่อนหน้า
+            real_free_gb = real_free
 
-            # 🎯 จุดเปลี่ยน: เลือกค่าที่น้อยที่สุด (Conservative Estimate) เพื่อความปลอดภัยสูงสุด
-            # ถ้าไม่มี Quota ให้ยึด Disk จริง ถ้ามี Quota ให้เลือกตัวที่หมดเร็วกว่า
+            # 3. คำนวณพื้นที่
+            quota_free_gb = max(0, self.quota_gb - used_gb) if self.quota_gb > 0 else float('inf')
+            
             if self.quota_gb > 0:
-                display_free = min(max(0, quota_free_gb), max(0, real_free_gb))
+                display_free = min(quota_free_gb, real_free_gb)
             else:
                 display_free = real_free_gb
 
             self.free_gb = max(0, display_free - safety_buffer)
 
-            # 4. ประกอบร่างข้อความแสดงผล
+            # 4. ประกอบร่างข้อความ (เปลี่ยน A เป็น Total)
             if self.quota_gb > 0:
                 self.stat_msg = (
                     f"FREE(Q): {quota_free_gb:.1f}GB | FREE(D): {real_free_gb:.1f}GB | "
-                    f"A: {active} | Used: {used_gb:.1f}G / {self.quota_gb:.0f}G | "
+                    f"Total: {total_count} | Used: {used_gb:.1f}G / {self.quota_gb:.0f}G | "
                     f"Safe: {self.free_gb:.1f}G"
                 )
             else:
-                self.stat_msg = f"FREE: {display_free:.1f}GB | A: {active} | Used: {used_gb:.1f}G | Safe: {self.free_gb:.1f}G"
+                self.stat_msg = f"FREE: {display_free:.1f}GB | Total: {total_count} | Used: {used_gb:.1f}G | Safe: {self.free_gb:.1f}G"
                 
             return True
         
@@ -5003,23 +4947,43 @@ async def main():
 
                                             for node_obj, n_cfg in active_nodes:
                                                 if stop_event.is_set(): break
+                                                
+                                                # 1. ตรวจสอบ Load (Weight) ก่อน
                                                 d_type = n_cfg.get('disk_type', 'HDD')
                                                 dynamic_max_cap, _ = get_node_dynamic_cap(node_obj, d_type)
                                                 current_load = round(get_node_current_weight(node_obj), 1)
 
-                                                print(f"📡 Check [{node_obj.name}]: Load {current_load:.1f}/{dynamic_max_cap}")
                                                 if (current_load + task_weight) > dynamic_max_cap:
-                                                    print(f" ⏳ [Queue Full] {node_obj.name} ลอง Node ถัดไป")
                                                     continue
                                                 
-                                                cleaner = NodeCleaner(node_obj, n_cfg, global_clean)
-                                                effective_free_gb = node_obj.free_gb - node_obj.get_downloading_size()
-                                                if effective_free_gb < (t_size_gb + 15.0):
-                                                    cleaner.smart_reclaim_process(required_gb=(t_size_gb + 15.0), is_emergency=False)
+                                                # 2. ปรับการคำนวณพื้นที่ให้ "กันพื้นที่" (Buffer) ไว้ชัดเจน
+                                                # ใช้ max(0, ...) ป้องกันค่าติดลบที่มักเกิดจาก get_downloading_size()
+                                                downloading_size = max(0, node_obj.get_downloading_size())
+                                                effective_free_gb = max(0, node_obj.free_gb - downloading_size)
+                                                
+                                                # 3. Smart Reclaim
+                                                required_space = t_size_gb + 15.0
+                                                if effective_free_gb < required_space:
+                                                    cleaner = NodeCleaner(node_obj, n_cfg, global_clean)
+                                                    cleaner.smart_reclaim_process(required_gb=required_space, is_emergency=False)
                                                     node_obj.refresh_status()
-                                                    effective_free_gb = node_obj.free_gb - node_obj.get_downloading_size()
+                                                    
+                                                    # อัปเดตค่าหลังทำความสะอาด
+                                                    downloading_size = max(0, node_obj.get_downloading_size())
+                                                    effective_free_gb = max(0, node_obj.free_gb - downloading_size)
+
+                                                # 4. Final Check & Emergency Flush
+                                                if effective_free_gb < (t_size_gb + 5.0):
+                                                    # ลองทำ Reclaim รอบที่ 2 แบบ Emergency
+                                                    print(f"🔄 [{node_obj.name}] Reclaim รอบที่ 1 ยังไม่พอ, ลอง Emergency Flush...")
+                                                    cleaner.smart_reclaim_process(required_gb=required_space, is_emergency=True)
+                                                    node_obj.refresh_status()
+                                                    
+                                                    # คำนวณใหม่รอบสุดท้าย
+                                                    effective_free_gb = max(0, node_obj.free_gb - node_obj.get_downloading_size())
+                                                    
                                                     if effective_free_gb < (t_size_gb + 5.0):
-                                                        print(f"❌ [{node_obj.name}] พื้นที่กู้คืนไม่สำเร็จ (Remaining: {effective_free_gb:.1f} GB)")
+                                                        print(f"⚠️ [{node_obj.name}] พื้นที่ไม่พอจริงๆ (เหลือ {effective_free_gb:.1f}G) -> ข้าม")
                                                         continue
 
                                                 try:
