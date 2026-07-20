@@ -108,8 +108,16 @@ def load_full_config():
     if not os.path.exists(CONFIG_PATH):
         print(f"❌ Error: ไม่พบไฟล์ {CONFIG_PATH}")
         sys.exit(1)
-    with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-        return json.load(f)
+        
+    try:
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"❌ Error: ไฟล์ {CONFIG_PATH} มีรูปแบบ JSON ไม่ถูกต้อง (Syntax Error: {e})")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Error: ไม่สามารถอ่านไฟล์ config ได้ ({e})")
+        sys.exit(1)
 
 async def send_notify(msg, *args, **kwargs):
     """
@@ -489,8 +497,24 @@ _active_browser_instance = None #ตัวแปรเพื่อติดต�
 _current_profile_path = None #ตัวแปรเก็บ pathpath
 os.environ["CHROME_DEVEL_SANDBOX"] = ""
 
+def load_xvfb_config():
+    """ฟังก์ชันช่วยอ่านค่า Xvfb_enable จาก config.json โดยดึงผ่าน load_full_config"""
+    try:
+        config_data = load_full_config()
+        return config_data.get("Xvfb_enable", False)
+    except SystemExit:
+        # ดักจับกรณีที่ load_full_config สั่ง sys.exit(1) เมื่อหาไฟล์ไม่พบ
+        print("⚠️ [Config] ไม่พบหรือโหลด config ไม่สำเร็จ ใช้ค่าเริ่มต้น Xvfb_enable: False")
+        return False
+    except Exception as e:
+        print(f"⚠️ [Config] เกิดข้อผิดพลาดในการอ่าน Xvfb_enable ({e}), ใช้ค่าเริ่มต้น: False")
+        return False
+
 async def launch_any_browser(sitename="default", custom_args=None):
     global _global_display, _active_browser_instance, _current_profile_path
+    
+    # อ่านค่าคอนฟิก Xvfb_enable จาก config.json
+    xvfb_enabled_in_config = load_xvfb_config()
     
     # 1. เคลียร์ Instance เก่า (เพิ่มการหน่วงเวลาเพื่อความเสถียร)
     if _active_browser_instance:
@@ -501,13 +525,32 @@ async def launch_any_browser(sitename="default", custom_args=None):
             pass
         _active_browser_instance = None
 
-    # 2. Xvfb Setup
-    xvfb_exists = shutil.which("Xvfb") is not None
-    if xvfb_exists and _global_display is None:
-        os.system("pkill -9 -f Xvfb")
-        _global_display = Display(visible=0, size=(1920, 1080))
-        _global_display.start()
-        await asyncio.sleep(2)
+    # ปิด Display เก่าทิ้งก่อนทุกครั้งเพื่อเคลียร์สถานะ
+    if _global_display:
+        try:
+            _global_display.stop()
+        except:
+            pass
+        _global_display = None
+    os.system("pkill -9 -f Xvfb")
+
+    # 2. Xvfb & Headless Setup ตามเงื่อนไขใหม่
+    headless_mode = True  # ค่าเริ่มต้นเป็น True ตามเงื่อนไข
+
+    if xvfb_enabled_in_config:
+        xvfb_exists = shutil.which("Xvfb") is not None
+        if xvfb_exists:
+            print("🖥️ [System] เปิดใช้งาน Xvfb ตาม config (Xvfb_enable: true)")
+            _global_display = Display(visible=0, size=(1920, 1080))
+            _global_display.start()
+            await asyncio.sleep(2)
+            headless_mode = False  # มี Xvfb และเปิดใช้งาน -> ตั้งค่า headless=False
+        else:
+            print("⚠️ [System] config สั่งเปิด Xvfb แต่ไม่พบแพ็กเกจ Xvfb ในระบบ -> Fallback เป็น headless=True")
+            headless_mode = True
+    else:
+        print("🖥️ [System] ปิดการใช้งาน Xvfb ตาม config (Xvfb_enable: false) -> ตั้งค่า headless=True")
+        headless_mode = True
 
     # 3. เตรียม Profile Path และล้าง Lock Files
     _current_profile_path = os.path.abspath(f"./profiles/{sitename}_uc_profile")
@@ -525,7 +568,7 @@ async def launch_any_browser(sitename="default", custom_args=None):
     config = Config(
         browser_executable_path=get_browser_path_or_fail(),
         user_data_dir=_current_profile_path,
-        headless=False
+        headless=headless_mode
     )
     
     # ตั้งค่าผ่าน Attribute โดยตรง (ไม่ต้องใส่ใน add_argument)
@@ -583,7 +626,7 @@ async def launch_any_browser(sitename="default", custom_args=None):
                 download_path="/tmp"
             )
         )
-        print(f"🚀 [System] Browser รันสำเร็จ")
+        print(f"🚀 [System] Browser รันสำเร็จ (Headless: {headless_mode})")
         return _active_browser_instance
 
     except Exception as e:
@@ -645,19 +688,34 @@ async def cleanup_profile():
 
 def kill_xvfb():
     global _global_display
-    if _global_display and hasattr(_global_display, 'pid'):
+    
+    # 1. ปิดตาม PID ของ Instance ที่เก็บไว้ (แม่นยำและปลอดภัยที่สุด)
+    if _global_display and hasattr(_global_display, 'pid') and _global_display.pid:
         pid = _global_display.pid
         try:
             print(f"🖥️ [System] กำลังปิด Xvfb (PID: {pid})...")
-            # ฆ่าตาม PID ที่เก็บไว้
             os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            print(f"⚠️ ไม่พบ Process ของ Xvfb (PID {pid}) อาจจะถูกปิดไปก่อนหน้านี้แล้ว")
         except Exception as e:
             print(f"⚠️ ไม่สามารถปิด Xvfb (PID {pid}): {e}")
         finally:
             _global_display = None
-    else:
-        # กรณีไม่มี PID ใน object ให้ลองสั่ง pkill ทั่วไป (เผื่อกรณีค้าง)
+            
+    # 2. ปิดเผื่อกรณีที่มี Display ค้างสะสมอยู่ หรือไม่มี PID อ้างอิงในระบบ
+    try:
+        if _global_display and hasattr(_global_display, 'stop'):
+            _global_display.stop()
+    except Exception:
+        pass
+    finally:
+        _global_display = None
+
+    # 3. กวาดล้าง Process Xvfb ที่อาจตกค้างในระบบทั้งหมด
+    try:
         os.system("pkill -9 -f Xvfb")
+    except Exception:
+        pass
 
 async def load_cookies_to_browser(tab, site_cfg):
     auth_path = get_auth_file(site_cfg['name'])
