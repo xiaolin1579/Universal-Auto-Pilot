@@ -591,6 +591,23 @@ async def launch_any_browser(sitename="default", custom_args=None):
         "--mute-audio",
         "--disable-features=VizDisplayCompositor",
         "--disk-cache-dir=/dev/null"
+        
+        # --- ปิดระบบ Background และการประมวลผลที่ไม่จำเป็น ---
+        "--disable-background-timer-throttling", # ปิดการหน่วงเวลาตัวนับเวลาในแท็บเบื้องหลัง (ช่วยลด CPU ซ้อน)
+        "--disable-backgrounding-occluded-windows", # ปิดการทำงานหน้าต่างที่ถูกบัง เพื่อประหยัด CPU
+        "--disable-renderer-backgrounding", # ปิดการลดความสำคัญ Renderer Process เบื้องหลัง
+        "--disable-ipc-flooding-protection", # ปิดตัวป้องกัน IPC flood (ลด overhead ในการสื่อสารภายใน)
+        
+        # --- ปิดฟีเจอร์และบริการเสริมเพื่อประหยัด RAM ---
+        "--disable-translate", # ปิดระบบแปลภาษาอัตโนมัติ
+        "--disable-extensions-http-throttling", # ปิดการจำกัดความเร็ว HTTP ของส่วนขยาย
+        "--disable-sync", # ปิดการซิงค์บัญชี Google (ลดการเชื่อมต่อ Network และ RAM)
+        "--metrics-recording-only", # ปิดการเก็บบันทึกสถิติการใช้งานเบื้องหลัง
+        "--no-first-run", # ข้ามขั้นตอนการตั้งค่าหน้าแรกเมื่อเปิดใช้งานครั้งแรก
+        "--disable-default-apps", # ไม่โหลดแอปพลิเคชันเริ่มต้นของ Chrome
+        
+        # --- จัดการหน่วยความจำ (Memory Management) ---
+        "--js-flags=--max-old-space-size=512", # บังคับจำกัดการใช้ RAM ของ V8 JavaScript Engine ไว้ที่ไม่เกิน 512MB (ปรับลดลงได้ เช่น 256 หรือ 128 ถ้าหน้าเว็บไม่ซับซ้อน)
     ]
     
     for arg in performance_args:
