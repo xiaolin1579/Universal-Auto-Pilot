@@ -699,15 +699,22 @@ async def cleanup_profile():
         await asyncio.sleep(3) 
         
         # 2. ใช้การ Retry ลบ (กรณีติด Lock ของ OS)
+        deleted_success = False
         for i in range(5): 
             try:
                 shutil.rmtree(_current_profile_path, ignore_errors=False)
                 print(f"🧹 [System] ลบ Profile สำเร็จ: {_current_profile_path}")
+                deleted_success = True
                 break
             except Exception as e:
                 print(f"⚠️ ลบ Profile ไม่ได้ (Retry {i+1}/5): {e}")
                 await asyncio.sleep(2) # รออีกนิดแล้วลองใหม่
         
+        # 3. กรณีลองครบทุกรอบแล้วยังลบไม่ได้ (เช่น โดนล็อกถาวรโดยโพรเซสผี) 
+        # ให้เคลียร์ชื่อโฟลเดอร์ทิ้งเพื่อบังคับสร้างโฟลเดอร์ใหม่รอบหน้า (กันโปรแกรมพัง)
+        if not deleted_success:
+            print(f"❌ [System] ไม่สามารถลบโฟลเดอร์โปรไฟล์เก่าได้ {_current_profile_path} จะทำการข้ามไปใช้เส้นทางใหม่")
+
         _current_profile_path = None
 
 def kill_xvfb():
