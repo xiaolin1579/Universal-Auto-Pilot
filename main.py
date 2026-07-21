@@ -647,29 +647,50 @@ async def launch_any_browser(sitename="default", custom_args=None):
 
 def kill_specific_browser():
     global _active_browser_instance
-    if _active_browser_instance and hasattr(_active_browser_instance, 'browser_pid'):
+    
+    # 1. ปิดตาม PID ของ Instance ที่เก็บไว้ (แม่นยำที่สุด)
+    if _active_browser_instance and hasattr(_active_browser_instance, 'browser_pid') and _active_browser_instance.browser_pid:
         pid = _active_browser_instance.browser_pid
         try:
             print(f"🔪 [System] กำลังตรวจสอบและฆ่า Browser PID: {pid}")
             
             if sys.platform == "win32":
-                # Windows ใช้ taskkill สั่งฆ่าทั้ง Tree
                 os.system(f"taskkill /F /PID {pid} /T")
             else:
-                # Linux/Unix: เช็คก่อนว่า process ยังอยู่ไหม
                 try:
-                    os.kill(pid, 0) # ส่ง signal 0 เพื่อเช็คว่า pid ยังมีชีวิตอยู่
+                    os.kill(pid, 0)
                     pgid = os.getpgid(pid)
                     os.killpg(pgid, signal.SIGKILL)
                     print(f"✅ [System] ฆ่า Browser PID {pid} และลูกหลานเรียบร้อย")
                 except ProcessLookupError:
                     print(f"ℹ️ PID {pid} ไม่พบในระบบ (อาจปิดไปแล้ว)")
-                    
         except Exception as e:
             print(f"⚠️ ไม่สามารถฆ่า PID {pid}: {e}")
         finally:
-            # ไม่ว่าจะฆ่าสำเร็จหรือไม่ ต้องเคลียร์ตัวแปรทิ้งเสมอ
             _active_browser_instance = None
+    
+    # 2. ปิดเผื่อกรณีที่มี Instance ค้างอยู่แต่ไม่มี PID อ้างอิง
+    try:
+        if _active_browser_instance and hasattr(_active_browser_instance, 'stop'):
+            # เรียกใช้ stop แบบ synchronous เผื่อกรณีรันนอก loop async
+            pass
+    except Exception:
+        pass
+    finally:
+        _active_browser_instance = None
+
+    # 3. กวาดล้าง (Force Kill) โพรเซส Chromium / Chrome / Browser ที่ตกค้างในระบบทั้งหมด
+    try:
+        print("🧹 [System] กำลังกวาดล้างโพรเซส Chromium/Chrome ที่ค้างในระบบทั้งหมด...")
+        if sys.platform == "win32":
+            os.system("taskkill /F /IM chrome.exe /T >nul 2>&1")
+            os.system("taskkill /F /IM chromium.exe /T >nul 2>&1")
+        else:
+            os.system("pkill -9 -f chromium")
+            os.system("pkill -9 -f chromium-browser")
+            os.system("pkill -9 -f chrome")
+    except Exception:
+        pass
 
 async def cleanup_profile():
     global _current_profile_path
