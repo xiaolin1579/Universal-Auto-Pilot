@@ -513,29 +513,25 @@ def load_xvfb_config():
 async def launch_any_browser(sitename="default", custom_args=None):
     global _global_display, _active_browser_instance, _current_profile_path
     
-    # อ่านค่าคอนฟิก Xvfb_enable จาก config.json
+    # 1. เคลียร์ Browser เก่า, Xvfb และลบโปรไฟล์เก่าทิ้งให้สะอาดก่อนเริ่ม
+    kill_specific_browser()
+    kill_xvfb()
+    await cleanup_profile()
+
+    # กวาดล้างโพรเซสตกค้างในระบบเผื่อกรณีฉุกเฉิน
+    try:
+        os.system("pkill -9 -f chromium")
+        os.system("pkill -9 -f chromium-browser")
+        os.system("pkill -9 -f Xvfb")
+        await asyncio.sleep(1)
+    except Exception:
+        pass
+
+    # 2. อ่านค่าคอนฟิก Xvfb_enable จาก config.json ผ่านฟังก์ชันที่คุณมี
     xvfb_enabled_in_config = load_xvfb_config()
-    
-    # 1. เคลียร์ Instance เก่า (เพิ่มการหน่วงเวลาเพื่อความเสถียร)
-    if _active_browser_instance:
-        try:
-            await _active_browser_instance.stop()
-            await asyncio.sleep(3) # รอให้ระบบเคลียร์ Process เก่า
-        except:
-            pass
-        _active_browser_instance = None
 
-    # ปิด Display เก่าทิ้งก่อนทุกครั้งเพื่อเคลียร์สถานะ
-    if _global_display:
-        try:
-            _global_display.stop()
-        except:
-            pass
-        _global_display = None
-    os.system("pkill -9 -f Xvfb")
-
-    # 2. Xvfb & Headless Setup ตามเงื่อนไขใหม่
-    headless_mode = True  # ค่าเริ่มต้นเป็น True ตามเงื่อนไข
+    # 3. Xvfb & Headless Setup ตามเงื่อนไข
+    headless_mode = True  # ค่าเริ่มต้นเป็น True
 
     if xvfb_enabled_in_config:
         xvfb_exists = shutil.which("Xvfb") is not None
@@ -552,30 +548,22 @@ async def launch_any_browser(sitename="default", custom_args=None):
         print("🖥️ [System] ปิดการใช้งาน Xvfb ตาม config (Xvfb_enable: false) -> ตั้งค่า headless=True")
         headless_mode = True
 
-    # 3. เตรียม Profile Path และล้าง Lock Files
+    # 4. กำหนด Profile Path ใหม่
     _current_profile_path = os.path.abspath(f"./profiles/{sitename}_uc_profile")
     if not os.path.exists(_current_profile_path):
         os.makedirs(_current_profile_path, exist_ok=True)
-    
-    # ล้างไฟล์ Lock ของ Chrome ที่ทำให้เปิด browser ไม่ขึ้น
-    for lock_file in ["SingletonLock", "SingletonCookie", "Singleton"]:
-        path = os.path.join(_current_profile_path, lock_file)
-        if os.path.exists(path):
-            try: os.remove(path)
-            except: pass
 
-    # 4. ตั้งค่า Config
+    # 5. ตั้งค่า Config ของเบราว์เซอร์
     config = Config(
         browser_executable_path=get_browser_path_or_fail(),
         user_data_dir=_current_profile_path,
         headless=headless_mode
     )
     
-    # ตั้งค่าผ่าน Attribute โดยตรง (ไม่ต้องใส่ใน add_argument)
     config.sandbox = False 
     config.connection_timeout = 30
     
-    # บล็อกอาร์กิวเมนต์รีดไขมัน (ลบ no-sandbox ออกจากลิสต์นี้!)
+    # บล็อกอาร์กิวเมนต์รีดทรัพยากรและป้องกัน Error บนสิทธิ์ Root
     performance_args = [
         # --- รีดประสิทธิภาพและการใช้งานหน่วยความจำ (Performance & Memory) ---
         "--disable-dev-shm-usage",
@@ -618,7 +606,7 @@ async def launch_any_browser(sitename="default", custom_args=None):
         for arg in custom_args:
             config.add_argument(arg)
 
-    # 5. รัน Browser
+    # 6. รัน Browser Instance ใหม่
     try:
         selected_path = config.browser_executable_path
     
@@ -649,15 +637,12 @@ async def launch_any_browser(sitename="default", custom_args=None):
 
     except Exception as e:
         print(f"❌ [Critical] Browser Start Error: {e}")
-        # ล้างการเชื่อมต่อทั้งหมดหากเปิดไม่สำเร็จ
-        _active_browser_instance = None
-        # ปิด Display หากค้าง
-        if _global_display:
-            try:
-                _global_display.stop()
-            except:
-                pass
-            _global_display = None
+        # หากเปิดไม่สำเร็จ ให้เคลียร์ทรัพยากรทั้งหมดทิ้งทันที
+        try:
+            kill_specific_browser()
+            kill_xvfb()
+        except:
+            pass
         raise e
 
 def kill_specific_browser():
