@@ -577,6 +577,7 @@ async def launch_any_browser(sitename="default", custom_args=None):
     
     # บล็อกอาร์กิวเมนต์รีดไขมัน (ลบ no-sandbox ออกจากลิสต์นี้!)
     performance_args = [
+        # --- รีดประสิทธิภาพและการใช้งานหน่วยความจำ (Performance & Memory) ---
         "--disable-dev-shm-usage",
         "--disable-breakpad",
         "--disable-component-update",
@@ -590,7 +591,24 @@ async def launch_any_browser(sitename="default", custom_args=None):
         "--disable-background-networking",
         "--mute-audio",
         "--disable-features=VizDisplayCompositor",
-        "--disk-cache-dir=/dev/null"
+        "--disk-cache-dir=/dev/null",
+        
+        # --- ปิดระบบ Background และการประมวลผลที่ไม่จำเป็น ---
+        "--disable-background-timer-throttling", 
+        "--disable-backgrounding-occluded-windows", 
+        "--disable-renderer-backgrounding", 
+        "--disable-ipc-flooding-protection", 
+        
+        # --- ปิดฟีเจอร์และบริการเสริมเพื่อประหยัด RAM ---
+        "--disable-translate", 
+        "--disable-extensions-http-throttling", 
+        "--disable-sync", 
+        "--metrics-recording-only", 
+        "--no-first-run", 
+        "--disable-default-apps", 
+        
+        # --- จัดการหน่วยความจำ (Memory Management) ---
+        "--js-flags=--max-old-space-size=512",
     ]
     
     for arg in performance_args:
