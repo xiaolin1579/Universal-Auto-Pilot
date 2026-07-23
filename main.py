@@ -498,12 +498,22 @@ _current_profile_path = None #ตัวแปรเก็บ pathpath
 os.environ["CHROME_DEVEL_SANDBOX"] = ""
 
 def load_xvfb_config():
-    """ฟังก์ชันช่วยอ่านค่า Xvfb_enable จาก config.json โดยดึงผ่าน load_full_config"""
+    """ฟังก์ชันช่วยอ่านค่า Xvfb_enable จาก config.json (รองรับทั้งแบบอยู่ใน SETTING และระดับนอกสุด)"""
     try:
         config_data = load_full_config()
-        return config_data.get("Xvfb_enable", False)
+        
+        # 1. ลองเช็คจากก้อน "SETTING" ดูก่อน (ตามโครงสร้างจริงของคุณ)
+        if isinstance(config_data, dict):
+            setting_section = config_data.get("SETTING", {})
+            if isinstance(setting_section, dict) and "Xvfb_enable" in setting_section:
+                return bool(setting_section.get("Xvfb_enable", False))
+            
+            # 2. เผื่อกรณีไฟล์ config วางไว้นอกสุดระดับ Root
+            if "Xvfb_enable" in config_data:
+                return bool(config_data.get("Xvfb_enable", False))
+                
+        return False
     except SystemExit:
-        # ดักจับกรณีที่ load_full_config สั่ง sys.exit(1) เมื่อหาไฟล์ไม่พบ
         print("⚠️ [Config] ไม่พบหรือโหลด config ไม่สำเร็จ ใช้ค่าเริ่มต้น Xvfb_enable: False")
         return False
     except Exception as e:
