@@ -514,9 +514,9 @@ async def launch_any_browser(sitename="default", custom_args=None):
     global _global_display, _active_browser_instance, _current_profile_path
     
     # 1. เคลียร์ Browser เก่า, Xvfb และลบโปรไฟล์เก่าทิ้งให้สะอาดก่อนเริ่ม
-    kill_specific_browser()
-    kill_xvfb()
-    await cleanup_profile()
+    if "kill_specific_browser" in globals(): kill_specific_browser()
+    if "kill_xvfb" in globals(): kill_xvfb()
+    if "cleanup_profile" in globals(): await cleanup_profile()
 
     # กวาดล้างโพรเซสตกค้างในระบบเผื่อกรณีฉุกเฉิน
     try:
@@ -528,7 +528,7 @@ async def launch_any_browser(sitename="default", custom_args=None):
         pass
 
     # 2. อ่านค่าคอนฟิก Xvfb_enable จาก config.json ผ่านฟังก์ชันที่คุณมี
-    xvfb_enabled_in_config = load_xvfb_config()
+    xvfb_enabled_in_config = load_xvfb_config() if "load_xvfb_config" in globals() else False
 
     # 3. Xvfb & Headless Setup ตามเงื่อนไข
     headless_mode = True  # ค่าเริ่มต้นเป็น True
@@ -537,6 +537,7 @@ async def launch_any_browser(sitename="default", custom_args=None):
         xvfb_exists = shutil.which("Xvfb") is not None
         if xvfb_exists:
             print("🖥️ [System] เปิดใช้งาน Xvfb ตาม config (Xvfb_enable: true)")
+            from pyvirtualdisplay import Display
             _global_display = Display(visible=0, size=(1920, 1080))
             _global_display.start()
             await asyncio.sleep(2)
@@ -553,17 +554,15 @@ async def launch_any_browser(sitename="default", custom_args=None):
     if not os.path.exists(_current_profile_path):
         os.makedirs(_current_profile_path, exist_ok=True)
 
-    # 5. ตั้งค่า Config ของเบราว์เซอร์
-    config = Config(
-        browser_executable_path=get_browser_path_or_fail(),
-        user_data_dir=_current_profile_path,
-        headless=headless_mode
-    )
+    # 5. ตั้งค่า Config ของ nodriver
+    config = uc.Config()
+    config.user_data_dir = _current_profile_path
+    config.headless = headless_mode
     
-    config.sandbox = False 
-    config.connection_timeout = 30
-    
-    # บล็อกอาร์กิวเมนต์รีดทรัพยากรและป้องกัน Error บนสิทธิ์ Root
+    if "get_browser_path_or_fail" in globals():
+        config.browser_executable_path = get_browser_path_or_fail()
+
+    # บล็อกอาร์กิวเมนต์รีดประสิทธิภาพ
     performance_args = [
         # --- รีดประสิทธิภาพและการใช้งานหน่วยความจำ (Performance & Memory) ---
         "--disable-dev-shm-usage",
@@ -606,41 +605,22 @@ async def launch_any_browser(sitename="default", custom_args=None):
         for arg in custom_args:
             config.add_argument(arg)
 
-    # 6. รัน Browser Instance ใหม่
+    # 6. รัน Browser Instance ใหม่ด้วย nodriver
     try:
-        selected_path = config.browser_executable_path
-    
-        browser_type = "Unknown"
-        if "chromium" in selected_path.lower():
-            browser_type = "Chromium"
-        elif "chrome" in selected_path.lower():
-            browser_type = "Google Chrome"
-        elif "msedge" in selected_path.lower():
-            browser_type = "Microsoft Edge"
-        elif "brave" in selected_path.lower():
-            browser_type = "Brave Browser"
-
-        print(f"🔍 [System] กำลังเริ่มทำงานโดยเลือกใช้: {browser_type}")
+        selected_path = config.browser_executable_path or "System Default"
         print(f"📂 [System] Path ที่ตรวจพบและใช้งาน: {selected_path}")
 
-        _active_browser_instance = await uc.start(config=config, no_sandbox=True)
+        # nodriver สตาร์ทผ่าน uc.start(config=config) ได้โดยตรง
+        _active_browser_instance = await uc.start(config=config)
         
-        # ตั้งค่า Download Behavior
-        await _active_browser_instance.send(
-            uc.cdp.browser.set_download_behavior(
-                behavior="allow",
-                download_path="/tmp"
-            )
-        )
-        print(f"🚀 [System] Browser รันสำเร็จ (Headless: {headless_mode})")
+        print(f"🚀 [System] Browser (nodriver) รันสำเร็จ (Headless: {headless_mode})")
         return _active_browser_instance
 
     except Exception as e:
-        print(f"❌ [Critical] Browser Start Error: {e}")
-        # หากเปิดไม่สำเร็จ ให้เคลียร์ทรัพยากรทั้งหมดทิ้งทันที
+        print(f"❌ [Critical] Nodriver Start Error: {e}")
         try:
-            kill_specific_browser()
-            kill_xvfb()
+            if "kill_specific_browser" in globals(): kill_specific_browser()
+            if "kill_xvfb" in globals(): kill_xvfb()
         except:
             pass
         raise e
