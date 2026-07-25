@@ -190,7 +190,7 @@ def get_historical_report(site_name="TORRENTDD"):
             prefix = "📈 +" if diff > 0 else "📉 "
             return f"{prefix}{format_size(diff)}"
 
-        # --- ส่วนรวบรวมและจัดเรียง Top Hourly ทุกชั่วโมงในวันนี้ (จากมากไปน้อย) ---
+        # --- ส่วนรวบรวมและจัดอันดับ Top Hourly ทุกชั่วโมงในวันนี้ (จากยอดอัปโหลดมากไปหาน้อย) ---
         hourly_rankings = []
         if len(today_keys) > 1:
             for i in range(1, len(today_keys)):
@@ -201,9 +201,12 @@ def get_historical_report(site_name="TORRENTDD"):
                 curr_data = history[curr_key]
                 
                 up_diff = curr_data['up'] - prev_data['up']
-                if up_diff > 0:  # เอาเฉพาะชั่วโมงที่มีการอัปโหลดเพิ่มขึ้น
+                dl_diff = curr_data['dl'] - prev_data['dl']
+                
+                # เก็บข้อมูลเฉพาะชั่วโมงที่มีการเปลี่ยนแปลงอย่างน้อยหนึ่งอย่าง (Up หรือ Dl)
+                if up_diff != 0 or dl_diff != 0:
                     time_label = curr_key.split(" ")[1][:5]
-                    hourly_rankings.append((time_label, up_diff))
+                    hourly_rankings.append((time_label, up_diff, dl_diff))
             
             # เรียงลำดับจากยอดอัปโหลดมากไปหาน้อย
             hourly_rankings.sort(key=lambda x: x[1], reverse=True)
@@ -234,10 +237,20 @@ def get_historical_report(site_name="TORRENTDD"):
         ])
 
         if hourly_rankings:
-            for time_str, up_val in hourly_rankings:
-                msg.append(f"  └ ⏰ <b>{time_str} น.</b> | 📤 📈 +{format_size(up_val)}")
+            for time_str, up_val, dl_val in hourly_rankings:
+                sub_lines = []
+                if up_val != 0:
+                    prefix = "📈 +" if up_val > 0 else "📉 "
+                    sub_lines.append(f"     ├ 📤 {prefix}{format_size(up_val)}")
+                if dl_val != 0:
+                    prefix = "📈 +" if dl_val > 0 else "📉 "
+                    sub_lines.append(f"     └ 📥 {prefix}{format_size(dl_val)}")
+                
+                if sub_lines:
+                    msg.append(f"  └ ⏰ <b>{time_str} น.</b>")
+                    msg.extend(sub_lines)
         else:
-            msg.append("  └ <i>ยังไม่มีข้อมูลช่วงชั่วโมงที่อัปโหลด</i>")
+            msg.append("  └ <i>ยังไม่มีข้อมูลช่วงชั่วโมงที่เปลี่ยนแปลง</i>")
 
         msg.append("━━━━━━━━━━━━━━━━━━")
         return "\n".join(msg)
