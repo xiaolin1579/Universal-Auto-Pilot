@@ -273,7 +273,7 @@ def get_monthly_report(site_name="TORRENTDD"):
 
         active_days = len(set([k.split()[0] for k in monthly_keys]))
 
-        # --- ส่วนคำนวณหา Top Transfer Day (วันที่ปั๊มเรโชพุ่งสูงสุดในเดือน) ---
+        # --- ส่วนรวบรวมและจัดอันดับ Top Transfer Days ---
         daily_stats = {}
         for k in monthly_keys:
             day_str = k.split()[0]
@@ -281,18 +281,19 @@ def get_monthly_report(site_name="TORRENTDD"):
                 daily_stats[day_str] = []
             daily_stats[day_str].append(history[k])
 
-        best_day = None
-        max_day_up = -1
-
+        daily_rankings = []
         for day_str, snapshots in daily_stats.items():
             if len(snapshots) > 1:
-                # ผลต่างอัปโหลดของวันนั้น (สแนปชอตสุดท้ายของวัน - สแนปชอตแรกของวัน)
                 day_up_diff = snapshots[-1]['up'] - snapshots[0]['up']
-                if day_up_diff > max_day_up:
-                    max_day_up = day_up_diff
-                    best_day = day_str
+                day_dl_diff = snapshots[-1]['dl'] - snapshots[0]['dl']
+                daily_rankings.append((day_str, day_up_diff, day_dl_diff))
+            elif len(snapshots) == 1 and active_days == 1:
+                day_up_diff = snapshots[0]['up']
+                day_dl_diff = snapshots[0]['dl']
+                daily_rankings.append((day_str, day_up_diff, day_dl_diff))
 
-        top_day_str = f"{best_day} (+{format_size(max_day_up)})" if best_day and max_day_up > 0 else "N/A"
+        # เรียงลำดับจากยอดอัปโหลดมากไปหาน้อย
+        daily_rankings.sort(key=lambda x: x[1], reverse=True)
 
         msg = [
             f"🗓️ <b>{site_name} Monthly: {current_month}</b>",
@@ -307,7 +308,25 @@ def get_monthly_report(site_name="TORRENTDD"):
 
         msg.extend([
             "━━━━━━━━━━━━━━━━━━",
-            f"🏆 <b>Top Transfer Day:</b> <code>{top_day_str}</code>",
+            f"🏆 <b>Top Transfer Days Ranking</b>"
+        ])
+
+        if daily_rankings:
+            for day_str, up_val, dl_val in daily_rankings:
+                sub_lines = []
+                if up_val > 0:
+                    sub_lines.append(f"     ├ 📤 📈 +{format_size(up_val)}")
+                if dl_val > 0:
+                    sub_lines.append(f"     └ 📥 📉 +{format_size(dl_val)}")
+                
+                # แสดงผลเฉพาะวันที่มีการขยับของ Up หรือ Dl อย่างน้อยหนึ่งอย่าง
+                if sub_lines:
+                    msg.append(f"  └ 📅 <b>{day_str}</b>")
+                    msg.extend(sub_lines)
+        else:
+            msg.append("  └ <i>ยังไม่มีข้อมูลสถิติรายวัน</i>")
+
+        msg.extend([
             "━━━━━━━━━━━━━━━━━━",
             f"📅 ข้อมูลสะสม: {active_days} วัน",
             f"⏱️ ตั้งแต่: {monthly_keys[0]}",
