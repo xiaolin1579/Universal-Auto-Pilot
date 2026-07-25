@@ -275,6 +275,27 @@ def get_monthly_report(site_name="TORRENTDD"):
 
         active_days = len(set([k.split()[0] for k in monthly_keys]))
 
+        # --- ส่วนคำนวณหา Top Transfer Day (วันที่ปั๊มเรโชพุ่งสูงสุดในเดือน) ---
+        daily_stats = {}
+        for k in monthly_keys:
+            day_str = k.split()[0]
+            if day_str not in daily_stats:
+                daily_stats[day_str] = []
+            daily_stats[day_str].append(history[k])
+
+        best_day = None
+        max_day_up = -1
+
+        for day_str, snapshots in daily_stats.items():
+            if len(snapshots) > 1:
+                # ผลต่างอัปโหลดของวันนั้น (สแนปชอตสุดท้ายของวัน - สแนปชอตแรกของวัน)
+                day_up_diff = snapshots[-1]['up'] - snapshots[0]['up']
+                if day_up_diff > max_day_up:
+                    max_day_up = day_up_diff
+                    best_day = day_str
+
+        top_day_str = f"{best_day} (+{format_size(max_day_up)})" if best_day and max_day_up > 0 else "N/A"
+
         msg = [
             f"🗓️ <b>{site_name} Monthly: {current_month}</b>",
             "━━━━━━━━━━━━━━━━━━",
@@ -287,6 +308,8 @@ def get_monthly_report(site_name="TORRENTDD"):
             msg.append(f"💰 <b>Total Bonus:</b> +{bonus_gain:,.1f} pts")
 
         msg.extend([
+            "━━━━━━━━━━━━━━━━━━",
+            f"🏆 <b>Top Transfer Day:</b> <code>{top_day_str}</code>",
             "━━━━━━━━━━━━━━━━━━",
             f"📅 ข้อมูลสะสม: {active_days} วัน",
             f"⏱️ ตั้งแต่: {monthly_keys[0]}",
