@@ -190,6 +190,32 @@ def get_historical_report(site_name="TORRENTDD"):
             prefix = "📈 +" if diff > 0 else "📉 "
             return f"{prefix}{format_size(diff)}"
 
+        # --- ส่วนคำนวณหา Top Transfer รายชั่วโมง (Peak Hour) ของวันนี้ ---
+        top_time_str = "N/A"
+        top_up_diff = 0
+        
+        if len(today_keys) > 1:
+            max_up = -1
+            best_interval = None
+            
+            # วนลูปจับคู่ snapshot ทีละชั่วโมงติดกันภายในวันนั้น
+            for i in range(1, len(today_keys)):
+                prev_key = today_keys[i - 1]
+                curr_key = today_keys[i]
+                
+                prev_data = history[prev_key]
+                curr_data = history[curr_key]
+                
+                up_diff = curr_data['up'] - prev_data['up']
+                if up_diff > max_up:
+                    max_up = up_diff
+                    # ดึงเวลาออกมาแสดงผล เช่น จาก "2026-07-25 14:00:00" เป็น "14:00"
+                    best_interval = curr_key.split(" ")[1][:5]
+            
+            if best_interval and max_up > 0:
+                top_time_str = f"{best_interval} น."
+                top_up_diff = max_up
+
         msg = [
             f"📊 <b>{site_name} Report: {today_str}</b>",
             "━━━━━━━━━━━━━━━━━━",
@@ -211,6 +237,9 @@ def get_historical_report(site_name="TORRENTDD"):
             f"📅 <b>Today's Gain</b>",
             f"  └ 📤 {calc_gain(latest_snapshot['up'], first_snapshot['up'])}",
             f"  └ 📥 {calc_gain(latest_snapshot['dl'], first_snapshot['dl'])}",
+            "━━━━━━━━━━━━━━━━━━",
+            f"🏆 <b>Top Hourly (Today)</b>",
+            f"  └ ⏰ <b>{top_time_str}</b> | 📤 {calc_gain(top_up_diff, 0) if top_up_diff > 0 else '➖ 0.00 GB'}",
             "━━━━━━━━━━━━━━━━━━"
         ])
         return "\n".join(msg)
