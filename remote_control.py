@@ -190,15 +190,9 @@ def get_historical_report(site_name="TORRENTDD"):
             prefix = "📈 +" if diff > 0 else "📉 "
             return f"{prefix}{format_size(diff)}"
 
-        # --- ส่วนคำนวณหา Top Transfer รายชั่วโมง (Peak Hour) ของวันนี้ ---
-        top_time_str = "N/A"
-        top_up_diff = 0
-        
+        # --- ส่วนรวบรวมและจัดเรียง Top Hourly ทุกชั่วโมงในวันนี้ (จากมากไปน้อย) ---
+        hourly_rankings = []
         if len(today_keys) > 1:
-            max_up = -1
-            best_interval = None
-            
-            # วนลูปจับคู่ snapshot ทีละชั่วโมงติดกันภายในวันนั้น
             for i in range(1, len(today_keys)):
                 prev_key = today_keys[i - 1]
                 curr_key = today_keys[i]
@@ -207,14 +201,12 @@ def get_historical_report(site_name="TORRENTDD"):
                 curr_data = history[curr_key]
                 
                 up_diff = curr_data['up'] - prev_data['up']
-                if up_diff > max_up:
-                    max_up = up_diff
-                    # ดึงเวลาออกมาแสดงผล เช่น จาก "2026-07-25 14:00:00" เป็น "14:00"
-                    best_interval = curr_key.split(" ")[1][:5]
+                if up_diff > 0:  # เอาเฉพาะชั่วโมงที่มีการอัปโหลดเพิ่มขึ้น
+                    time_label = curr_key.split(" ")[1][:5]
+                    hourly_rankings.append((time_label, up_diff))
             
-            if best_interval and max_up > 0:
-                top_time_str = f"{best_interval} น."
-                top_up_diff = max_up
+            # เรียงลำดับจากยอดอัปโหลดมากไปหาน้อย
+            hourly_rankings.sort(key=lambda x: x[1], reverse=True)
 
         msg = [
             f"📊 <b>{site_name} Report: {today_str}</b>",
@@ -238,10 +230,16 @@ def get_historical_report(site_name="TORRENTDD"):
             f"  └ 📤 {calc_gain(latest_snapshot['up'], first_snapshot['up'])}",
             f"  └ 📥 {calc_gain(latest_snapshot['dl'], first_snapshot['dl'])}",
             "━━━━━━━━━━━━━━━━━━",
-            f"🏆 <b>Top Hourly (Today)</b>",
-            f"  └ ⏰ <b>{top_time_str}</b> | 📤 {calc_gain(top_up_diff, 0) if top_up_diff > 0 else '➖ 0.00 GB'}",
-            "━━━━━━━━━━━━━━━━━━"
+            f"🏆 <b>Top Hourly Rankings (Today)</b>"
         ])
+
+        if hourly_rankings:
+            for time_str, up_val in hourly_rankings:
+                msg.append(f"  └ ⏰ <b>{time_str} น.</b> | 📤 📈 +{format_size(up_val)}")
+        else:
+            msg.append("  └ <i>ยังไม่มีข้อมูลช่วงชั่วโมงที่อัปโหลด</i>")
+
+        msg.append("━━━━━━━━━━━━━━━━━━")
         return "\n".join(msg)
     except Exception as e:
         return f"❌ Report Error [{site_name}]: {str(e)}"
