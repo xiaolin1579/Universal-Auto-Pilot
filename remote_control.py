@@ -184,12 +184,6 @@ def get_historical_report(site_name="TORRENTDD"):
         latest_snapshot = history[today_keys[-1]]
         h1_snapshot = history.get(today_keys[-2]) if len(today_keys) > 1 else None
 
-        def calc_gain(new_val, old_val):
-            diff = new_val - old_val
-            if diff == 0: return "➖ 0.00 GB"
-            prefix = "📈 +" if diff > 0 else "📉 "
-            return f"{prefix}{format_size(diff)}"
-
         # --- ส่วนรวบรวมและจัดอันดับ Top Hourly ทุกชั่วโมงในวันนี้ (จากยอดอัปโหลดมากไปหาน้อย) ---
         hourly_rankings = []
         if len(today_keys) > 1:
@@ -202,11 +196,12 @@ def get_historical_report(site_name="TORRENTDD"):
                 
                 up_diff = curr_data['up'] - prev_data['up']
                 dl_diff = curr_data['dl'] - prev_data['dl']
+                bonus_diff = curr_data.get('bonus', 0) - prev_data.get('bonus', 0)
                 
-                # เก็บข้อมูลเฉพาะชั่วโมงที่มีการเปลี่ยนแปลงอย่างน้อยหนึ่งอย่าง (Up หรือ Dl)
-                if up_diff != 0 or dl_diff != 0:
+                # เก็บข้อมูลเฉพาะชั่วโมงที่มีการเปลี่ยนแปลงอย่างน้อยหนึ่งอย่าง (Up, Dl หรือ Bonus)
+                if up_diff != 0 or dl_diff != 0 or bonus_diff != 0:
                     time_label = curr_key.split(" ")[1][:5]
-                    hourly_rankings.append((time_label, up_diff, dl_diff))
+                    hourly_rankings.append((time_label, up_diff, dl_diff, bonus_diff))
             
             # เรียงลำดับจากยอดอัปโหลดมากไปหาน้อย
             hourly_rankings.sort(key=lambda x: x[1], reverse=True)
@@ -223,30 +218,83 @@ def get_historical_report(site_name="TORRENTDD"):
         if 'bonus' in latest_snapshot:
             msg.append(f"💰 <b>Bonus:</b> <code>{latest_snapshot['bonus']:,.1f}</code>")
 
+        # --- ส่วน Last 1 Hour (แสดงเฉพาะค่าที่มีการเปลี่ยนแปลง) ---
+        h1_lines = []
+        if h1_snapshot:
+            h1_up_diff = latest_snapshot['up'] - h1_snapshot['up']
+            h1_dl_diff = latest_snapshot['dl'] - h1_snapshot['dl']
+            h1_bonus_diff = latest_snapshot.get('bonus', 0) - h1_snapshot.get('bonus', 0)
+
+            if h1_up_diff != 0:
+                prefix = "📈 +" if h1_up_diff > 0 else "📉 "
+                h1_lines.append(f"  ├ 📤 {prefix}{format_size(h1_up_diff)}")
+            if h1_dl_diff != 0:
+                prefix = "📈 +" if h1_dl_diff > 0 else "📉 "
+                h1_lines.append(f"  ├ 📥 {prefix}{format_size(h1_dl_diff)}")
+            if h1_bonus_diff != 0:
+                prefix = "📈 +" if h1_bonus_diff > 0 else "📉 "
+                h1_lines.append(f"  ├ 💰 {prefix}{h1_bonus_diff:,.1f} pts")
+
+            if h1_lines:
+                h1_lines[-1] = h1_lines[-1].replace("  ├", "  └")
+            else:
+                h1_lines.append("  └ ➖ 0.00 GB")
+        else:
+            h1_lines.append("  └ Collecting...")
+
         msg.extend([
             "━━━━━━━━━━━━━━━━━━",
-            "⚡ <b>Last 1 Hour</b>",
-            f"  └ 📤 {calc_gain(latest_snapshot['up'], h1_snapshot['up']) if h1_snapshot else 'Collecting...'}",
-            f"  └ 📥 {calc_gain(latest_snapshot['dl'], h1_snapshot['dl']) if h1_snapshot else 'Collecting...'}",
+            "⚡ <b>Last 1 Hour</b>"
+        ])
+        msg.extend(h1_lines)
+
+        # --- ส่วน Today's Gain (แสดงเฉพาะค่าที่มีการเปลี่ยนแปลง) ---
+        today_lines = []
+        today_up_diff = latest_snapshot['up'] - first_snapshot['up']
+        today_dl_diff = latest_snapshot['dl'] - first_snapshot['dl']
+        today_bonus_diff = latest_snapshot.get('bonus', 0) - first_snapshot.get('bonus', 0)
+
+        if today_up_diff != 0:
+            prefix = "📈 +" if today_up_diff > 0 else "📉 "
+            today_lines.append(f"  ├ 📤 {prefix}{format_size(today_up_diff)}")
+        if today_dl_diff != 0:
+            prefix = "📈 +" if today_dl_diff > 0 else "📉 "
+            today_lines.append(f"  ├ 📥 {prefix}{format_size(today_dl_diff)}")
+        if today_bonus_diff != 0:
+            prefix = "📈 +" if today_bonus_diff > 0 else "📉 "
+            today_lines.append(f"  ├ 💰 {prefix}{today_bonus_diff:,.1f} pts")
+
+        if today_lines:
+            today_lines[-1] = today_lines[-1].replace("  ├", "  └")
+        else:
+            today_lines.append("  └ ➖ 0.00 GB")
+
+        msg.extend([
             "━━━━━━━━━━━━━━━━━━",
-            f"📅 <b>Today's Gain</b>",
-            f"  └ 📤 {calc_gain(latest_snapshot['up'], first_snapshot['up'])}",
-            f"  └ 📥 {calc_gain(latest_snapshot['dl'], first_snapshot['dl'])}",
+            f"📅 <b>Today's Gain</b>"
+        ])
+        msg.extend(today_lines)
+
+        msg.extend([
             "━━━━━━━━━━━━━━━━━━",
             f"🏆 <b>Top Hourly Rankings (Today)</b>"
         ])
 
         if hourly_rankings:
-            for time_str, up_val, dl_val in hourly_rankings:
+            for time_str, up_val, dl_val, bonus_val in hourly_rankings:
                 sub_lines = []
                 if up_val != 0:
                     prefix = "📈 +" if up_val > 0 else "📉 "
                     sub_lines.append(f"     ├ 📤 {prefix}{format_size(up_val)}")
                 if dl_val != 0:
                     prefix = "📈 +" if dl_val > 0 else "📉 "
-                    sub_lines.append(f"     └ 📥 {prefix}{format_size(dl_val)}")
+                    sub_lines.append(f"     ├ 📥 {prefix}{format_size(dl_val)}")
+                if bonus_val != 0:
+                    prefix = "📈 +" if bonus_val > 0 else "📉 "
+                    sub_lines.append(f"     ├ 💰 {prefix}{bonus_val:,.1f} pts")
                 
                 if sub_lines:
+                    sub_lines[-1] = sub_lines[-1].replace("     ├", "     └")
                     msg.append(f"  └ ⏰ <b>{time_str} น.</b>")
                     msg.extend(sub_lines)
         else:
@@ -299,11 +347,13 @@ def get_monthly_report(site_name="TORRENTDD"):
             if len(snapshots) > 1:
                 day_up_diff = snapshots[-1]['up'] - snapshots[0]['up']
                 day_dl_diff = snapshots[-1]['dl'] - snapshots[0]['dl']
-                daily_rankings.append((day_str, day_up_diff, day_dl_diff))
+                day_bonus_diff = snapshots[-1].get('bonus', 0) - snapshots[0].get('bonus', 0)
+                daily_rankings.append((day_str, day_up_diff, day_dl_diff, day_bonus_diff))
             elif len(snapshots) == 1 and active_days == 1:
                 day_up_diff = snapshots[0]['up']
                 day_dl_diff = snapshots[0]['dl']
-                daily_rankings.append((day_str, day_up_diff, day_dl_diff))
+                day_bonus_diff = snapshots[0].get('bonus', 0)
+                daily_rankings.append((day_str, day_up_diff, day_dl_diff, day_bonus_diff))
 
         # เรียงลำดับจากยอดอัปโหลดมากไปหาน้อย
         daily_rankings.sort(key=lambda x: x[1], reverse=True)
@@ -325,17 +375,28 @@ def get_monthly_report(site_name="TORRENTDD"):
         ])
 
         if daily_rankings:
-            for day_str, up_val, dl_val in daily_rankings:
+            for day_str, up_val, dl_val, bonus_val in daily_rankings:
                 sub_lines = []
                 if up_val > 0:
                     sub_lines.append(f"     ├ 📤 📈 +{format_size(up_val)}")
                 if dl_val > 0:
-                    sub_lines.append(f"     └ 📥 📉 +{format_size(dl_val)}")
+                    sub_lines.append(f"     ├ 📥 📉 +{format_size(dl_val)}")
+                if bonus_val > 0:
+                    sub_lines.append(f"     ├ 💰 📈 +{bonus_val:,.1f} pts")
                 
-                # แสดงผลเฉพาะวันที่มีการขยับของ Up หรือ Dl อย่างน้อยหนึ่งอย่าง
+                # แสดงผลเฉพาะวันที่มีการขยับของ Up, Dl หรือ Bonus อย่างน้อยหนึ่งอย่าง
                 if sub_lines:
+                    # ปรับสัญลักษณ์ตัวสุดท้ายของบรรทัดย่อยให้สวยงาม (เปลี่ยนตัวสุดท้ายเป็น └ ถ้าไม่มีตัวถัดไป)
+                    # จัดการทำความสะอาดไอคอนบรรทัดสุดท้ายให้เป็นรูปแบบมาตรฐาน
+                    formatted_sub_lines = []
+                    for idx, line in enumerate(sub_lines):
+                        if idx == len(sub_lines) - 1:
+                            # เปลี่ยน ├ เป็น └ ในบรรทัดสุดท้ายของวันนั้นๆ
+                            line = line.replace("     ├", "     └")
+                        formatted_sub_lines.append(line)
+
                     msg.append(f"  └ 📅 <b>{day_str}</b>")
-                    msg.extend(sub_lines)
+                    msg.extend(formatted_sub_lines)
         else:
             msg.append("  └ <i>ยังไม่มีข้อมูลสถิติรายวัน</i>")
 
