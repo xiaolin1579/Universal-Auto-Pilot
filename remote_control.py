@@ -602,7 +602,21 @@ async def main():
                     await tg_bot.send_message(chat_id, "♻️ รีสตาร์ท Remote...")
                     os._exit(0)
 
-            tasks.append(tg_bot.infinity_polling(skip_pending=True, timeout=60, request_timeout=60))
+            async def start_telegram_polling():
+                while True:
+                    try:
+                        print("🤖 [Telegram] กำลังเริ่มเปิดระบบ Telegram Long Polling...")
+                        await tg_bot.infinity_polling(
+                            skip_pending=True, 
+                            timeout=60, 
+                            request_timeout=60
+                        )
+                    except Exception as e:
+                        print(f"⚠️ [Telegram] ขัดข้อง/Timeout: {e}")
+                        print("🔄 [Telegram] กำลังเชื่อมต่อใหม่ใน 10 วินาที...")
+                        await asyncio.sleep(10)
+
+            tasks.append(start_telegram_polling())
             
         except Exception as e: print(f"❌ TG Error: {e}")
 
