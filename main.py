@@ -568,6 +568,9 @@ async def launch_any_browser(sitename="default", custom_args=None):
     config.user_data_dir = _current_profile_path
     config.headless = headless_mode
     
+    # 🔴 บังคับปิด Sandbox สำหรับสิทธิ์ Root (แก้ปัญหา Failed to connect to browser)
+    config.sandbox = False
+    
     if "get_browser_path_or_fail" in globals():
         config.browser_executable_path = get_browser_path_or_fail()
 
@@ -619,8 +622,11 @@ async def launch_any_browser(sitename="default", custom_args=None):
         selected_path = config.browser_executable_path or "System Default"
         print(f"📂 [System] Path ที่ตรวจพบและใช้งาน: {selected_path}")
 
-        # nodriver สตาร์ทผ่าน uc.start(config=config) ได้โดยตรง
-        _active_browser_instance = await uc.start(config=config)
+        # 🔴 เพิ่ม no_sandbox=True เข้าไปตรงนี้ เพื่อแก้ปัญหาบน Ubuntu 24.04 (Root)
+        _active_browser_instance = await uc.start(
+            config=config,
+            no_sandbox=True
+        )
         
         print(f"🚀 [System] Browser (nodriver) รันสำเร็จ (Headless: {headless_mode})")
         return _active_browser_instance
