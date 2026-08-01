@@ -443,49 +443,57 @@ def get_universal_browser_path(override_path=None):
 
     current_os = platform.system().lower()
     
-    # 2. กรณี Windows
+    # 2. กรณี Windows (เรียงจาก Google Chrome เป็นหลัก ตามด้วย Edge และ Brave)
     if current_os == "windows":
         program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
         program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
         local_app_data = os.environ.get("LOCALAPPDATA", os.path.expanduser(r"~\AppData\Local"))
         
         search_paths = [
+            os.path.join(local_app_data, "Google", "Chrome", "Application", "chrome.exe"),
             os.path.join(program_files, "Google", "Application", "chrome.exe"),
             os.path.join(program_files_x86, "Google", "Application", "chrome.exe"),
-            os.path.join(local_app_data, "Google", "Chrome", "Application", "chrome.exe"),
             os.path.join(program_files, "Microsoft", "Edge", "Application", "msedge.exe"),
             os.path.join(program_files_x86, "Microsoft", "Edge", "Application", "msedge.exe"),
-            os.path.join(program_files, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
             os.path.join(local_app_data, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+            os.path.join(program_files, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
         ]
         
         for path in search_paths:
             if os.path.exists(path):
                 return path
 
-    # 3. กรณี Linux/Unix 
-    executables = ["chromium", "chromium-browser", "google-chrome-stable", "google-chrome", "brave-browser"]
+    # 3. กรณี Linux/Unix (เรียงลำดับความเสถียรและเบาสุด: Google Chrome ตัวเต็ม -> Stable -> Chromium)
+    explicit_linux_paths = [
+        "/opt/google/chrome/chrome",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser"
+    ]
+    for path in explicit_linux_paths:
+        if os.path.exists(path) and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+
+    # ค้นหาผ่านระบบ PATH โดยตัด Snap ออกเพื่อความเสถียรและประหยัดแรม
+    executables = ["chrome", "google-chrome-stable", "google-chrome", "chromium", "chromium-browser", "brave-browser"]
     
     for exe in executables:
         path = shutil.which(exe)
         if path:
             real_path = os.path.realpath(path)
-            # เพิ่มการเช็ค: ต้องไม่ใช่ไฟล์ snapd หรือไฟล์ระบบทั่วไป
-            if "snap" in real_path and "chromium" not in real_path:
+            if "snap" in real_path:
                 continue 
             if os.access(real_path, os.X_OK):
                 return real_path
     
-    # ค้นหาใน Snap/Flatpak เพิ่มเติม (เช็คความถูกต้องก่อน return)
+    # สำรองกรณีสุดท้าย (หลีกเลี่ยง Snap ถ้าไม่จำเป็น)
     extra_paths = [
-        "/snap/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/lib/chromium-browser/chromium-browser"
+        "/usr/lib/chromium-browser/chromium-browser",
+        "/snap/bin/chromium"
     ]
     for path in extra_paths:
-        # ตรวจสอบว่าเป็นไฟล์จริง และต้องมีคำว่า chromium/chrome/brave ใน path ถึงจะผ่าน
         if os.path.exists(path) and os.path.isfile(path) and os.access(path, os.X_OK):
-            # ตรวจสอบว่าไม่ใช่ไฟล์ตัวรัน snapd เอง
             if "snap" in path and not any(name in path.lower() for name in ["chromium", "chrome", "brave"]):
                 continue
             return path
@@ -527,15 +535,6 @@ async def launch_any_browser(sitename="default", custom_args=None):
     if "kill_specific_browser" in globals(): kill_specific_browser()
     if "kill_xvfb" in globals(): kill_xvfb()
     if "cleanup_profile" in globals(): await cleanup_profile()
-
-    # กวาดล้างโพรเซสตกค้างในระบบเผื่อกรณีฉุกเฉิน
-    try:
-        os.system("pkill -9 -f chromium")
-        os.system("pkill -9 -f chromium-browser")
-        os.system("pkill -9 -f Xvfb")
-        await asyncio.sleep(1)
-    except Exception:
-        pass
 
     # 2. อ่านค่าคอนฟิก Xvfb_enable จาก config.json ผ่านฟังก์ชันที่คุณมี
     xvfb_enabled_in_config = load_xvfb_config() if "load_xvfb_config" in globals() else False
@@ -662,25 +661,11 @@ def kill_specific_browser():
     # 2. ปิดเผื่อกรณีที่มี Instance ค้างอยู่แต่ไม่มี PID อ้างอิง
     try:
         if _active_browser_instance and hasattr(_active_browser_instance, 'stop'):
-            # เรียกใช้ stop แบบ synchronous เผื่อกรณีรันนอก loop async
             pass
     except Exception:
         pass
     finally:
         _active_browser_instance = None
-
-    # 3. กวาดล้าง (Force Kill) โพรเซส Chromium / Chrome / Browser ที่ตกค้างในระบบทั้งหมด
-    try:
-        print("🧹 [System] กำลังกวาดล้างโพรเซส Chromium/Chrome ที่ค้างในระบบทั้งหมด...")
-        if sys.platform == "win32":
-            os.system("taskkill /F /IM chrome.exe /T >nul 2>&1")
-            os.system("taskkill /F /IM chromium.exe /T >nul 2>&1")
-        else:
-            os.system("pkill -9 -f chromium")
-            os.system("pkill -9 -f chromium-browser")
-            os.system("pkill -9 -f chrome")
-    except Exception:
-        pass
 
 async def cleanup_profile():
     global _current_profile_path
