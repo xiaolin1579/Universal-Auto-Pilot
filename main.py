@@ -2271,7 +2271,7 @@ class NodeCleaner:
     def smart_reclaim_process(self, required_gb, is_emergency=False):
         """
         ปรับปรุงเป็น Instance Method ของ NodeCleaner
-        เพื่อให้เข้าถึงระบบ Permission และ Hard Purge ได้โดยตรง
+        เพิ่มเงื่อนไข: โหลดเสร็จแล้วอย่างน้อย 1 ชม. และเรโชอย่างน้อย 1.0
         """
         try:
             self.node.refresh_status()
@@ -2296,7 +2296,7 @@ class NodeCleaner:
                 if self.check_torrent_permission(t_hash) == "PROTECTED":
                     continue
     
-                # 1. กรองเวลาเริ่มต้น (Grace Period)
+                # 1. กรองเวลาเริ่มต้นเพิ่มเข้าคิว (Grace Period พื้นฐาน 45 นาที)
                 ts_init = t.get('added_on', t.get('ts_init', 0))
                 if (current_ts - ts_init) < 2700:
                     continue
@@ -2306,22 +2306,32 @@ class NodeCleaner:
                 t_ratio = t.get('ratio', 0.0)
                 is_completed = (t.get('progress', 0) >= 0.99) or (t.get('amount_left', 1) == 0)
     
-                # ดึงค่าความนิ่ง (ใช้ Default เป็น 0 หาก API ไม่ส่งมา)
+                # ดึงค่าความนิ่ง
                 upspeed = float(t.get('up_speed', 0))
                 leechers = float(t.get('leechers', 0))
-    
-                # --- เพิ่มเงื่อนไขไฟล์นิ่งสนิท ---
                 is_stagnant = (upspeed == 0 and leechers == 0)
+
+                # --- เช็คเวลาที่โหลดเสร็จแล้ว (Completion Time) ---
+                # qBittorrent มักใช้ 'completion_on', ถ้าไม่มีให้ fallback ไปใช้เวลาปัจจุบันหรือเวลาแอด
+                ts_completed = t.get('completion_on', t.get('completed_on', 0))
+                if ts_completed == 0 and is_completed:
+                    # ถ้า API ไม่ส่งเวลาเสร็จมา แต่สถานะบอกว่าเสร็จแล้ว ให้ประเมินว่าเพิ่งเสร็จ หรือใช้เวลาแอดแทน
+                    ts_completed = ts_init 
+                
+                # เช็คว่าโหลดเสร็จมาแล้วอย่างน้อย 1 ชั่วโมง (3600 วินาที) หรือไม่
+                has_matured_after_complete = is_completed and ((current_ts - ts_completed) >= 3600)
 
                 t['_calculated_size_gb'] = t_size_gb
                 t['_calculated_ratio'] = t_ratio
 
                 if is_completed:
-                    # เงื่อนไขการลบ: 
-                    # ต้องมีขนาดไฟล์ถึงเกณฑ์ + (เป็นโหมดฉุกเฉิน หรือ ได้ Ratio แล้ว หรือ ไฟล์นิ่งสนิท)
+                    # เงื่อนไขการลบใหม่: 
+                    # - โหมดฉุกเฉิน (ขนาดถึงเกณฑ์) OR
+                    # - (โหลดเสร็จมาแล้ว >= 1 ชม. AND เรโช >= 1.0 AND ขนาด >= 1.0 GB) OR
+                    # - (ไฟล์นิ่งสนิท AND ขนาด >= 1.0 GB)
                     can_remove_completed = (is_emergency and t_size_gb >= 1.0) or \
-                                           (t_ratio >= 1.0 and t_size_gb >= 1.0) or \
-                                           (is_stagnant and t_size_gb >= 1.0) # ไฟล์นิ่งก็ลบได้
+                                           (has_matured_after_complete and t_ratio >= 1.0 and t_size_gb >= 1.0) or \
+                                           (is_stagnant and t_size_gb >= 1.0)
         
                     if can_remove_completed:
                         scannable_torrents.append(t)
@@ -2336,17 +2346,11 @@ class NodeCleaner:
 
             # 3. ให้คะแนนความคุ้มค่า (Scoring) เพื่อจัดลำดับการลบ
             def get_priority_score(t):
-                # คะแนนพื้นฐานคือขนาดไฟล์ (ยิ่งใหญ่ยิ่งได้เปรียบในการคืนพื้นที่)
                 score = t['_calculated_size_gb']
-                
-                # ถ้าไฟล์นิ่งสนิท (Stagnant) ให้คะแนนพิเศษเพิ่ม 10 เท่า
-                # เพื่อดันไฟล์นิ่งขึ้นมาอยู่ต้น List การถูกลบเสมอ
                 if (t.get('up_speed', 0) == 0 and t.get('leechers', 0) == 0):
                     score *= 10.0
-                
                 return score
 
-            # เรียงลำดับจากคะแนนที่คำนวณได้ (จากมากไปน้อย)
             scannable_torrents.sort(key=get_priority_score, reverse=True)
             
             # เลือกเป้าหมาย
@@ -2354,12 +2358,13 @@ class NodeCleaner:
             
             # 4. ดำเนินการลบ
             for t in targets:
-                print(f"🗑️ [PURGE] Removing: {t.get('name', 'Unknown')} | Size: {t['_calculated_size_gb']:.2f}GB")
+                print(f"🗑️ [PURGE] Removing: {t.get('name', 'Unknown')} | Size: {t['_calculated_size_gb']:.2f}GB | Ratio: {t['_calculated_ratio']:.2f}")
                 self._hard_purge_sequence(t['hash'])
 
             return True
+            
         except Exception as e:
-            print(f"❌ [SMART RECLAIM] Error: {e}")
+            print(f"❌ [SMART RECLAIM] Error: {str(e)}")
             return False
         
 # ========================= Global FUNCTIONS =========================
