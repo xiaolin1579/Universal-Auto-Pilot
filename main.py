@@ -3641,8 +3641,8 @@ async def sync_hr_with_web(site_key, page, base_url, ctx):
                 torrent_id, meta.get('name'), meta.get('size_gb'), 
                 details_url, meta.get('download_url'), site_key, 
                 ctx.dl_session, page, ctx.active_nodes, ctx.seen_hashes, 
-                ctx.seen_ids, ctx.global_clean,force_download=(hr_status == 'danger')
-        )
+                ctx.seen_ids, ctx.global_clean, force_download=(hr_status in ['danger', 'warning'])
+            )
     
             if success:
                 tid_info.update({"status": "PROTECTED", "retry_count": 0})
@@ -3667,20 +3667,28 @@ async def sync_hr_with_web(site_key, page, base_url, ctx):
     print(f"📧 [{site_key}] สรุปผลเรียบร้อย: {stats}")
 
 def extract_hr_status(row):
+    """
+    ตรวจสอบสถานะ H&R (Hit & Run) และป้ายกำกับจากแถวข้อมูล HTML
+    คืนค่าเป็น: 'danger', 'warning', หรือ 'normal'
+    """
+    row_html = str(row).lower()
     row_text = row.get_text().lower()
     
-    # ดึงค่าสีจาก style หรือ class
-    style = row.get('style', '').lower()
-    classes = " ".join(row.get('class', []))
+    # 1. เช็คสถานะ Danger (ติดแดง / ผิดเงื่อนไข H&R / โค้ดสีแดง #c1352b)
+    if ('color:#c1352b' in row_html or 
+        'color: #c1352b' in row_html or 
+        'danger' in row_html or 
+        'class=\'bd hit\'' in row_html): # ครอบคลุมคำว่า 'เตือน' หรือ 'ผิดเงื่อนไข H&R' จากตัวอย่างล่าสุด
+        return 'danger'
     
-    # เช็คว่าติด H&R ชัดเจน (เช่น สีแดง หรือ keyword รุนแรง)
-    if 'red' in style or 'danger' in classes or 'h&r' in row_text:
-        return 'danger' # สถานะติดแดง
-    
-    # เช็คสถานะเตือนปกติ
-    if 'warning' in row_text or 'yellow' in style or 'alert' in classes:
+    # 2. เช็คสถานะ Warning (เตือน / สีเหลือง / คลาส warn หรือ pause)
+    if ('warning' in row_html or 
+        'yellow' in row_html or 
+        'pause' in row_html or
+        'class=\'bd warn\'' in row_html):
         return 'warning'
         
+    # 3. หากเป็นสถานะปกติหรือปลอดภัย (เช่น seed เรียบร้อย, สีเขียว) ให้คืนค่า 'normal'
     return 'normal'
 
 async def perform_cleanup(site_key, db, current_ids_on_web):
