@@ -670,7 +670,8 @@ async def main():
                         await tg_bot.infinity_polling(
                             skip_pending=True, 
                             timeout=60, 
-                            request_timeout=60
+                            request_timeout=60,
+                            allowed_updates=["message", "callback_query"]
                         )
                     except Exception as e:
                         print(f"⚠️ [Telegram] ขัดข้อง/Timeout: {e}")
