@@ -2949,6 +2949,7 @@ async def get_site_stats(page: uc.Tab, site_cfg: dict, ctx: BotContext) -> str:
                 # แต่เนื่องจากเราใช้ nodriver อยู่แล้ว เราสามารถดึง source ผ่าน page ได้
                 hr_html = await page.get_content()
                 await sync_hr_with_web(site_key=site, page=page, base_url=base_url, ctx=ctx)
+                await sync_seed_quest_with_web(site_key=site, page=page, base_url=base_url, ctx=ctx)
 
             except Exception as sub_err:
                 print(f"⚠️ [{site}] ระบบย่อยขัดข้อง: {sub_err}")
@@ -3666,6 +3667,77 @@ async def sync_hr_with_web(site_key, page, base_url, ctx):
     await send_notify(summary_msg)
     print(f"📧 [{site_key}] สรุปผลเรียบร้อย: {stats}")
 
+async def sync_seed_quest_with_web(site_key, page, base_url, ctx):
+    print(f"🔄 [{site_key}] เริ่มต้นกระบวนการ Sync Seed Quest...")
+    await page.get(f"{base_url.rstrip('/')}/mybonus.php")
+    await asyncio.sleep(2)
+    
+    content = await page.get_content()
+    soup = BeautifulSoup(content, 'lxml')
+    db = await async_load_db(f"{site_key}_seed_quest")
+
+    stats = {"total": 0, "active": 0, "completed": 0}
+    current_ids_on_web = []
+
+    # ค้นหากล่องเควสต์ Seed Quest ตามคลาส bbx-quest ในหน้า mybonus.php
+    quest_card = soup.find('div', class_='bbx-quest')
+    
+    if quest_card:
+        # ดึงลิงก์ทอร์เรนต์ทั้งหมดที่เกี่ยวข้องกับเควสต์
+        torrent_links = quest_card.find_all('a', href=re.compile(r'details\.php\?id='))
+        
+        for link in torrent_links:
+            href = link['href']
+            match_id = re.search(r'id=(\d+)', href)
+            if not match_id:
+                continue
+                
+            torrent_id = match_id.group(1)
+            if torrent_id in current_ids_on_web:
+                continue
+                
+            current_ids_on_web.append(torrent_id)
+            stats["total"] += 1
+            
+            # ดึงข้อความสถานะชั่วโมง Seed จากแถวหรือไลฟ์สไตล์ของ Element รอบข้าง
+            parent_el = link.find_parent('li') or link.find_parent('div')
+            status_text = parent_el.get_text() if parent_el else ""
+            
+            # แกะรูปแบบชั่วโมง เช่น "11/24"
+            seed_hour_match = re.search(r'(\d+)\s*/\s*24', status_text)
+            seed_hours = int(seed_hour_match.group(1)) if seed_hour_match else 0
+            
+            # จัดเตรียมข้อมูลใน DB สำหรับติดตามและป้องกันไฟล์
+            if torrent_id not in db:
+                db[torrent_id] = {
+                    "status": "PROTECTED_QUEST", 
+                    "seed_hours": seed_hours, 
+                    "added_at": get_now().strftime("%Y-%m-%d %H:%M")
+                }
+                await async_save_db(f"{site_key}_seed_quest", db)
+            
+            tid_info = db[torrent_id]
+            tid_info["seed_hours"] = seed_hours
+            
+            # เช็กเงื่อนไข: หากยัง seed ไม่ครบ 24 ชั่วโมง ให้ล็อกสถานะห้ามลบเด็ดขาด
+            if seed_hours < 24:
+                stats["active"] += 1
+                tid_info["status"] = "PROTECTED_QUEST"
+                print(f"🔒 [{site_key}] Seed Quest Locked: ID {torrent_id} ({seed_hours}/24 ชม.) - ห้ามลบไฟล์")
+            else:
+                stats["completed"] += 1
+                tid_info["status"] = "QUEST_COMPLETED"
+                print(f"✅ [{site_key}] Seed Quest Completed: ID {torrent_id} ครบ 24 ชม. แล้ว")
+                
+            await async_save_db(f"{site_key}_seed_quest", db)
+    else:
+        print(f"✨ [{site_key}] ไม่พบการแสดงผล Seed Quest ในหน้า mybonus.php")
+
+    # แจ้งเตือนสรุปผลผ่านระบบ Notify
+    summary_msg = f"🎯 <b>SEED QUEST SYNC: {site_key}</b>\n📋 Total Tracked: `{stats['total']}`\n🔒 Active/Protected: `{stats['active']}`\n✅ Completed: `{stats['completed']}`"
+    await send_notify(summary_msg)
+    print(f"📧 [{site_key}] สรุปผล Seed Quest เรียบร้อย: {stats}")
+
 def extract_hr_status(row):
     """
     ตรวจสอบสถานะ H&R (Hit & Run) และป้ายกำกับจากแถวข้อมูล HTML
@@ -3685,6 +3757,7 @@ def extract_hr_status(row):
     if ('warning' in row_html or 
         'yellow' in row_html or 
         'pause' in row_html or
+        'class=\'bd pause\'' in row_html or
         'class=\'bd warn\'' in row_html):
         return 'warning'
         
@@ -3817,24 +3890,18 @@ async def trigger_download_if_needed(t_id, t_name, t_size_gb, details_url, downl
             return
 
         if download_ready:
-            # ตรวจสอบ Hash ซ้ำ
-            if not force_download and t_hash in seen_hashes:
-                print(f" ❌ ข้าม: Hash {t_hash} ซ้ำในระบบ")
+            is_already_in_node = False
+            target_node_name = ""
+            for node_obj, _ in active_nodes:
+                if node_obj.is_torrent_exists(t_hash):
+                    is_already_in_node = True
+                    target_node_name = node_obj.name
+                    break
+        
+            if is_already_in_node:
+                print(f" ❌ ข้าม: ตรวจพบ Hash [...{t_hash[-5:]}] วิ่งอยู่ใน {target_node_name}")
                 seen_hashes.add(t_hash)
                 download_ready = False
-            else:
-                is_already_in_node = False
-                target_node_name = ""
-                for node_obj, _ in active_nodes:
-                    if node_obj.is_torrent_exists(t_hash):
-                        is_already_in_node = True
-                        target_node_name = node_obj.name
-                        break
-        
-                if is_already_in_node:
-                    print(f" ❌ ข้าม: ตรวจพบ Hash [...{t_hash[-5:]}] วิ่งอยู่ใน {target_node_name}")
-                    seen_hashes.add(t_hash)
-                    download_ready = False
 
         # จัดการส่งเข้า Node
         if download_ready:
