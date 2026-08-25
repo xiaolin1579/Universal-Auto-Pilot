@@ -2006,6 +2006,7 @@ class NodeCleaner:
         self._db_cache = None
 
     @classmethod
+    @classmethod
     def clear_cache(cls):
         """ล้าง Cache ทั้งหมดเพื่อให้โหลดใหม่จากไฟล์ DB"""
         cls._PROTECTED_CACHE_STORAGE = None
@@ -2013,15 +2014,17 @@ class NodeCleaner:
 
     @classmethod
     def get_global_protected_set(cls):
-        """โหลดและแคชข้อมูล Hash ในระดับ Class"""
+        """โหลดและแคชข้อมูล Hash ในระดับ Class (รองรับทั้ง HR และ Seed Quest)"""
         if cls._PROTECTED_CACHE_STORAGE is None:
-            all_dbs = load_all_db() 
+            all_dbs = load_all_db()  
             cls._PROTECTED_CACHE_STORAGE = set()
-            for db_data in all_dbs.values():
+            for db_name, db_data in all_dbs.items():
                 for data in db_data.values():
-                    if data.get("status") == "PROTECTED":
+                    # ตรวจสอบสถานะที่ต้องป้องกัน ทั้งรูปแบบเดิม "PROTECTED" และของ Seed Quest "PROTECTED_QUEST"
+                    status = data.get("status")
+                    if status in ["PROTECTED", "PROTECTED_QUEST"]:
                         h = data.get("hash")
-                        if h:
+                        if h and h != "UNKNOWN":
                             cls._PROTECTED_CACHE_STORAGE.add(h.lower())
         return cls._PROTECTED_CACHE_STORAGE
     
@@ -2037,23 +2040,33 @@ class NodeCleaner:
             return
 
         h = t_hash.lower()
-        if status == "PROTECTED":
+        # เพิ่มเงื่อนไขรองรับสถานะ PROTECTED_QUEST ให้เข้ามาอยู่ใน Cache ด้วย
+        if status in ["PROTECTED", "PROTECTED_QUEST"]:
             cls._PROTECTED_CACHE_STORAGE.add(h)
         elif h in cls._PROTECTED_CACHE_STORAGE:
             cls._PROTECTED_CACHE_STORAGE.remove(h)
 
     def _update_db_status(self, t_hash, new_status):
-        db = load_db(self.site_key)
+        # รองรับการอัปเดตทั้ง Database หลักและ Seed Quest DB ของเว็บไซต์นี้
+        db_keys = [self.site_key, f"{self.site_key}_seed_quest"]
         updated = False
-        for data in db.values():
-            if data.get("hash", "").lower() == t_hash.lower():
-                data["status"] = new_status
-                data["deleted_at"] = get_now().strftime("%Y-%m-%d %H:%M")
-                updated = True
+
+        for db_name in db_keys:
+            db = load_db(db_name)
+            if not db:
+                continue
+            
+            for data in db.values():
+                if data.get("hash", "").lower() == t_hash.lower():
+                    data["status"] = new_status
+                    data["deleted_at"] = get_now().strftime("%Y-%m-%d %H:%M")
+                    updated = True
+                    save_db(db_name, db)
+                    break
+            if updated:
                 break
         
         if updated:
-            save_db(self.site_key, db)
             # อัปเดต Cache แบบ Active ทันทีโดยไม่ต้องเคลียร์ทิ้ง
             NodeCleaner.update_protected_cache_item(t_hash, new_status)
             print(f"🚀 [Cache] Active Sync: อัปเดต {t_hash} สถานะเป็น {new_status}")
@@ -2063,11 +2076,13 @@ class NodeCleaner:
         if t_hash.lower() in protected_hashes:
             return "PROTECTED"
         
-        site_data = load_db(self.site_key)
-        for data in site_data.values():
-            if data.get("hash", "").lower() == t_hash.lower():
-                # แปลงเป็นตัวพิมพ์ใหญ่เสมอเพื่อเปรียบเทียบง่ายขึ้น
-                return str(data.get("status", "NOT_FOUND")).upper()
+        # ค้นหาเพิ่มเติมใน DB ทั้งแบบปกติและ Seed Quest ของ Site นี้
+        db_keys = [self.site_key, f"{self.site_key}_seed_quest"]
+        for db_name in db_keys:
+            site_data = load_db(db_name)
+            for data in site_data.values():
+                if data.get("hash", "").lower() == t_hash.lower():
+                    return str(data.get("status", "NOT_FOUND")).upper()
     
         return "NOT_FOUND"
 
@@ -3668,7 +3683,7 @@ async def sync_hr_with_web(site_key, page, base_url, ctx):
     print(f"📧 [{site_key}] สรุปผลเรียบร้อย: {stats}")
 
 async def sync_seed_quest_with_web(site_key, page, base_url, ctx):
-    print(f"🔄 [{site_key}] เริ่มต้นกระบวนการ Sync Seed Quest...")
+    print(f"🔄 [{site_key}] เริ่มต้นกระบวนการ Sync Seed Quest (พร้อมดึง Hash)...")
     await page.get(f"{base_url.rstrip('/')}/mybonus.php")
     await asyncio.sleep(2)
     
@@ -3676,7 +3691,7 @@ async def sync_seed_quest_with_web(site_key, page, base_url, ctx):
     soup = BeautifulSoup(content, 'lxml')
     db = await async_load_db(f"{site_key}_seed_quest")
 
-    stats = {"total": 0, "active": 0, "completed": 0}
+    stats = {"total": 0, "active": 0, "completed": 0, "scanned": 0}
     current_ids_on_web = []
 
     # ค้นหากล่องเควสต์ Seed Quest ตามคลาส bbx-quest ในหน้า mybonus.php
@@ -3699,7 +3714,7 @@ async def sync_seed_quest_with_web(site_key, page, base_url, ctx):
             current_ids_on_web.append(torrent_id)
             stats["total"] += 1
             
-            # ดึงข้อความสถานะชั่วโมง Seed จากแถวหรือไลฟ์สไตล์ของ Element รอบข้าง
+            # ดึงข้อความสถานะชั่วโมง Seed จาก Element รอบข้าง
             parent_el = link.find_parent('li') or link.find_parent('div')
             status_text = parent_el.get_text() if parent_el else ""
             
@@ -3707,10 +3722,11 @@ async def sync_seed_quest_with_web(site_key, page, base_url, ctx):
             seed_hour_match = re.search(r'(\d+)\s*/\s*24', status_text)
             seed_hours = int(seed_hour_match.group(1)) if seed_hour_match else 0
             
-            # จัดเตรียมข้อมูลใน DB สำหรับติดตามและป้องกันไฟล์
+            # จัดเตรียมข้อมูลเริ่มต้นใน DB หากยังไม่มี
             if torrent_id not in db:
                 db[torrent_id] = {
                     "status": "PROTECTED_QUEST", 
+                    "hash": "UNKNOWN",
                     "seed_hours": seed_hours, 
                     "added_at": get_now().strftime("%Y-%m-%d %H:%M")
                 }
@@ -3718,23 +3734,51 @@ async def sync_seed_quest_with_web(site_key, page, base_url, ctx):
             
             tid_info = db[torrent_id]
             tid_info["seed_hours"] = seed_hours
-            
-            # เช็กเงื่อนไข: หากยัง seed ไม่ครบ 24 ชั่วโมง ให้ล็อกสถานะห้ามลบเด็ดขาด
+            meta = {}
+
+            # เช็กเงื่อนไขสถานะชั่วโมง
             if seed_hours < 24:
                 stats["active"] += 1
                 tid_info["status"] = "PROTECTED_QUEST"
-                print(f"🔒 [{site_key}] Seed Quest Locked: ID {torrent_id} ({seed_hours}/24 ชม.) - ห้ามลบไฟล์")
+                print(f"🔒 [{site_key}] Seed Quest Locked: ID {torrent_id} ({seed_hours}/24 ชม.)")
             else:
                 stats["completed"] += 1
                 tid_info["status"] = "QUEST_COMPLETED"
                 print(f"✅ [{site_key}] Seed Quest Completed: ID {torrent_id} ครบ 24 ชม. แล้ว")
-                
+
+            # --- PHASE: กู้คืน Hash ทอร์เรนต์ (หากยังเป็น UNKNOWN) ---
+            if tid_info.get("hash") == "UNKNOWN":
+                stats["scanned"] += 1
+                new_tab = await page.browser.get("about:blank", new_tab=True)
+                try:
+                    details_url = f"{base_url.rstrip('/')}/details.php?id={torrent_id}"
+                    meta = await get_torrent_details_full(new_tab, base_url, details_url, torrent_id)
+                    if meta.get('hash') and meta['hash'] != "UNKNOWN":
+                        tid_info["hash"] = meta['hash'].lower()
+                        print(f"🔑 [{site_key}] ดึง Hash สำเร็จสำหรับ ID {torrent_id}: {tid_info['hash']}")
+                    else:
+                        print(f"⚠️ [{site_key}] ไม่สามารถดึง Hash สำหรับ ID {torrent_id} ได้")
+                except Exception as e:
+                    print(f"❌ [{site_key}] Error ดึง Hash ID {torrent_id}: {e}")
+                finally:
+                    if new_tab: 
+                        await new_tab.close()
+
+            # --- PHASE: ตรวจสอบความซ้ำซ้อนกับโหนด Active ---
+            hash_val = tid_info.get("hash")
+            if hash_val and hash_val != "UNKNOWN":
+                if any(node_obj.is_torrent_exists(hash_val) for node_obj, _ in ctx.active_nodes):
+                    print(f"🛡️ [{site_key}] ตรวจพบไฟล์ Quest (ID: {torrent_id}) อยู่ในระบบ Seedbox แล้ว")
+
             await async_save_db(f"{site_key}_seed_quest", db)
     else:
         print(f"✨ [{site_key}] ไม่พบการแสดงผล Seed Quest ในหน้า mybonus.php")
 
+    # ปิดท้ายด้วย Cleanup ตัวเดียว
+    stats["completed"] = await perform_cleanup(site_key, db, current_ids_on_web)
+
     # แจ้งเตือนสรุปผลผ่านระบบ Notify
-    summary_msg = f"🎯 <b>SEED QUEST SYNC: {site_key}</b>\n📋 Total Tracked: `{stats['total']}`\n🔒 Active/Protected: `{stats['active']}`\n✅ Completed: `{stats['completed']}`"
+    summary_msg = f"🎯 <b>SEED QUEST SYNC: {site_key}</b>\n📋 Total: `{stats['total']}`\n🔍 Scanned Hash: `{stats['scanned']}`\n🔒 Active: `{stats['active']}`\n✅ Completed: `{stats['completed']}`"
     await send_notify(summary_msg)
     print(f"📧 [{site_key}] สรุปผล Seed Quest เรียบร้อย: {stats}")
 
