@@ -3672,22 +3672,7 @@ async def sync_seed_quest_with_web(site_key, page, base_url, ctx):
     await page.get(f"{base_url.rstrip('/')}/mybonus.php")
     await asyncio.sleep(2)
     
-    # 1. บังคับเปิด <details> และคลิกปุ่ม "ดูทั้งหมด" ผ่าน JS ของ nodriver
-    try:
-        await page.evaluate("""
-            () => {
-                // ค้นหาปุ่มที่มีคำว่า "ดูทั้งหมด" หรือคล้ายกันแล้วสั่งคลิก
-                const buttons = Array.from(document.querySelectorAll('a, div, span, button'));
-                const targetBtn = buttons.find(el => el.textContent && el.textContent.includes('ดูทั้งหมด'));
-                if (targetBtn) {
-                    targetBtn.click();
-                }
-            }
-        """)
-        await asyncio.sleep(2)
-    except Exception as e:
-        print(f"⚠️ [{site_key}] ไม่สามารถขยายข้อมูลอัตโนมัติได้: {e}")
-    
+    # ดึง Content ล่าสุดหลังจากกาง details แล้ว
     content = await page.get_content()
     soup = BeautifulSoup(content, 'lxml')
     db = await async_load_db(site_key)
@@ -3695,76 +3680,87 @@ async def sync_seed_quest_with_web(site_key, page, base_url, ctx):
     stats = {"total": 0, "scanned": 0, "active": 0, "inactive": 0}
     current_ids_on_web = []
 
-    quest_list = soup.find('ul', class_='bbx-qlist')
-    
-    if quest_list:
-        torrent_links = []
-        # วนลูปหาแท็ก <a> ทั้งหมดที่อยู่ในลิสต์รายการ
-        for li in quest_list.find_all('li'):
-            link = li.find('a', href=re.compile(r'details\.php\?id='))
+    # ค้นหา <ul class='bbx-qlist'> ทุกตัวในหน้าเว็บ
+    quest_lists = soup.find_all('ul', class_='bbx-qlist')
+    print(f"📌 [{site_key}] พบกล่องรายการ Quest ทั้งหมด: {len(quest_lists)} บล็อก")
+
+    torrent_links = []
+    for q_list in quest_lists:
+        for li in q_list.find_all('li'):
+            link = li.find('a', href=re.compile(r'details\.php\?id=\d+'))
             if link and link not in torrent_links:
-                torrent_links.append(link)
+                # เก็บทั้ง element ของ link และ text สถานะจาก bbx-chip ใน li เดียวกัน
+                chip = li.find('span', class_='bbx-chip')
+                chip_text = chip.get_text(strip=True) if chip else ""
+                torrent_links.append((link, chip_text))
         
-        print(f"📌 [{site_key}] ตรวจพบลิงก์ Quest ทั้งหมดบนเว็บ: {len(torrent_links)} รายการ")
+    print(f"📌 [{site_key}] ตรวจพบลิงก์ Quest รวมทุกบล็อก: {len(torrent_links)} รายการ")
+    
+    for link, chip_text in torrent_links:
+        href = link['href']
+        match_id = re.search(r'id=(\d+)', href)
+        if not match_id:
+            continue
+            
+        torrent_id = match_id.group(1)
+        if torrent_id in current_ids_on_web:
+            continue
+            
+        current_ids_on_web.append(torrent_id)
+        stats["total"] += 1
         
-        for link in torrent_links:
-            href = link['href']
-            match_id = re.search(r'id=(\d+)', href)
-            if not match_id:
-                continue
-                
-            torrent_id = match_id.group(1)
-            if torrent_id in current_ids_on_web:
-                continue
-                
-            current_ids_on_web.append(torrent_id)
-            stats["total"] += 1
-            
-            if torrent_id not in db:
-                db[torrent_id] = {
-                    "status": "PROTECTED", 
-                    "hash": "UNKNOWN",
-                    "seed_quest": True,
-                    "hr": False,
-                    "seed_state": "inactive",
-                    "seed_quest_added_at": get_now().strftime("%Y-%m-%d %H:%M")
-                }
-            
-            tid_info = db[torrent_id]
-            tid_info["seed_quest"] = True
-            tid_info["status"] = "PROTECTED"
-            print(f"🔒 [{site_key}] Seed Quest Locked: ID {torrent_id} ({link.get_text().strip()})")
+        if torrent_id not in db:
+            db[torrent_id] = {
+                "status": "PROTECTED", 
+                "hash": "UNKNOWN",
+                "seed_quest": True,
+                "hr": False,
+                "seed_state": "inactive",
+                "seed_quest_status": "",
+                "seed_quest_added_at": get_now().strftime("%Y-%m-%d %H:%M")
+            }
+        
+        tid_info = db[torrent_id]
+        tid_info["seed_quest"] = True
+        tid_info["status"] = "PROTECTED"
+        
+        # วิเคราะห์สถานะจาก chip_text ที่ดึงมา เช่น "17/24 · กำลังนับ: ไม่ได้ seed" หรือ "9/24 · พัก: seed 4 คน"
+        tid_info["seed_quest_status"] = chip_text
+        if "กำลังนับ" in chip_text:
+            tid_info["seed_state"] = "active"
+        elif "พัก" in chip_text:
+            tid_info["seed_state"] = "pause"
+        else:
+            tid_info["seed_state"] = "inactive"
 
-            if tid_info.get("hash") == "UNKNOWN":
-                stats["scanned"] += 1
-                new_tab = await page.browser.get("about:blank", new_tab=True)
-                try:
-                    details_url = f"{base_url.rstrip('/')}/details.php?id={torrent_id}"
-                    meta = await get_torrent_details_full(new_tab, base_url, details_url, torrent_id)
-                    if meta.get('hash') and meta['hash'] != "UNKNOWN":
-                        tid_info["hash"] = meta['hash'].lower()
-                except Exception as e:
-                    print(f"❌ [{site_key}] Error ดึง Hash ID {torrent_id}: {e}")
-                finally:
-                    if new_tab: 
-                        await new_tab.close()
+        print(f"🔒 [{site_key}] Seed Quest Locked: ID {torrent_id} [{tid_info['seed_state'].upper()}] ({chip_text}) - {link.get_text().strip()}")
 
-            hash_val = tid_info.get("hash")
-            is_active = False
-            if hash_val and hash_val != "UNKNOWN":
-                if any(node_obj.is_torrent_exists(hash_val) for node_obj, _ in ctx.active_nodes):
-                    is_active = True
-                    print(f"🛡️ [{site_key}] ตรวจพบไฟล์ Quest (ID: {torrent_id}) อยู่ในระบบ Seedbox แล้ว [Active]")
-                else:
-                    print(f"⚠️ [{site_key}] ไม่พบไฟล์ Quest (ID: {torrent_id}) ในระบบ Seedbox [Inactive]")
+        if tid_info.get("hash") == "UNKNOWN":
+            stats["scanned"] += 1
+            new_tab = await page.browser.get("about:blank", new_tab=True)
+            try:
+                details_url = f"{base_url.rstrip('/')}/details.php?id={torrent_id}"
+                meta = await get_torrent_details_full(new_tab, base_url, details_url, torrent_id)
+                if meta.get('hash') and meta['hash'] != "UNKNOWN":
+                    tid_info["hash"] = meta['hash'].lower()
+            except Exception as e:
+                print(f"❌ [{site_key}] Error ดึง Hash ID {torrent_id}: {e}")
+            finally:
+                if new_tab: 
+                    await new_tab.close()
 
-            tid_info["seed_state"] = "active" if is_active else "inactive"
-            if is_active:
-                stats["active"] += 1
-            else:
-                stats["inactive"] += 1
+        hash_val = tid_info.get("hash")
+        is_box_active = False
+        if hash_val and hash_val != "UNKNOWN":
+            if any(node_obj.is_torrent_exists(hash_val) for node_obj, _ in ctx.active_nodes):
+                is_box_active = True
 
-            await async_save_db(site_key, db)
+        if is_box_active:
+            stats["active"] += 1
+        else:
+            stats["inactive"] += 1
+
+        await async_save_db(site_key, db)
     else:
         print(f"✨ [{site_key}] ไม่พบการแสดงผล Seed Quest ในหน้า mybonus.php")
 
@@ -3813,7 +3809,7 @@ async def perform_hr_cleanup(site_key, db, current_hr_ids):
                 # ถ้าไม่ได้ติด Seed Quest อยู่ด้วย ถึงจะเปลี่ยนเป็น COMPLETED
                 if not info.get("seed_quest"):
                     info["status"] = "COMPLETED"
-                    info["completed_at"] = get_now().strftime("%Y-%m-%d %H:%M")
+                    info["seed_quest_completed_at"] = get_now().strftime("%Y-%m-%d %H:%M")
                 
                 info["hr_status"] = "none"
                 info["hr_completed_at"] = get_now().strftime("%Y-%m-%d %H:%M")
@@ -3839,7 +3835,7 @@ async def perform_quest_cleanup(site_key, db, current_quest_ids):
                 # ถ้าไม่ได้ติด H&R อยู่ด้วย ถึงจะเปลี่ยนเป็น COMPLETED
                 if not info.get("hr"):
                     info["status"] = "COMPLETED"
-                    info["completed_at"] = get_now().strftime("%Y-%m-%d %H:%M")
+                    info["hr_completed_at"] = get_now().strftime("%Y-%m-%d %H:%M")
                 
                 info["seed_quest_completed_at"] = get_now().strftime("%Y-%m-%d %H:%M")
                 updated = True
