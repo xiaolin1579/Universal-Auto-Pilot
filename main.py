@@ -3672,6 +3672,22 @@ async def sync_seed_quest_with_web(site_key, page, base_url, ctx):
     await page.get(f"{base_url.rstrip('/')}/mybonus.php")
     await asyncio.sleep(2)
     
+    # 1. บังคับเปิด <details> และคลิกปุ่ม "ดูทั้งหมด" ผ่าน JS ของ nodriver
+    try:
+        await page.evaluate("""
+            () => {
+                // ค้นหาปุ่มที่มีคำว่า "ดูทั้งหมด" หรือคล้ายกันแล้วสั่งคลิก
+                const buttons = Array.from(document.querySelectorAll('a, div, span, button'));
+                const targetBtn = buttons.find(el => el.textContent && el.textContent.includes('ดูทั้งหมด'));
+                if (targetBtn) {
+                    targetBtn.click();
+                }
+            }
+        """)
+        await asyncio.sleep(2)
+    except Exception as e:
+        print(f"⚠️ [{site_key}] ไม่สามารถขยายข้อมูลอัตโนมัติได้: {e}")
+    
     content = await page.get_content()
     soup = BeautifulSoup(content, 'lxml')
     db = await async_load_db(site_key)
@@ -3679,19 +3695,17 @@ async def sync_seed_quest_with_web(site_key, page, base_url, ctx):
     stats = {"total": 0, "scanned": 0, "active": 0, "inactive": 0}
     current_ids_on_web = []
 
-    # เปลี่ยนมาค้นหาจาก ul ที่มีคลาส bbx-qlist โดยตรง
     quest_list = soup.find('ul', class_='bbx-qlist')
     
     if quest_list:
         torrent_links = []
-        # วนลูปหา li ทั้งหมดภายใน ul.bbx-qlist
+        # วนลูปหาแท็ก <a> ทั้งหมดที่อยู่ในลิสต์รายการ
         for li in quest_list.find_all('li'):
-            # ต้องมีลิงก์รายละเอียด และมีข้อความวงเล็บจำนวน seed กำกับ (เช่น seed X คน)
             link = li.find('a', href=re.compile(r'details\.php\?id='))
-            li_text = li.get_text()
-            if link and ('seed' in li_text or 'คน' in li_text):
-                if link not in torrent_links:
-                    torrent_links.append(link)
+            if link and link not in torrent_links:
+                torrent_links.append(link)
+        
+        print(f"📌 [{site_key}] ตรวจพบลิงก์ Quest ทั้งหมดบนเว็บ: {len(torrent_links)} รายการ")
         
         for link in torrent_links:
             href = link['href']
@@ -3721,7 +3735,6 @@ async def sync_seed_quest_with_web(site_key, page, base_url, ctx):
             tid_info["status"] = "PROTECTED"
             print(f"🔒 [{site_key}] Seed Quest Locked: ID {torrent_id} ({link.get_text().strip()})")
 
-            # กู้คืน Hash หากยังเป็น UNKNOWN
             if tid_info.get("hash") == "UNKNOWN":
                 stats["scanned"] += 1
                 new_tab = await page.browser.get("about:blank", new_tab=True)
@@ -3736,7 +3749,6 @@ async def sync_seed_quest_with_web(site_key, page, base_url, ctx):
                     if new_tab: 
                         await new_tab.close()
 
-            # ตรวจสอบสถานะ Active / Inactive บน Seedbox
             hash_val = tid_info.get("hash")
             is_active = False
             if hash_val and hash_val != "UNKNOWN":
@@ -3746,7 +3758,6 @@ async def sync_seed_quest_with_web(site_key, page, base_url, ctx):
                 else:
                     print(f"⚠️ [{site_key}] ไม่พบไฟล์ Quest (ID: {torrent_id}) ในระบบ Seedbox [Inactive]")
 
-            # บันทึกสถานะ seed_state ลง DB
             tid_info["seed_state"] = "active" if is_active else "inactive"
             if is_active:
                 stats["active"] += 1
