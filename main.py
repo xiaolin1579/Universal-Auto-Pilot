@@ -3721,19 +3721,28 @@ async def sync_seed_quest_with_web(site_key, page, base_url, ctx):
             }
         
         tid_info = db[torrent_id]
-        tid_info["seed_quest"] = True
-        tid_info["status"] = "PROTECTED"
         
-        # วิเคราะห์สถานะจาก chip_text ที่ดึงมา เช่น "17/24 · กำลังนับ: ไม่ได้ seed" หรือ "9/24 · พัก: seed 4 คน"
+        # วิเคราะห์สถานะจาก chip_text ที่ดึงมา
         tid_info["seed_quest_status"] = chip_text
-        if "กำลังนับ" in chip_text:
-            tid_info["seed_state"] = "active"
-        elif "พัก" in chip_text:
-            tid_info["seed_state"] = "pause"
+        if "ครบแล้ว" in chip_text:
+            tid_info["seed_state"] = "completed"
+            tid_info["seed_quest"] = False
+            # ถ้าเควสเสร็จแล้ว ไม่ล็อก PROTECTED (ปล่อยให้เป็น NORMAL หรือสถานะเดิม)
+            if tid_info.get("status") == "PROTECTED":
+                tid_info["status"] = "NORMAL" if not tid_info.get("hr") else "PROTECTED"
+            print(f"✅ [{site_key}] Seed Quest Completed: ID {torrent_id} [{tid_info['seed_state'].upper()}] ({chip_text}) - {link.get_text().strip()}")
         else:
-            tid_info["seed_state"] = "inactive"
+            tid_info["seed_quest"] = True
+            tid_info["status"] = "PROTECTED"
+            
+            if "กำลังนับ" in chip_text:
+                tid_info["seed_state"] = "active"
+            elif "พัก" in chip_text:
+                tid_info["seed_state"] = "pause"
+            else:
+                tid_info["seed_state"] = "inactive"
 
-        print(f"🔒 [{site_key}] Seed Quest Locked: ID {torrent_id} [{tid_info['seed_state'].upper()}] ({chip_text}) - {link.get_text().strip()}")
+            print(f"🔒 [{site_key}] Seed Quest Locked: ID {torrent_id} [{tid_info['seed_state'].upper()}] ({chip_text}) - {link.get_text().strip()}")
 
         if tid_info.get("hash") == "UNKNOWN":
             stats["scanned"] += 1
