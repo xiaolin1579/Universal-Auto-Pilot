@@ -3563,6 +3563,13 @@ async def sync_hr_with_web(site_key, page, base_url, ctx):
     await asyncio.sleep(2)
     
     content = await page.get_content()
+    
+    # 🛑 ตรวจจับหน้ากำลังอัพเดทข้อมูล
+    if "ระบบกำลัง อัพเดทข้อมูล" in content or "กรุณารอสักครู่" in content:
+        print(f"⚠️ [{site_key}] เว็บกำลังอยู่ในระหว่างอัพเดทข้อมูล ข้ามการ Sync รอบนี้ไปก่อน")
+        await send_notify(f"⚠️ <b>Sync H&R: {site_key}</b>\nเว็บกำลังอยู่ในระหว่างอัพเดทข้อมูล กรุณารอสักครู่...")
+        return
+        
     soup = BeautifulSoup(content, 'lxml')
     db = await async_load_db(site_key)
 
@@ -3674,6 +3681,13 @@ async def sync_seed_quest_with_web(site_key, page, base_url, ctx):
     
     # ดึง Content ล่าสุดหลังจากกาง details แล้ว
     content = await page.get_content()
+    
+    # 🛑 ตรวจจับหน้ากำลังอัพเดทข้อมูล
+    if "ระบบกำลัง อัพเดทข้อมูล" in content or "กรุณารอสักครู่" in content:
+        print(f"⚠️ [{site_key}] เว็บกำลังอยู่ในระหว่างอัพเดทข้อมูล ข้ามการ Sync รอบนี้ไปก่อน")
+        await send_notify(f"⚠️ <b>SEED QUEST SYNC: {site_key}</b>\nเว็บกำลังอยู่ในระหว่างอัพเดทข้อมูล กรุณารอสักครู่...")
+        return
+
     soup = BeautifulSoup(content, 'lxml')
     db = await async_load_db(site_key)
 
