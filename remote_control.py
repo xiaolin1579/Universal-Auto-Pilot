@@ -358,16 +358,23 @@ def get_monthly_report(site_name="TORRENTDD"):
         # เรียงลำดับจากยอดอัปโหลดมากไปหาน้อย
         daily_rankings.sort(key=lambda x: x[1], reverse=True)
 
+        def format_signed_size(val):
+            if val < 0:
+                return f"-{format_size(abs(val))}"
+            else:
+                return f"+{format_size(val)}"
+
         msg = [
             f"🗓️ <b>{site_name} Monthly: {current_month}</b>",
             "━━━━━━━━━━━━━━━━━━",
             f"👤 <b>User:</b> <code>{last_data['username']}</code>",
-            f"📤 <b>Total Uploaded:</b> +{format_size(up_gain)}",
-            f"📥 <b>Total Downloaded:</b> +{format_size(dl_gain)}",
+            f"📤 <b>Total Uploaded:</b> {format_signed_size(up_gain)}",
+            f"📥 <b>Total Downloaded:</b> {format_signed_size(dl_gain)}",
         ]
 
         if bonus_gain != 0 or 'bonus' in last_data:
-            msg.append(f"💰 <b>Total Bonus:</b> +{bonus_gain:,.1f} pts")
+            sign_str = "+" if bonus_gain >= 0 else ""
+            msg.append(f"💰 <b>Total Bonus:</b> {sign_str}{bonus_gain:,.1f} pts")
 
         msg.extend([
             "━━━━━━━━━━━━━━━━━━",
@@ -377,21 +384,21 @@ def get_monthly_report(site_name="TORRENTDD"):
         if daily_rankings:
             for day_str, up_val, dl_val, bonus_val in daily_rankings:
                 sub_lines = []
-                if up_val > 0:
-                    sub_lines.append(f"     ├ 📤 📈 +{format_size(up_val)}")
-                if dl_val > 0:
-                    sub_lines.append(f"     ├ 📥 📉 +{format_size(dl_val)}")
-                if bonus_val > 0:
-                    sub_lines.append(f"     ├ 💰 📈 +{bonus_val:,.1f} pts")
+                if up_val != 0:
+                    icon = "📈" if up_val > 0 else "📉"
+                    sub_lines.append(f"     ├ 📤 {icon} {format_signed_size(up_val)}")
+                if dl_val != 0:
+                    icon = "📈" if dl_val > 0 else "📉"
+                    sub_lines.append(f"     ├ 📥 {icon} {format_signed_size(dl_val)}")
+                if bonus_val != 0:
+                    icon = "📈" if bonus_val > 0 else "📉"
+                    sub_lines.append(f"     ├ 💰 {icon} {'+' if bonus_val > 0 else ''}{bonus_val:,.1f} pts")
                 
-                # แสดงผลเฉพาะวันที่มีการขยับของ Up, Dl หรือ Bonus อย่างน้อยหนึ่งอย่าง
+                # แสดงผลเฉพาะวันที่มีการขยับของ Up, Dl หรือ Bonus ไม่เท่ากับ 0
                 if sub_lines:
-                    # ปรับสัญลักษณ์ตัวสุดท้ายของบรรทัดย่อยให้สวยงาม (เปลี่ยนตัวสุดท้ายเป็น └ ถ้าไม่มีตัวถัดไป)
-                    # จัดการทำความสะอาดไอคอนบรรทัดสุดท้ายให้เป็นรูปแบบมาตรฐาน
                     formatted_sub_lines = []
                     for idx, line in enumerate(sub_lines):
                         if idx == len(sub_lines) - 1:
-                            # เปลี่ยน ├ เป็น └ ในบรรทัดสุดท้ายของวันนั้นๆ
                             line = line.replace("     ├", "     └")
                         formatted_sub_lines.append(line)
 
