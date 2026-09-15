@@ -137,16 +137,6 @@ def format_size(size_gb):
     sign = "-" if size_gb < 0 else ""
     return f"{sign}{current_size:.2f} {units[unit_index]}"
 
-def parse_size(size_str):
-    try:
-        size_str = size_str.upper().replace(',', '')
-        match = re.search(r"([0-9.]+)\s*(TB|GB|MB|KB|GIB|MIB|TIB)", size_str)
-        if not match: return 0.0
-        num, unit = float(match.group(1)), match.group(2)
-        factors = {"TB": 1024, "TIB": 1024, "GB": 1, "GIB": 1, "MB": 1/1024, "MIB": 1/1024}
-        return num * factors.get(unit, 1)
-    except: return 0.0
-
 def get_filtered_logs(n=15):
     if not os.path.exists(LOG_PATH): return "❌ ไม่พบไฟล์ Log"
     try:

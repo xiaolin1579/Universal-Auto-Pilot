@@ -349,19 +349,21 @@ def extract_info_hash(torrent_content):
         return None
 
 def parse_size(size_str):
-    """แปลง Text สถิติจากหน้าเว็บ (TB, GB, MB) ให้เป็นตัวเลขหน่วย GB"""
+    """แปลง Text สถิติจากหน้าเว็บ (PB, TB, GB, MB) ให้เป็นตัวเลขหน่วย GB"""
     try:
         if not size_str: return 0.0
         size_str = size_str.upper().replace(',', '').strip()
-        # เพิ่มการรองรับ B, KB, และหน่วย iB
-        match = re.search(r"([0-9.]+)\s*(TB|TIB|GB|GIB|MB|MIB|KB|KIB|B)", size_str)
+        
+        # เพิ่ม PB และ PIB เข้าไปใน Regex
+        match = re.search(r"([0-9.]+)\s*(PB|PIB|TB|TIB|GB|GIB|MB|MIB|KB|KIB|B)", size_str)
         if not match: return 0.0
         
         num = float(match.group(1))
         unit = match.group(2)
         
-        # กำหนด Factor โดยให้ GB = 1
+        # กำหนด Factor โดยให้ GB = 1 (1 PB = 1024 TB = 1,048,576 GB)
         factors = {
+            "PB": 1024 * 1024, "PIB": 1024 * 1024,
             "TB": 1024, "TIB": 1024,
             "GB": 1, "GIB": 1,
             "MB": 1/1024, "MIB": 1/1024,
@@ -2747,6 +2749,7 @@ def save_hourly_snapshot(site_name, current_data):
     """
     บันทึกข้อมูลแบบแยกระบบ Site และเก็บเป็นตัวเลข (Parsed)
     - [Data Integrity] เพิ่มระบบดักจับและเปลี่ยนประเภทข้อมูล (Cast Type) เป็นตัวเลขที่แท้จริงก่อนลงดิสก์
+    - [Anomaly Guard] ป้องกันสถิติลดลงหรือกระโดดผิดปกติจากเว็บต้นทางรวน (เช่น ค่าส่งมาเป็น 0 หรือดรอปฮวบ)
     - [Retention Fix] ปรับปรุงการคำนวณขอบเขตลบข้อมูล 31 วัน (744 ชั่วโมง) ป้องกันประวัติหายจากบอทรันซ้ำในชั่วโมงเดิม
     """
     try:
@@ -2767,7 +2770,6 @@ def save_hourly_snapshot(site_name, current_data):
         timestamp_key = now.strftime("%Y-%m-%d %H:00")
         
         # 2. 🛡️ Data Type Safeguard: แปลงค่าให้แน่ใจว่าเป็นตัวเลขก่อนบันทึกลง JSON
-        # ป้องกันกรณีต้นทางส่งมาเป็น string เช่น "1,500" หรือติดคอมมามา
         def clean_float(val):
             if isinstance(val, (int, float)):
                 return float(val)
@@ -2776,25 +2778,47 @@ def save_hourly_snapshot(site_name, current_data):
             except (ValueError, TypeError):
                 return 0.0
 
+        raw_up = clean_float(current_data.get('up', 0))
+        raw_dl = clean_float(current_data.get('dl', 0))
+        raw_bonus = clean_float(current_data.get('bonus', 0))
+        raw_ratio = clean_float(current_data.get('ratio', 0))
+
+        # 3. 🛡️ Anomaly Guard: ป้องกันสถิติลดลง/กระโดดผิดปกติจากเว็บรวนหรือรีเซ็ต
+        existing_keys = sorted(all_history[site_name].keys())
+        if existing_keys:
+            latest_prev_key = existing_keys[-1]
+            prev_data = all_history[site_name][latest_prev_key]
+            
+            prev_up = prev_data.get('up', 0)
+            prev_dl = prev_data.get('dl', 0)
+            
+            # ถ้า Upload ปัจจุบันน้อยกว่าค่าเดิมอย่างมีนัยสำคัญ (เช่น เว็บพังส่งค่า 0 หรือหลุด) ให้ใช้ค่าเดิมกันพัง
+            if raw_up < prev_up * 0.95:  # ยอมให้ลดลงได้ไม่เกิน 5% (หรือปรับเงื่อนไขตามความเหมาะสม)
+                print(f"⚠️ [{site_name}] Anomaly Guard: ตรวจพบยอด Upload ลดลงผิดปกติจาก {prev_up} เหลือ {raw_up} -> ใช้ค่าเดิมแทน")
+                raw_up = prev_up
+            
+            # ถ้า Download ลดลงผิดปกติ ให้ล็อกค่าเดิมไว้เช่นกัน
+            if raw_dl < prev_dl * 0.95:
+                print(f"⚠️ [{site_name}] Anomaly Guard: ตรวจพบยอด Download ลดลงผิดปกติจาก {prev_dl} เหลือ {raw_dl} -> ใช้ค่าเดิมแทน")
+                raw_dl = prev_dl
+
         # บันทึกข้อมูล Snapshot ประจำชั่วโมง
         all_history[site_name][timestamp_key] = {
             'username': current_data.get('username', 'N/A'),
-            'ratio': clean_float(current_data.get('ratio', 0)),
-            'up': clean_float(current_data.get('up', 0)),
-            'dl': clean_float(current_data.get('dl', 0)),
-            'bonus': clean_float(current_data.get('bonus', 0)),
+            'ratio': raw_ratio,
+            'up': raw_up,
+            'dl': raw_dl,
+            'bonus': raw_bonus,
             'raw_time': now.strftime("%Y-%m-%d %H:%M:%S")
         }
 
-        # 3. ⏱️ ปรับปรุงระบบ Retention (จำกัดความยาวประวัติ 31 วัน)
-        # โพซิชันเดิม site_keys[:-744] หากคีย์มีน้อยกว่า 744 ตัว มันจะส่งลิสต์เปล่าออกมา ซึ่งปลอดภัย
-        # แต่เปลี่ยนใช้ลูปจำกัดจำนวนแบบตรงไปตรงมา เพื่อความแม่นยำในการคัดทิ้งคีย์ที่เก่าที่สุด
+        # 4. ⏱️ ปรับปรุงระบบ Retention (จำกัดความยาวประวัติ 31 วัน / 744 ชั่วโมง)
         site_keys = sorted(all_history[site_name].keys())
         while len(site_keys) > 744:
             oldest_key = site_keys.pop(0)  # ดึงคีย์ที่เก่าที่สุดออกทีละตัว
             del all_history[site_name][oldest_key]
 
-        # 4. Save แบบ Atomic ป้องกันไฟล์พังเมื่อบอทโดนตัดการทำงาน
+        # 5. Save แบบ Atomic ป้องกันไฟล์พังเมื่อบอทโดนตัดการทำงาน
         tmp_file = STATS_HISTORY_FILE + ".tmp"
         with open(tmp_file, 'w', encoding='utf-8') as f:
             json.dump(all_history, f, indent=4, ensure_ascii=False)
@@ -2818,7 +2842,7 @@ async def async_get_stats_diff(site_name, current_data):
 def get_stats_diff(site_name, current_data):
     """
     เปรียบเทียบค่าปัจจุบันกับ Cache โดยแยกตาม site_name 
-    และส่งคืนข้อความส่วนต่างที่กระชับ
+    พร้อมระบบ Anomaly Guard ป้องกัน Cache พังเมื่อเว็บรวนส่งค่า 0 หรือค่าดรอป
     """
     diff_msg = ""
     all_cache = {}
@@ -2836,22 +2860,38 @@ def get_stats_diff(site_name, current_data):
     # 2. ดึงข้อมูลเก่าเฉพาะของ Site นี้
     old_data = all_cache.get(site_name)
 
+    # แปลงค่าปัจจุบันเตรียมไว้เช็ค
+    curr_up = parse_size(current_data.get('up', '0'))
+    curr_dl = parse_size(current_data.get('dl', '0'))
+    
+    def clean_float(val):
+        try: return float(str(val).replace(',', ''))
+        except: return 0.0
+
+    curr_bonus = clean_float(current_data.get('bonus', 0))
+
     if old_data:
         try:
-            # ใช้ parse_size ที่เราทำไว้ เพื่อความแม่นยำของหน่วย (GB)
-            curr_up = parse_size(current_data.get('up', '0'))
             old_up = parse_size(old_data.get('up', '0'))
-            
-            curr_dl = parse_size(current_data.get('dl', '0'))
             old_dl = parse_size(old_data.get('dl', '0'))
-
-            # คำนวณ Bonus (ดึงตัวเลขออกมาลบกันตรงๆ)
-            def clean_float(val):
-                try: return float(str(val).replace(',', ''))
-                except: return 0.0
-
-            curr_bonus = clean_float(current_data.get('bonus', 0))
             old_bonus = clean_float(old_data.get('bonus', 0))
+
+            # 🛡️ Anomaly Guard: ถ้าค่าปัจจุบันดรอปลงผิดปกติ (เช่นเว็บส่ง 0 หรือรวน) ห้ามเอาไปทับ Cache เก่า
+            if curr_up == 0.0 and old_up > 0:
+                print(f"⚠️ [{site_name}] Cache Guard: ตรวจพบยอด Upload เป็น 0 -> ใช้ค่าเก่า ({old_up}) คำนวณและดึง Cache เดิมไว้")
+                curr_up = old_up
+                current_data['up'] = old_data.get('up')  # ใช้ค่าเดิมกัน Cache พัง
+            elif curr_up < old_up * 0.95:
+                print(f"⚠️ [{site_name}] Cache Guard: ยอด Upload ลดลงผิดปกติ -> ใช้ค่าเดิมแทน")
+                curr_up = old_up
+                current_data['up'] = old_data.get('up')
+
+            if curr_dl == 0.0 and old_dl > 0:
+                curr_dl = old_dl
+                current_data['dl'] = old_data.get('dl')
+            elif curr_dl < old_dl * 0.95:
+                curr_dl = old_dl
+                current_data['dl'] = old_data.get('dl')
 
             changes = []
             
@@ -2877,7 +2917,7 @@ def get_stats_diff(site_name, current_data):
         except Exception as e:
             print(f"⚠️ [{site_name}] Calc Diff Error: {e}")
 
-    # 3. อัปเดต Cache เฉพาะส่วนของ Site นี้ และบันทึกกลับแบบ Atomic
+    # 3. อัปเดต Cache เฉพาะส่วนของ Site นี้ และบันทึกกลับแบบ Atomic (ใช้ข้อมูลที่ผ่าน Guard แล้ว)
     all_cache[site_name] = current_data
     try:
         temp_file = STATS_CACHE_FILE + ".tmp"
@@ -3027,8 +3067,8 @@ async def get_site_stats(page: uc.Tab, site_cfg: dict, ctx: BotContext) -> str:
             return m.group(1) if m else default
 
         curr_ratio = extract(r"Ratio:?\s*([\d\.,]+)", text, None)
-        curr_up    = extract(r"(?:Uploaded|Upload):?\s*([\d\.,]+\s*[KMGTP]B)", text, None)
-        curr_dl    = extract(r"(?:Downloaded|Download):?\s*([\d\.,]+\s*[KMGTP]B)", text, None)
+        curr_up    = extract(r"(?:Uploaded|Upload):?\s*([\d\.,]+\s*[KMGTPE]B)", text, None)
+        curr_dl    = extract(r"(?:Downloaded|Download):?\s*([\d\.,]+\s*[KMGTPE]B)", text, None)
         curr_bonus = extract(r"(?:Bonus):?\s*([\d\.,]+)", text, "0")
 
         if not all([curr_ratio, curr_up, curr_dl]):
