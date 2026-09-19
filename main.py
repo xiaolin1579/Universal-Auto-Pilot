@@ -3157,6 +3157,10 @@ async def extract_torrent_data(row, base_url, dl_session=None, headers=None, che
             return await _extract_unlimitz_logic(row, base_url, dl_session, headers, checked_cache)
         elif "bearbit" in url_lower:
             return await _extract_bearbit_logic(row, base_url, dl_session, headers, checked_cache)
+        elif "dedbit" in url_lower:
+            return await _extract_dedbit_logic(row, base_url, dl_session, headers, checked_cache)
+        elif "bitsuse" in url_lower:
+            return await _extract_bitsuse_logic(row, base_url, dl_session, headers, checked_cache)
         else:
             print(f"⚠️ ไม่พบ Logic สำหรับเว็บไซต์: {base_url}")
             return None
@@ -3164,6 +3168,161 @@ async def extract_torrent_data(row, base_url, dl_session=None, headers=None, che
     except Exception as e:
         print(f"❌ เกิดข้อผิดพลาดในการดึงข้อมูลจาก {base_url}: {e}")
         return None
+
+async def _extract_bitsuse_logic(row, base_url, dl_session, headers, checked_cache):
+    """
+    ฟังก์ชันแกะข้อมูลทอร์เรนต์สำหรับเว็บไซต์ BITSUSE ตามโครงสร้าง HTML จริง
+    """
+    t_id, title, details_url = None, "Unknown File", None
+    
+    # 1. ดึง Title และ ID (รองรับ bs_details.php)
+    title_tag = row.find("a", href=re.compile(r"(?:bs_)?details\.php\?id=\d+"))
+    if title_tag:
+        title = title_tag.get_text(strip=True)
+        id_match = re.search(r"id=(\d+)", title_tag['href'])
+        if id_match:
+            t_id = id_match.group(1)
+            # รักษาชื่อสคริปต์ไฟล์ตามเว็บ (bs_details.php หรือ details.php)
+            script_name = title_tag['href'].split('?')[0]
+            details_url = f"{base_url.rstrip('/')}/{script_name}?id={t_id}"
+
+    # 2. ดึง Download URL (รองรับ bs_download.php)
+    download_url = None
+    dl_tag = row.find("a", href=re.compile(r"(?:bs_)?download\.php\?id=\d+"))
+    if dl_tag:
+        url = dl_tag['href']
+        download_url = url if url.startswith('http') else f"{base_url.rstrip('/')}/{url.lstrip('/')}"
+
+    # 3. ดึงขนาดไฟล์ (Size) จากคอลัมน์ที่มีหน่วย [KMGTP]B (ในตัวอย่างคือ 3.84 GB)
+    size_str = "0 B"
+    for cell in row.find_all(["td", "span", "div"]):
+        txt = cell.get_text(strip=True)
+        if re.search(r"[\d.]+\s*[KMGTP]B", txt, re.I) and not "Ratio" in txt:
+            match = re.search(r"([\d.]+\s*[KMGTP]B)", txt, re.I)
+            if match:
+                size_str = match.group(1)
+                break
+
+    # 4. ดึงสถิติ Seeders, Leechers, Completed 
+    # ตาม HTML ของ Bitsuse ตัวเลขจะอยู่ใน tag <b> ท้ายตาราง (เช่น Seeders: 32, Leechers: 4, Snatched/Completed: 57)
+    seeders, leechers, completed = 0, 0, 0
+    
+    # รวบรวมตัวเลขจากทุกแท็ก <b> หรือ td ท้ายแถว
+    all_b = row.find_all("b")
+    numeric_stats = []
+    for b in all_b:
+        val = b.get_text(strip=True)
+        if val.isdigit():
+            numeric_stats.append(int(val))
+
+    # แกะสถิติตามลำดับโครงสร้างแถวของ Bitsuse
+    # ตัวอย่าง: [Completed (57 times), Seeders (32), Leechers (4)] หรือใกล้เคียง
+    # ค้นหาคอลัมน์ Snatched / Completed (มักจะมีคำว่า times หรืออยู่ก่อนหน้า seeders)
+    for cell in row.find_all(["td"]):
+        txt = cell.get_text(strip=True)
+        if "times" in txt:
+            comp_match = re.search(r"([\d,]+)\s*times", txt)
+            if comp_match:
+                try: completed = int(comp_match.group(1).replace(',', ''))
+                except: pass
+
+    # Seeders และ Leechers มักอยู่ช่องท้ายๆ ที่เป็นตัวเลขโดดๆ
+    if len(numeric_stats) >= 2:
+        # สมมติฐาน: ตัวเลขท้ายๆ แถวคือ Seeders และ Leechers
+        seeders = numeric_stats[-2] if len(numeric_stats) >= 2 else 0
+        leechers = numeric_stats[-1] if len(numeric_stats) >= 1 else 0
+
+    # 5. ดึงวันที่และเวลาอัปโหลด (ในตัวอย่างคือ 2026-09-19 17:22:58)
+    raw_date = None
+    for cell in row.find_all(["td", "nobr"]):
+        txt = cell.get_text(separator=" ", strip=True)
+        if re.search(r"\d{4}-\d{2}-\d{2}", txt):
+            raw_date = txt.replace("\n", " ")
+            break
+
+    return { 
+        "id": t_id, 
+        "title": title, 
+        "seeders": seeders, 
+        "leechers": leechers, 
+        "completed": completed, 
+        "size_str": size_str, 
+        "raw_date": raw_date,
+        "download_url": download_url, 
+        "details_url": details_url 
+    }
+
+async def _extract_dedbit_logic(row, base_url, dl_session, headers, checked_cache):
+    """
+    ฟังก์ชันแกะข้อมูลทอร์เรนต์สำหรับ DEDBIT / BITSUSE ตามโครงสร้าง HTML จริง
+    """
+    t_id, title, details_url = None, "Unknown File", None
+    
+    # 1. ดึง Title และ ID จากแท็ก a ที่ลิงก์ไป details.php?id=...
+    title_tag = row.find("a", href=re.compile(r"details\.php\?id=\d+"))
+    if title_tag:
+        title = title_tag.get_text(strip=True)
+        id_match = re.search(r"id=(\d+)", title_tag['href'])
+        if id_match:
+            t_id = id_match.group(1)
+            details_url = f"{base_url.rstrip('/')}/details.php?id={t_id}"
+
+    # 2. ดึง Download URL จากแท็ก img alt="download" หรือลิงก์ download.php
+    download_url = None
+    dl_tag = row.find("a", href=re.compile(r"download\.php\?id=\d+"))
+    if dl_tag:
+        url = dl_tag['href']
+        download_url = url if url.startswith('http') else f"{base_url.rstrip('/')}/{url.lstrip('/')}"
+
+    # 3. ดึงขนาดไฟล์ (Size) จากคอลัมน์ที่มีหน่วย [KMGTP]B (ในตัวอย่างคือ 10.58 MB)
+    size_str = "0 B"
+    for cell in row.find_all(["td", "span", "div"]):
+        txt = cell.get_text(strip=True)
+        if re.search(r"[\d.]+\s*[KMGTP]B", txt, re.I) and not "Ratio" in txt:
+            match = re.search(r"([\d.]+\s*[KMGTP]B)", txt, re.I)
+            if match:
+                size_str = match.group(1)
+                break
+
+    # 4. ดึงสถิติ Seeders / Leechers / Completed จากคอลัมน์ที่เป็นตัวเลขท้ายตาราง
+    # ตาม HTML: คอลัมน์ Seeders (91) และ Leechers (4) อยู่ในลิงก์ ajaxpeers.php
+    seeders, leechers, completed = 0, 0, 0
+    
+    seed_tag = row.find("a", href=re.compile(r"ajaxpeers\.php.*type=seed"))
+    if seed_tag:
+        try: seeders = int(seed_tag.get_text(strip=True).replace(',', ''))
+        except: pass
+
+    leech_tag = row.find("a", href=re.compile(r"ajaxpeers\.php(?!.*type=seed)"))
+    if leech_tag:
+        try: leechers = int(leech_tag.get_text(strip=True).replace(',', ''))
+        except: pass
+
+    # ค้นหาจำนวนการดาวน์โหลดสำเร็จ (Completed / Snatched) จากลิงก์ filelist.php (ในตัวอย่างคือ 13)
+    completed_tag = row.find("a", href=re.compile(r"filelist\.php"))
+    if completed_tag:
+        try: completed = int(completed_tag.get_text(strip=True).replace(',', ''))
+        except: pass
+
+    # 5. ดึงวันที่และเวลาอัปโหลด (ในตัวอย่างคือ 2012-06-28 10:36:28)
+    raw_date = None
+    for cell in row.find_all(["td", "nobr"]):
+        txt = cell.get_text(separator=" ", strip=True)
+        if re.search(r"\d{4}-\d{2}-\d{2}", txt):
+            raw_date = txt.replace("\n", " ")
+            break
+
+    return { 
+        "id": t_id, 
+        "title": title, 
+        "seeders": seeders, 
+        "leechers": leechers, 
+        "completed": completed, 
+        "size_str": size_str, 
+        "raw_date": raw_date,
+        "download_url": download_url, 
+        "details_url": details_url 
+    }    
 
 async def _extract_unlimitz_logic(row, base_url, dl_session, headers, checked_cache):
     tds = row.find_all("td")
