@@ -2979,6 +2979,13 @@ async def get_site_stats(page: uc.Tab, site_cfg: dict, ctx: BotContext) -> str:
             base_url = "https://www.dedbit.com"
         else:
             base_url = site_cfg.get('base_url', "https://bearbit.org").rstrip('/')
+        
+        # -------------------------------------------------------------------------
+        # 🎯 0. [เพิ่มใหม่] จัดการเคลียร์สถานะคอนฟิกหากไม่ใช่เว็บ BEARBIT
+        # -------------------------------------------------------------------------
+        if 'bearbit' not in site.lower():
+            if 'reset_bot_config_to_default' in globals():
+                await asyncio.to_thread(reset_bot_config_to_default)
 
         # -------------------------------------------------------------------------
         # 🎯 1. ทำภารกิจกวาดล้าง (Clear Notifications & Auto-Vote)
@@ -4482,9 +4489,9 @@ def get_bearbit_item_status(soup):
             if active_item.startswith("FREELOAD"):
                 display_exp = get_date_from_table(r"Item\s*Status|สถานะ\s*ไอเทม")
 
-        # 4. ส่งค่าอัปเดต
-        if active_item != "NONE" and 'update_bot_config' in globals():
-            update_bot_config(active_item)
+        # 4. ส่งค่าอัปเดต (ลบเงื่อนไข != "NONE" ออก เพื่อให้มันรีเซ็ตค่ากลับเป็นปกติได้เมื่อไอเทมหมด/ปิด)
+        if 'update_bot_config' in globals():
+            update_bot_config(active_item, site_name="BEARBIT")
 
         return f"{active_item} ({display_exp})"
 
@@ -4492,60 +4499,80 @@ def get_bearbit_item_status(soup):
         print(f"❌ [Parser Error]: {e}")
         return "NONE"
 
-def update_bot_config(active_item):
+def update_bot_config(active_item, site_name="BEARBIT"):
     global CFG
     if not CFG or 'SETTING' not in CFG: return
     
-    # เพิ่ม PAUSE_DOWNLOAD เข้าไปในลอจิกการคำนวณ
+    # จำกัดให้ทำงานเฉพาะเว็บ BEARBIT เท่านั้น
+    if site_name.upper() != "BEARBIT":
+        return
+
+    # กรณีไม่มีไอเทม หรือสั่งปิด (NONE) ให้รีเซ็ตกลับค่าเริ่มต้นจากไฟล์ config.json ทันที
+    if active_item == "NONE":
+        try:
+            with open('config.json', 'r', encoding='utf-8') as f:
+                new_cfg = json.load(f)
+                CFG['SETTING'].update(new_cfg.get('SETTING', {}))
+            CFG['SETTING']['CURRENT_DISCOUNT'] = 0
+            print("🛡️ [BEARBIT - NORMAL MODE]: รีเซ็ตค่ากลับสู่โหมดปกติเรียบร้อย")
+        except Exception as e:
+            CFG['SETTING']['CURRENT_DISCOUNT'] = 0
+            CFG['SETTING']['FREELOAD_ENABLE'] = False
+            print(f"❌ Error reloading config: {e}")
+        return
+
+    # --- ลอจิกส่วนลดและ Pause เดิม ---
     if active_item == "PAUSE_DOWNLOAD":
         CFG['SETTING']['CURRENT_DISCOUNT'] = 100
         CFG['SETTING']['FREELOAD_ENABLE'] = True
         CFG['SETTING']['MIN_FREE_PERCENT'] = 0
         CFG['SETTING']['EXCLUDE_WEB_FREE'] = False 
-        # เน้นว่าโหมดนี้ไม่ต้องสน Ratio เลย เพราะโหลดฟรีไม่หัก Download credit
-        print("⏸️ [PAUSE DOWNLOAD MODE]: ฟรีโควต้าดาวน์โหลด 100% | กวาดได้เต็มที่!")
-        return # จบการทำงานในเงื่อนไขพิเศษนี้
+        print("⏸️ [BEARBIT - PAUSE DOWNLOAD MODE]: ฟรีโควต้าดาวน์โหลด 100%")
+        return
 
     discounts = {
-        "FREELOAD_100": 100,
-        "FREELOAD_50": 50,
-        "FREELOAD_30": 30,
-        "FREELOAD_15": 15,
-        "FREELOAD_10": 10
+        "FREELOAD_100": 100, "FREELOAD_50": 50,
+        "FREELOAD_30": 30, "FREELOAD_15": 15, "FREELOAD_10": 10
     }
 
     current_discount = discounts.get(active_item, 0)
     CFG['SETTING']['CURRENT_DISCOUNT'] = current_discount
 
     if current_discount == 100:
-        # โหมดฟรี 100%: ไม่ต้องสนหน้าเว็บ ไม่ต้องสน Pending เพราะเราฟรีแน่นอน
         CFG['SETTING']['FREELOAD_ENABLE'] = True
         CFG['SETTING']['MIN_FREE_PERCENT'] = 0
-        CFG['SETTING']['EXCLUDE_WEB_FREE'] = False # ไม่ต้องเลี่ยงไฟล์ฟรี เพราะยังไงเราก็ฟรี
-        print("🚀 [FREE 100% MODE]: กวาดทุกไฟล์ไม่สนหน้าเว็บ (เน้นเก็บยอดอัปโหลด)")
-
+        CFG['SETTING']['EXCLUDE_WEB_FREE'] = False 
+        print("🚀 [BEARBIT - FREE 100% MODE]")
     elif current_discount > 0:
-        # โหมดมีส่วนลด (เช่น 50%): ต้องใช้ลอจิกคัดกรองความคุ้มค่า
         CFG['SETTING']['FREELOAD_ENABLE'] = True
         CFG['SETTING']['MIN_FREE_PERCENT'] = 0
         CFG['SETTING']['EXCLUDE_WEB_FREE'] = True
-        print(f"⚠️ [DISCOUNT {current_discount}% MODE]: เน้นไฟล์ที่ใช้ไอเทมแล้วคุ้มกว่าหน้าเว็บ")
-
+        print(f"⚠️ [BEARBIT - DISCOUNT {current_discount}% MODE]")
     else:
-        # โหมดปกติ: ไอเทมหมดอายุ
-        try:
-            with open('config.json', 'r', encoding='utf-8') as f:
-                new_cfg = json.load(f)
-                CFG['SETTING'].update(new_cfg.get('SETTING', {}))
+        # เผื่อกรณีอื่นๆ ให้รีเซ็ตเช่นกัน
+        CFG['SETTING']['CURRENT_DISCOUNT'] = 0
+        CFG['SETTING']['FREELOAD_ENABLE'] = False
 
-            # --- เสริมกำแพงป้องกัน ---
-            CFG['SETTING']['CURRENT_DISCOUNT'] = 0
-
-            print("🛡️ [NORMAL MODE]: กลับสู่โหมดปกติ")
-        except Exception as e:
-            # กรณีโหลดไฟล์ไม่สำเร็จ ให้ใช้ค่า Hard-coded ที่ปลอดภัยที่สุด
-            CFG['SETTING']['CURRENT_DISCOUNT'] = 0
-            print(f"❌ Error reloading config: {e} | Switching to Emergency Safety Mode")
+def reset_bot_config_to_default():
+    """รีเซ็ตค่าคอนฟิก global กลับเป็นค่าตั้งต้นจากไฟล์ config.json ทันที (ใช้เมื่อย้ายไปเว็บอื่น)"""
+    global CFG
+    if not CFG or 'SETTING' not in CFG: return
+    
+    try:
+        with open('config.json', 'r', encoding='utf-8') as f:
+            base_cfg = json.load(f)
+            CFG['SETTING'].update(base_cfg.get('SETTING', {}))
+        
+        # กำหนดค่าความปลอดภัยพื้นฐานสำหรับเว็บทั่วไป
+        CFG['SETTING']['CURRENT_DISCOUNT'] = 0
+        # สมมติว่าค่าเริ่มต้นปกติของเว็บทั่วไปตั้งค่า Freeload เป็น False ไว้
+        # หรือปล่อยให้ config.json จัดการโดยตรง
+        print("🛡️ [SYSTEM]: รีเซ็ตค่าคอนฟิกกลางกลับสู่ค่าตั้งต้นสำหรับเว็บทั่วไปเรียบร้อย")
+    except Exception as e:
+        CFG['SETTING']['CURRENT_DISCOUNT'] = 0
+        CFG['SETTING']['FREELOAD_ENABLE'] = False
+        CFG['SETTING']['EXCLUDE_WEB_FREE'] = True
+        print(f"❌ Error resetting config to default: {e}")
 
 async def auto_vote_snatched(page: uc.Tab, base_url: str, site_name: str = "BEARBIT") -> bool:
     try:
