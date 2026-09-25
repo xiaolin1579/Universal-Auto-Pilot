@@ -169,3 +169,4 @@ debug_error.html
 *.html
 /db
 /profiles
+torrent_mapping.json

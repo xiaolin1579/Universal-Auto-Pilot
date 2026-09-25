@@ -24,3 +24,4 @@ pyvirtualdisplay
 bencodepy
 httpx
 aiohttp
+qbittorrent-api
