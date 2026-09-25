@@ -1,11 +1,13 @@
 from fake_useragent import UserAgent
 from urllib.parse import urljoin, unquote
 import xmlrpc.client
+import logging
 import aiohttp
 import random
 import inspect
 import httpx
 import cloudscraper
+from qbittorrentapi import Client
 import threading
 import chardet
 import gzip
@@ -41,6 +43,8 @@ import ddddocr
 import io
 from xml.sax.saxutils import escape
 import functools
+from pathlib import Path
+
 print = functools.partial(print, flush=True)
 
 ocr = ddddocr.DdddOcr(show_ad=False)
@@ -100,6 +104,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 STATS_CACHE_FILE = os.path.join(BASE_DIR, "stats_cache.json")
 STATS_HISTORY_FILE = os.path.join(BASE_DIR, "stats_history.json")
+MAPPING_FILE = os.path.join(BASE_DIR, "torrent_mapping.json")
 DB_DIR = os.path.join(BASE_DIR, "db")
 CFG = {} 
 ORIGINAL_SETTING = None
@@ -328,6 +333,36 @@ def add_hash_to_site(site_key, t_hash):
 def save_data(path, data):
     with open(path, "w", encoding='utf-8') as f: f.write("\n".join(sorted(list(data))))
 
+async def load_mapping():
+    """โหลดข้อมูลจากไฟล์ JSON แบบ Asynchronous"""
+    def _load():
+        if not os.path.exists(MAPPING_FILE):
+            initial_data = {"version": "1.1", "torrents": []}
+            # เขียนไฟล์เริ่มต้นแบบซิงค์ภายในเธรดแยก
+            with open(MAPPING_FILE, 'w', encoding='utf-8') as f:
+                json.dump(initial_data, f, indent=4, ensure_ascii=False)
+            return initial_data
+        try:
+            with open(MAPPING_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"❌ Error loading mapping: {e}")
+            return {"version": "1.1", "torrents": []}
+
+    # ใช้ asyncio.to_thread เพื่อรันงานอ่านไฟล์ไม่ให้บล็อก Event Loop
+    return await asyncio.to_thread(_load)
+
+async def save_mapping(data):
+    """บันทึกข้อมูลลงไฟล์ JSON แบบ Asynchronous"""
+    def _save():
+        try:
+            with open(MAPPING_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"❌ Error saving mapping: {e}")
+
+    await asyncio.to_thread(_save)
+
 def extract_info_hash(torrent_content):
     try:
         # ใช้ bencodepy ในการ decode ไฟล์ .torrent
@@ -422,6 +457,213 @@ async def check_pending_status(session, details_url):
     except Exception as e:
         print(f"      ⚠️ Error checking pending status: {e}")
         return False
+
+async def add_or_update_torrent(client_data, web_data=None, node_data=None):
+    """
+    รองรับการเพิ่มหรืออัปเดตเรกคอร์ดทอร์เรนต์แบบ Asynchronous 
+    จากทั้ง qBittorrent และ rTorrent
+    """
+    data = await load_mapping()  # หรือ load_mapping()
+    torrents = data.get('torrents', [])
+    
+    target_hash = client_data.get('hash', '').upper()
+    if not target_hash:
+        print("⚠️ [Mapper]: ไม่พบค่า Hash ใน client_data ไม่สามารถดำเนินการต่อได้")
+        return
+
+    web_data = web_data or {}
+    node_data = node_data or {}
+    client_type = client_data.get('client_type', 'unknown')
+    
+    existing = next((t for t in torrents if t.get('client_info', {}).get('hash', '').upper() == target_hash), None)
+    
+    if existing:
+        # 1. อัปเดตข้อมูลฝั่ง client_info ปกติ (เพิ่ม save_path เข้าไปเผื่อเก็บไว้ใน client_info ด้วยถ้าต้องการ)
+        existing['client_info'].update({
+            'state': client_data.get('state', existing['client_info'].get('state')),
+            'ratio': client_data.get('ratio', existing['client_info'].get('ratio')),
+            'name': client_data.get('name', existing['client_info'].get('name'))
+        })
+        
+        # 🛠️ 2. เพิ่มการอัปเดต save_path ลงใน node_info ตรงนี้ครับ!
+        if 'node_info' not in existing:
+            existing['node_info'] = {}
+            
+        if node_data.get('save_path'):
+            existing['node_info']['save_path'] = node_data.get('save_path')
+            
+        # หรือถ้า save_path ส่งมาผ่าน client_data (เช่นจากตัวแปร t_directory ที่ดึงมา)
+        elif client_data.get('save_path'):
+            existing['node_info']['save_path'] = client_data.get('save_path')
+
+        print(f"🔄 [Mapper]: อัปเดตสถานะและพาธ ({client_type}) ของ {existing.get('release_name', target_hash)} สำเร็จ")
+    else:
+        new_record = {
+            "torrent_id": web_data.get('torrent_id', None),
+            "site_name": web_data.get('site_name', 'Unknown'),
+            "release_name": web_data.get('release_name', client_data.get('name', 'Unknown')),
+            "web_size": web_data.get('web_size', client_data.get('size_bytes', 0)),
+            "client_info": {
+                "client_type": client_type,
+                "hash": target_hash,
+                "name": client_data.get('name'),
+                "size_bytes": client_data.get('size_bytes', 0),
+                "state": client_data.get('state', 'unknown'),
+                "ratio": client_data.get('ratio', 0.0)
+            },
+            "node_info": {
+                "seedbox_host": node_data.get('seedbox_host', 'Localhost'),
+                "save_path": node_data.get('save_path', '')
+            },
+            "cross_seed_links": [],
+            "status": "active"
+        }
+        torrents.append(new_record)
+        print(f"✨ [Mapper]: เพิ่มเรกคอร์ดใหม่ผ่าน {client_type} สำเร็จ ({new_record['release_name']})")
+        
+    data['torrents'] = torrents
+    await save_mapping(data)
+
+async def handle_new_torrent_grabbed(web_item, client_response, host_name):
+    """
+    web_item = ข้อมูลจากเว็บ เช่น {"torrent_id": 999, "site_name": "BEARBIT", "release_name": "Movie.X", "web_size": "10 GB"}
+    client_response = ข้อมูลที่ได้หลังจากสั่งแอดเข้า qBit/rTorrent สำเร็จ (ต้องมี hash, name, state ฯลฯ)
+    """
+    client_data = {
+        "client_type": client_response.get('type', 'qbittorrent'), # หรือ 'rtorrent'
+        "hash": client_response['hash'],
+        "name": client_response['name'],
+        "size_bytes": client_response.get('size_bytes', 0),
+        "state": client_response.get('state', 'downloading'),
+        "ratio": 0.0
+    }
+
+    node_data = {
+        "seedbox_host": host_name,
+        "save_path": client_response.get('save_path', '')
+    }
+
+    # ส่ง web_data เข้าไปด้วยเพื่อให้ฟังก์ชันสร้างเรกคอร์ดใหม่ที่สมบูรณ์
+    await add_or_update_torrent(
+        client_data=client_data,
+        web_data=web_item,
+        node_data=node_data
+    )
+
+def process_cross_seed_linking(mapping_data):
+    """
+    ตรวจสอบและเชื่อมโยง cross_seed_links จาก save_path ที่ตรงกัน
+    mapping_data: ข้อมูลทั้งหมดในไฟล์ JSON Mapping
+    """
+    torrents = mapping_data.get('torrents', [])
+    
+    # สร้าง Index กลุ่มตาม save_path
+    path_groups = {}
+    for t in torrents:
+        path = t.get('save_path', '').strip()
+        if not path:
+            continue
+        if path not in path_groups:
+            path_groups[path] = []
+        path_groups[path].append(t)
+        
+    # ทำการผูกลิงก์ cross_seed_links หากพบ path เดียวกันแต่คนละ hash
+    for path, group in path_groups.items():
+        if len(group) > 1:
+            # ดึงรายชื่อ Hash ทั้งหมดใน Path นี้
+            all_hashes = [item['hash'] for item in group]
+            
+            for item in group:
+                current_hash = item['hash']
+                # ให้ cross_seed_links เก็บ hash อื่นๆ ที่อยู่ในโฟลเดอร์เดียวกัน
+                linked_hashes = [h for h in all_hashes if h != current_hash]
+                
+                # อัปเดตเข้าไปในเรกคอร์ด
+                item['cross_seed_links'] = list(set(item.get('cross_seed_links', []) + linked_hashes))
+                
+    print(f"🔗 [Cross-Seed] ตรวจพบและเชื่อมโยงโฟลเดอร์ที่ใช้ข้อมูลร่วมกันเรียบร้อยแล้ว ({len(path_groups)} กลุ่ม)")
+    return mapping_data
+
+async def reverse_cross_seed_from_existing_files(active_nodes, scraped_web_items, mapping_data, mapper_func):
+    """
+    ระบบค้นหาไฟล์จากเว็บโดยเทียบจากไฟล์ที่มีอยู่แล้วใน Seedbox
+    - active_nodes: รายการโหนดที่กำลังทำงานอยู่
+    - scraped_web_items: รายการทอร์เรนต์ทั้งหมดที่กวาดมาจากหน้าเว็บในรอบล่าสุด
+    - mapping_data: ข้อมูล mapping ปัจจุบัน
+    """
+    torrents_in_mapping = mapping_data.get('torrents', [])
+    matched_count = 0
+    
+    # สร้าง Index รายการเว็บเพื่อค้นหาได้รวดเร็ว (เทียบด้วยขนาดไฟล์หรือชื่อ)
+    web_catalog_by_size = {}
+    for item in scraped_web_items:
+        sz = item.get('size_bytes', 0)
+        if sz > 0:
+            if sz not in web_catalog_by_size:
+                web_catalog_by_size[sz] = []
+            web_catalog_by_size[sz].append(item)
+
+    for node_obj, n_cfg in active_nodes:
+        # กรองทอร์เรนต์เฉพาะโหนอนี้ที่ดาวน์โหลดเสร็จแล้ว
+        completed_torrents = [
+            t for t in torrents_in_mapping 
+            if t.get('seedbox_host') == node_obj.name and t.get('state', '').lower() in ['completed', 'seeding', 'uploading']
+        ]
+        
+        for local_t in completed_torrents:
+            t_size = local_t.get('size_bytes', 0)
+            save_path = local_t.get('save_path', '')
+            existing_links = [h.lower() for h in local_t.get('cross_seed_links', [])]
+            local_hash = local_t.get('hash', '').lower()
+            
+            if not save_path or t_size not in web_catalog_by_size:
+                continue
+                
+            # ค้นหาทอร์เรนต์บนเว็บที่มีขนาดเท่ากัน
+            candidates = web_catalog_by_size[t_size]
+            for web_item in candidates:
+                web_hash = web_item.get('hash', '').lower()
+                
+                # เงื่อนไข: ต้องไม่ใช่ Hash เดิม และยังไม่เคยลิงก์กัน
+                if web_hash != local_hash and web_hash not in existing_links:
+                    print(f"🎯 [Reverse Cross-Seed] พบไฟล์ตรงกันจากเว็บอื่นสำหรับโหนด {node_obj.name}!")
+                    print(f"   📁 ไฟล์เดิม: {local_t.get('name')}")
+                    print(f"   🌐 พบในเว็บ: {web_item.get('release_name')} (Site: {web_item.get('site_name')})")
+                    
+                    # 1. ดาวน์โหลดไฟล์ .torrent จากเว็บเป้าหมาย
+                    torrent_bytes = await download_torrent_file(web_item.get('download_url'))
+                    
+                    if torrent_bytes:
+                        # 2. สั่งแอดเข้า Seedbox ที่ path เดิม โดยตั้งสถานะเป็น Pause เพื่อรอ Recheck
+                        add_success = node_obj.add_torrent_with_path(
+                            torrent_bytes=torrent_bytes,
+                            save_path=save_path,
+                            paused=True
+                        )
+                        
+                        if add_success:
+                            matched_count += 1
+                            # 3. บันทึกความสัมพันธ์ลง cross_seed_links
+                            local_t.setdefault('cross_seed_links', []).append(web_item.get('hash'))
+                            
+                            # อัปเดตข้อมูลลง mapping ทันที
+                            client_data = {
+                                "client_type": getattr(node_obj, "client_type", "qbittorrent"),
+                                "hash": web_hash,
+                                "name": web_item.get('release_name'),
+                                "size_bytes": t_size,
+                                "state": "paused",
+                                "ratio": 0.0
+                            }
+                            node_data = {
+                                "seedbox_host": node_obj.name,
+                                "save_path": save_path
+                            }
+                            await mapper_func(client_data=client_data, web_data=web_item, node_data=node_data)
+
+    if matched_count > 0:
+        print(f"✨ [Reverse Cross-Seed] ดึงข้อมูลจากเว็บมาประกบคู่ไฟล์เดิมสำเร็จทั้งหมด {matched_count} รายการ")
+    return matched_count
 
 # ========================= BROWSER ENGINE =========================
 
@@ -1035,7 +1277,8 @@ class QbitNode:
                     'up_speed': t.get('upspeed', 0),
                     'ts_finished': t.get('completion_on', 0),
                     'ts_init': t.get('added_on', 0),
-                    'is_rt_complete': t.get('progress', 0) >= 1.0
+                    'is_rt_complete': t.get('progress', 0) >= 1.0,
+                    'save_path': t.get('save_path', '')
                 })
             return results
             
@@ -1216,6 +1459,77 @@ class QbitNode:
             return False
         except Exception:
             return False
+
+    async def sync_to_mapping(self, web_data_list=None, mapper_func=None):
+        """
+        ดึงข้อมูลทอร์เรนต์ทั้งหมดจาก qBittorrent แล้วอัปเดตลง JSON Mapping (Async)
+        - web_data_list: ข้อมูลรายการทอร์เรนต์ที่กวาดมาจากหน้าเว็บ (ถ้าเป็น None จะซิงค์ทุกทอร์เรนต์จาก qBittorrent โดยตรง)
+        - mapper_func: ฟังก์ชันสำหรับบันทึกข้อมูลแบบ async (เช่น add_or_update_torrent)
+        """
+        # ตรวจสอบการเชื่อมต่อ
+        if not self.is_connected:
+            if not self.login():
+                return False
+            
+        # ดึงรายการทอร์เรนต์ทั้งหมดจาก qBittorrent
+        all_qbt_torrents = self.get_all_torrents_info()
+        if not all_qbt_torrents:
+            return False
+        
+        # เลือกฟังก์ชันบันทึก (ใช้ mapper_func ที่ส่งมา หรือ fallback เป็น add_or_update_torrent)
+        save_func = mapper_func if mapper_func else add_or_update_torrent
+        synced_count = 0
+
+        # กรณีที่มีการส่ง web_data_list มา (จับคู่เฉพาะทอร์เรนต์ที่มีในเว็บ)
+        if web_data_list:
+            qbt_map = {t['hash'].lower(): t for t in all_qbt_torrents}
+            for web_item in web_data_list:
+                target_hash = web_item.get('hash', '').lower()
+            
+                if target_hash in qbt_map:
+                    qbt_t = qbt_map[target_hash]
+                
+                    client_data = {
+                        "client_type": "qbittorrent",
+                        "hash": qbt_t['hash'],
+                        "name": qbt_t['name'],
+                        "size_bytes": qbt_t['size_bytes'],
+                        "state": qbt_t['state'],
+                        "ratio": qbt_t['ratio']
+                    }
+                
+                    node_data = {
+                        "seedbox_host": self.name,
+                        "save_path": qbt_t.get('save_path', '')
+                    }
+                
+                    await save_func(client_data=client_data, web_data=web_item, node_data=node_data)
+                    synced_count += 1
+
+        # กรณีที่ไม่ได้ส่ง web_data_list มา (เรียกจาก Node Section รอบปกติ จะซิงค์ทุกตัวจาก qBittorrent ตรงๆ)
+        else:
+            for qbt_t in all_qbt_torrents:
+                client_data = {
+                    "client_type": "qbittorrent",
+                    "hash": qbt_t['hash'],
+                    "name": qbt_t['name'],
+                    "size_bytes": qbt_t['size_bytes'],
+                    "state": qbt_t['state'],
+                    "ratio": qbt_t['ratio']
+                }
+            
+                node_data = {
+                    "seedbox_host": self.name,
+                    "save_path": qbt_t.get('save_path', '')
+                }
+            
+                # ส่ง web_data เป็น dict เปล่า เพราะรอบนี้ไม่ได้กวาดเว็บมา
+                await save_func(client_data=client_data, web_data={}, node_data=node_data)
+                synced_count += 1
+            
+        if synced_count > 0:
+            print(f"🔄 [{self.name}] ซิงค์ข้อมูล qBittorrent เข้า Mapping เรียบร้อยแล้ว ({synced_count} รายการ)")
+        return True
 
     def get_stats_by_site(self):
         """ดึงสถิติแยกตาม Category ของแต่ละเว็บ"""
@@ -1431,7 +1745,7 @@ class RtorrentNode:
 
     def get_all_torrents_info(self):
         try:
-            # ⚡ [Unified Payload]: ดึงค่าครบทุกสล็อตเพื่อเอาไปให้ตัวเคลียร์คำนวณได้อย่างอิสระ
+            # ⚡ เพิ่ม <param><value><string>d.directory=</string></value></param> เข้าไป
             xml = '''<?xml version="1.0"?>
             <methodCall>
             <methodName>d.multicall2</methodName>
@@ -1448,24 +1762,26 @@ class RtorrentNode:
                 <param><value><string>d.state=</string></value></param>
                 <param><value><string>d.up.rate=</string></value></param>
                 <param><value><string>d.peers_leeching=</string></value></param>
-                <param><value><string>d.creation_date=</string></value></param> 
+                <param><value><string>d.creation_date=</string></value></param>
+                <param><value><string>d.directory=</string></value></param>
             </params>
             </methodCall>'''
 
+            # ... (โค้ดเชื่อมต่อและประมวลผล XML ปกติ) ...
             req_headers = getattr(self, 'headers', {}).copy()
             if "Connection" not in req_headers: 
                 req_headers["Connection"] = "close"
 
             r = self.s.post(self.url, data=xml, auth=self.auth, headers=req_headers, timeout=20, verify=False)
             if r.status_code != 200: 
-                print(f"❌ rTorrent API Error: Status Code {r.status_code}") # เพิ่ม Log ตรงนี้
+                print(f"❌ rTorrent API Error: Status Code {r.status_code}")
                 return []
             
             root = ET.fromstring(r.text)
             data = root.findall(".//value/array/data/value/array/data")
             
             if not data:
-                print(f"⚠️ rTorrent return empty data list") # เพิ่ม Log ตรงนี้
+                print(f"⚠️ rTorrent return empty data list")
                 return []
 
             results = []
@@ -1473,7 +1789,6 @@ class RtorrentNode:
                 values = item.findall("./value")
                 if len(values) < 9: continue 
 
-                # ฟังก์ชันช่วยดึง text จาก node
                 def safe_get_text(val_node):
                     if val_node is None: return ""
                     for tag in ["./string", "./i4", "./int"]:
@@ -1482,10 +1797,7 @@ class RtorrentNode:
                             return target.text.strip()
                     return val_node.text.strip() if val_node.text else ""
 
-                # ดึงข้อมูลพร้อมแปลง hash เป็น lowercase ทันที
                 t_hash = safe_get_text(values[0]).lower()
-                
-                # หากไม่มี hash ให้ข้ามไป
                 if not t_hash:
                     continue
                     
@@ -1499,54 +1811,47 @@ class RtorrentNode:
                 t_ts_created_str = safe_get_text(values[8])
                 t_up_rate_str = safe_get_text(values[9]) 
                 t_leechers_str = safe_get_text(values[10])
+                
+                # 📂 ดึงค่า Directory ตามตำแหน่งดัชนี (ลำดับที่ 11 หรือค่าท้ายสุดที่เพิ่มเข้ามา)
+                t_directory = safe_get_text(values[11]) if len(values) > 11 else ""
 
-                # 🎯 ปลดล็อก: ส่งข้อมูลดิบออกไปทั้งหมด ไม่ใช้คำสั่ง continue เตะงานทิ้งกลางคัน
-                # ย้ายการตัดสินใจเรื่องความเสร็จสมบูรณ์ไปให้ฟังก์ชันสลัดดิสก์ภายนอกจัดการ
                 is_complete_flag = (t_complete_str == "1")
                 left_bytes = int(t_left_str) if t_left_str.isdigit() else 0
 
-                if t_hash:
-                    try:
-                        ratio_val = int(t_ratio_str) / 1000.0 if t_ratio_str.isdigit() else 0.0
-                        if ratio_val < 0: ratio_val = 0.0
-                        size_bytes = int(t_size_str) if t_size_str.isdigit() else 0
-                        ts_finished = int(t_ts_finished_str) if t_ts_finished_str.isdigit() else 0
-                        ts_init = int(t_ts_created_str) if t_ts_created_str.isdigit() else 0
-                        
-                        if ts_init == 0:
-                            ts_init = int(time.time())
+                try:
+                    ratio_val = int(t_ratio_str) / 1000.0 if t_ratio_str.isdigit() else 0.0
+                    if ratio_val < 0: ratio_val = 0.0
+                    size_bytes = int(t_size_str) if str(t_size_str).isdigit() else 0
+                    ts_finished = int(t_ts_finished_str) if t_ts_finished_str.isdigit() else 0
+                    ts_init = int(t_ts_created_str) if t_ts_created_str.isdigit() else 0
                     
-                        if ts_finished <= 0:
-                            age_hours = 99.0 
-                        else:
-                            age_hours = (time.time() - ts_finished) / 3600.0
+                    if ts_init == 0:
+                        ts_init = int(time.time())
+                except Exception:
+                    ratio_val = 0.0
+                    size_bytes = 0
 
-                    except Exception:
-                        ratio_val = 0.0
-                        size_bytes = 0
-                        age_hours = 0.0
+                mapped_state = "seeding" if is_complete_flag else "downloading"
+                if t_state_str == "0": mapped_state = "paused"
 
-                    # แปลงสถานะตัวเลขของ rTorrent ให้เป็นข้อความล้อไปกับลักษณะของ qBit
-                    mapped_state = "seeding" if is_complete_flag else "downloading"
-                    if t_state_str == "0": mapped_state = "paused"
-
-                    results.append({
-                        'hash': t_hash,
-                        'ratio': ratio_val,
-                        'name': t_name,
-                        'size': size_bytes / (1024**3),
-                        'size_bytes': size_bytes,
-                        'amount_left': left_bytes,
-                        'progress': 1.0 if is_complete_flag else 0.0,
-                        'state': mapped_state,
-                        'added_on': ts_finished, # ใช้ ts_finished เป็นตัวแทนเมื่อไม่มี added_on
-                        'ts_finished': ts_finished,
-                        'ts_init': ts_init,     # เพิ่ม ts_init เพื่อ Safety Gate
-                        'up_speed': int(t_up_rate_str) if t_up_rate_str.isdigit() else 0,
-                        'leechers': int(t_leechers_str) if t_leechers_str.isdigit() else 0,
-                        'is_rt_complete': is_complete_flag
-                    })
-                
+                results.append({
+                    'hash': t_hash,
+                    'ratio': ratio_val,
+                    'name': t_name,
+                    'size': size_bytes / (1024**3),
+                    'size_bytes': size_bytes,
+                    'amount_left': left_bytes,
+                    'progress': 1.0 if is_complete_flag else 0.0,
+                    'state': mapped_state,
+                    'added_on': ts_finished,
+                    'ts_finished': ts_finished,
+                    'ts_init': ts_init,
+                    'up_speed': int(t_up_rate_str) if t_up_rate_str.isdigit() else 0,
+                    'leechers': int(t_leechers_str) if t_leechers_str.isdigit() else 0,
+                    'is_rt_complete': is_complete_flag,
+                    'save_path': t_directory  # 👈 เพิ่มฟิลด์ save_path ตรงนี้เพื่อให้ส่งออกไปใช้งานต่อได้
+                })
+            
             results.sort(key=lambda x: x.get('ratio', 0), reverse=True)
             return results
 
@@ -1910,7 +2215,136 @@ class RtorrentNode:
             self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=15, verify=False)
             return True
         except: return False
-        
+
+    async def sync_to_mapping(self, web_data_list=None, mapper_func=None):
+        """
+        ดึงข้อมูลทอร์เรนต์ทั้งหมดจาก rTorrent แล้วจับคู่กับข้อมูลเว็บเพื่ออัปเดตลง JSON Mapping (Async)
+        """
+        if not self.is_connected and not self.login():
+            return False
+
+        mapping = {}
+        try:
+            xml = (
+                '<?xml version="1.0"?>'
+                '<methodCall>'
+                '<methodName>d.multicall2</methodName>'
+                '<params>'
+                '<param><value><string></string></value></param>'
+                '<param><value><string>main</string></value></param>'
+                '<param><value><string>d.hash=</string></value></param>'
+                '<param><value><string>d.name=</string></value></param>'
+                '<param><value><string>d.size_bytes=</string></value></param>'
+                '<param><value><string>d.completed_bytes=</string></value></param>'
+                '<param><value><string>d.up.total=</string></value></param>'
+                '<param><value><string>d.down.total=</string></value></param>'
+                '<param><value><string>d.custom1=</string></value></param>'
+                '<param><value><string>d.is_open=</string></value></param>'
+                '<param><value><string>d.is_active=</string></value></param>'
+                '<param><value><string>d.state=</string></value></param>'
+                '<param><value><string>d.directory=</string></value></param>'  # 👈 1. เพิ่ม d.directory= ตรงนี้
+                '</params>'
+                '</methodCall>'
+            )
+
+            req_headers = {**getattr(self, 'headers', {}), 'Connection': 'close'}
+            r = self.s.post(self.url, data=xml, auth=self.auth, headers=req_headers, timeout=20, verify=False)
+            
+            if r.status_code in [401, 403]:
+                if self.login():
+                    r = self.s.post(self.url, data=xml, auth=self.auth, headers=req_headers, timeout=20, verify=False)
+
+            if r.status_code != 200:
+                print(f"❌ [{self.name}] sync_to_mapping Error: Status Code {r.status_code}")
+                return False
+
+            root = ET.fromstring(r.text)
+            data = root.findall(".//value/array/data/value/array/data")
+            if not data:
+                return False
+
+            for item in data:
+                values = item.findall("./value")
+                if len(values) < 11:  # 👈 2. ขยับเงื่อนไขเช็คความยาวตามจำนวนพารามิเตอร์ที่เพิ่มขึ้น (0-10 รวมเป็น 11 ตัว)
+                    continue
+
+                def safe_get_text(val_node):
+                    if val_node is None: return ""
+                    for tag in ["./string", "./i4", "./int", "./i8"]:
+                        target = val_node.find(tag)
+                        if target is not None and target.text is not None:
+                            return target.text.strip()
+                    return val_node.text.strip() if val_node.text else ""
+
+                t_hash = safe_get_text(values[0]).upper()
+                if not t_hash:
+                    continue
+
+                try:
+                    size_bytes = int(safe_get_text(values[2])) if safe_get_text(values[2]).lstrip('-').isdigit() else 0
+                    completed_bytes = int(safe_get_text(values[3])) if safe_get_text(values[3]).lstrip('-').isdigit() else 0
+                    up_total = int(safe_get_text(values[4])) if safe_get_text(values[4]).lstrip('-').isdigit() else 0
+                    down_total = int(safe_get_text(values[5])) if safe_get_text(values[5]).lstrip('-').isdigit() else 0
+                    is_open = int(safe_get_text(values[7])) == 1 if safe_get_text(values[7]).lstrip('-').isdigit() else False
+                    is_active = int(safe_get_text(values[8])) == 1 if safe_get_text(values[8]).lstrip('-').isdigit() else False
+                except Exception:
+                    size_bytes, completed_bytes, up_total, down_total = 0, 0, 0, 0
+                    is_open, is_active = False, False
+
+                ratio = (up_total / size_bytes) if size_bytes > 0 else 0.0
+
+                mapping[t_hash] = {
+                    "hash": t_hash,
+                    "name": safe_get_text(values[1]),
+                    "size_bytes": size_bytes,
+                    "completed_bytes": completed_bytes,
+                    "up_total": up_total,
+                    "down_total": down_total,
+                    "ratio": round(ratio, 4),
+                    "label": safe_get_text(values[6]),
+                    "is_open": is_open,
+                    "is_active": is_active,
+                    "state": safe_get_text(values[9]),
+                    "save_path": safe_get_text(values[10])  # 👈 3. ดึงค่า Directory มาเก็บไว้ใน mapping
+                }
+
+        except Exception as e:
+            print(f"❌ [{self.name}] Exception during sync_to_mapping: {e}")
+            return False
+
+        if not mapping:
+            return False
+
+        save_func = mapper_func if mapper_func else add_or_update_torrent
+
+        synced_count = 0
+        for t_hash, rt_t in mapping.items():
+            client_data = {
+                "client_type": "rtorrent",
+                "hash": rt_t['hash'],
+                "name": rt_t['name'],
+                "size_bytes": rt_t['size_bytes'],
+                "state": rt_t['state'],
+                "ratio": rt_t['ratio'],
+                "up_total": rt_t['up_total'],
+                "down_total": rt_t['down_total']
+            }
+            
+            node_data = {
+                "seedbox_host": self.name,
+                "label": rt_t['label'],
+                "is_active": rt_t['is_active'],
+                "save_path": rt_t.get('save_path', '')
+            }
+            
+            # ส่ง web_data เป็น {} ไปก่อน
+            await save_func(client_data=client_data, web_data={}, node_data=node_data)
+            synced_count += 1
+            
+        if synced_count > 0:
+            print(f"🔄 [{self.name}] ซิงค์ข้อมูล rTorrent เข้า Mapping เรียบร้อยแล้ว ({synced_count} รายการ)")
+        return True
+
     def get_stats_by_site(self):
         if not self.is_connected: 
             self.login()
@@ -4983,6 +5417,12 @@ async def main():
 
                     node.reannounce_all()
                     node.refresh_status()
+                    
+                    await node.sync_to_mapping()
+                    
+                    mapping_data = await load_mapping()
+                    updated_mapping = process_cross_seed_linking(mapping_data)
+                    await save_mapping(updated_mapping)
 
                     gained = node.free_gb - pre_free
                     if gained > 0.01:
@@ -5376,27 +5816,47 @@ async def main():
 
                                         # 4. ส่วนการส่งเข้า Node
                                         if download_ready:
-                                            # ตรวจสอบ Hash ซ้ำ
+                                            is_duplicate = False
+                                            target_node_name = ""
+
+                                            # เช็คว่าซ้ำใน seen_hashes หรือมีอยู่แล้วใน Node ใด Node หนึ่ง
                                             if t_hash in seen_hashes:
-                                                print(f" ❌ ข้าม: Hash {t_hash} ซ้ำในระบบ")
-                                                seen_hashes.add(t_hash)
-                                                download_ready = False
-                                            else:
-                                                is_already_in_node = False
-                                                target_node_name = ""
+                                                is_duplicate = True
+                                                # พยายามหาว่ามันอยู่ Node ไหน เพื่อเอาชื่อ Node ไปซิงค์
                                                 for node_obj, _ in active_nodes:
                                                     if node_obj.is_torrent_exists(t_hash):
-                                                        is_already_in_node = True
                                                         target_node_name = node_obj.name
                                                         break
+                                            else:
+                                                for node_obj, _ in active_nodes:
+                                                    if node_obj.is_torrent_exists(t_hash):
+                                                        is_duplicate = True
+                                                        target_node_name = node_obj.name
+                                                        break
+
+                                            if is_duplicate:
+                                                print(f" ❌ ข้าม: ตรวจพบ Hash [...{t_hash[-5:]}] ซ้ำในระบบ/วิ่งอยู่ใน {target_node_name or 'Unknown Node'}")
+                                                seen_hashes.add(t_hash)
         
-                                                if is_already_in_node:
-                                                    print(f" ❌ ข้าม: ตรวจพบ Hash [...{t_hash[-5:]}] วิ่งอยู่ใน {target_node_name}")
-                                                    seen_hashes.add(t_hash)
-                                                    # กดปุ่ม Thanks
-                                                    await handle_thanks_click(browser_instance, details_url)
-                                                    count_skip += 1
-                                                    download_ready = False
+                                                # 🛠️ ทำการซิงค์ข้อมูลลง Mapping ทันทีไม่ว่าจะเจอซ้ำจากจุดไหน
+                                                if target_node_name:
+                                                    sync_data = dict(data)
+                                                    sync_data['torrent_id'] = t_id
+                                                    sync_data['site_name'] = site
+                                                    sync_data['release_name'] = raw_title
+                                                    sync_data['web_size'] = data.get('size_str', '')
+                                                    sync_data['download_url'] = download_url
+                                                    sync_data['details_url'] = details_url
+
+                                                    for node_obj, _ in active_nodes:
+                                                        if node_obj.name == target_node_name:
+                                                            await node_obj.sync_to_mapping(web_data_list=[sync_data])
+                                                            break
+
+                                                # กดปุ่ม Thanks
+                                                await handle_thanks_click(browser_instance, details_url)
+                                                count_skip += 1
+                                                download_ready = False
 
                                         if download_ready:
                                             print(f"✅ [{site}] พร้อมส่งไฟล์เข้า Client (Hash: {t_hash})")
@@ -5455,17 +5915,43 @@ async def main():
                                                         if result:
                                                             success_msg = f"📥 [Success] {node_obj.name} | {t_size_gb:.1f}GB | {t_name[:40]}"
                                                             print(success_msg)
-                                                            
+                                            
                                                             # อัปเดตสถานะ Node
                                                             node_obj.free_gb = max(0.0, node_obj.free_gb - (t_size_gb + 0.1))
                                                             added_in_zone.append(success_msg)
                                                             seen_ids.add(t_id)
                                                             seen_hashes.add(t_hash)
                                                             success_node = node_obj
-            
+                                            
+                                                            # --- ประกอบข้อมูล web_item และ client_response เพื่อส่งเข้าฟังก์ชัน Mapping ---
+                                                            web_item_payload = {
+                                                                "torrent_id": t_id,
+                                                                "site_name": site,
+                                                                "release_name": raw_title,
+                                                                "web_size": data.get('size_str', ''),
+                                                                "download_url": download_url,
+                                                                "details_url": details_url
+                                                            }
+                                            
+                                                            # รองรับกรณีที่ safe_add_torrent คืนค่าเป็น dict หรือเป็นค่าจริงจาก client
+                                                            client_response_payload = {
+                                                                "client_type": getattr(node_obj, "client_type", "rtorrent"), # ปรับตามประเภท client เช่น qbittorrent/rtorrent
+                                                                "hash": t_hash,
+                                                                "name": t_name,
+                                                                "size_bytes": int(t_size_gb * 1024 * 1024 * 1024),
+                                                                "state": "downloading",
+                                                                "save_path": getattr(node_obj, "save_path", "")
+                                                            }
+                                            
+                                                            await handle_new_torrent_grabbed(
+                                                                web_item=web_item_payload, 
+                                                                client_response=client_response_payload, 
+                                                                host_name=node_obj.name
+                                                            )
+
                                                             # กดปุ่ม Thanks
                                                             await handle_thanks_click(browser_instance, details_url)
-            
+
                                                             break # ส่งเข้า Node สำเร็จแล้ว ให้หยุด Loop
                                                     else:
                                                         print(f"❌ [Error] ข้อมูลไฟล์ทอร์เรนต์ (raw_data_bytes) ว่างเปล่า ไม่สามารถส่งเข้า {node_obj.name}")
@@ -5601,7 +6087,8 @@ async def main():
                     print("🔒 [System] ปิด Browser และเคลียร์หน่วยความจำแล้ว")
             else:
                 print("ℹ️ Browser instance ไม่มีอยู่แล้ว")
-
+            
+            
             #รันรายงานสถิติ (ยิง api ตรง)
             stats_report = format_site_stats_report([n[0] for n in active_nodes])
             if stats_report:
