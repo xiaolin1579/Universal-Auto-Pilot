@@ -44,6 +44,8 @@ import io
 from xml.sax.saxutils import escape
 import functools
 from pathlib import Path
+import traceback
+import urllib.parse
 
 print = functools.partial(print, flush=True)
 
@@ -1223,51 +1225,74 @@ class QbitNode:
             print(f"⚠️ [{self.name}] qBittorrent Refresh Error: {e}")
             return False
 
-    def add(self, content, site_name="Universal", size=None, n_cfg=None):
-        try:
-            if len(content) < 1000: return False
-
-            files = {"torrents": ("f.torrent", content, "application/x-bittorrent")}
-            data = {
-                "paused": "false",
-                "firstLastPiecePrio": "true",
-                "sequentialDownload": "false",
-                "category": site_name,
-                "tags": "AutoPilot",
-                "autoTMM": "false"
-            }
-
-            # ใช้ _execute_request แทน self.s.post
-            # โดยส่ง headers{'Referer': self.url} เข้าไป เดี๋ยว helper จะเติม Connection: close ให้เอง
-            r = self._execute_request(
-                'POST',
-                f"{self.url}/api/v2/torrents/add",
-                files=files,
-                data=data,
-                headers={'Referer': self.url},
-                auth=self.auth,
-                verify=False,
-                timeout=30
-            )
-
-            # ตรวจสอบ Response
-            if r is not None and r.status_code == 200:
-                return True
-            
-            # กรณี Session หลุดหรือ Error
-            if r is not None and r.status_code in [401, 403]:
-                print(f" 🔄 [{self.name}] Session expired during add(), re-logging...")
-                if self.login():
-                    # ลองใหม่อีกครั้งหลังจาก Login ใหม่สำเร็จ
-                    return self.add(content, site_name, size, n_cfg)
-            
-            error_msg = r.text if r is not None else "No response"
-            print(f"⚠️ [API Error] {self.name}: {r.status_code if r else 'None'} - {error_msg}")
+    def add(self, content, site_name="Universal", size=None, n_cfg=None, save_path=None, skip_checking=False, tags="AutoPilot"):
+    """
+    เพิ่ม Torrent เข้า qBittorrent รองรับทั้ง Normal Grab และ Cross-Seed Mode
+    
+    :param save_path: ตำแหน่งโฟลเดอร์สำหรับเซฟไฟล์ (จำเป็นมากสำหรับ Cross-Seed)
+    :param skip_checking: หากเป็น True จะข้ามการตรวจ Hash และเริ่ม Seed ทันที
+    """
+    try:
+        if len(content) < 1000:
             return False
 
-        except Exception as e:
-            print(f"❌ [Exception] {self.name}: {str(e)}")
-            return False
+        files = {"torrents": ("f.torrent", content, "application/x-bittorrent")}
+        
+        data = {
+            "paused": "false",
+            "firstLastPiecePrio": "true" if not skip_checking else "false",
+            "sequentialDownload": "false",
+            "category": site_name,
+            "tags": tags,
+            "autoTMM": "false"  # ปิด TMM เพื่อให้บังคับใช้ savepath ที่ส่งไปได้แม่นยำ
+        }
+
+        # 🎯 เพิ่มพารามิเตอร์พิเศษสำหรับ Cross-Seed
+        if save_path:
+            data["savepath"] = save_path
+        
+        if skip_checking:
+            data["skip_checking"] = "true"
+            data["tags"] = f"{tags},Cross-Seed" if tags else "Cross-Seed"
+
+        # ส่ง Request ไปยัง qBittorrent WebUI
+        r = self._execute_request(
+            'POST',
+            f"{self.url}/api/v2/torrents/add",
+            files=files,
+            data=data,
+            headers={'Referer': self.url},
+            auth=self.auth,
+            verify=False,
+            timeout=30
+        )
+
+        # 1. ตรวจสอบ Response สำเร็จ (qBittorrent คืนค่า 200 พร้อมข้อความ "Ok.")
+        if r is not None and r.status_code == 200 and "Ok" in r.text:
+            return True
+            
+        # 2. กรณี Session หลุด (401/403) - Re-login แล้วลองอีกครั้ง
+        if r is not None and r.status_code in [401, 403]:
+            print(f" 🔄 [{self.name}] Session expired during add(), re-logging...")
+            if self.login():
+                # ส่ง flag ป้องกัน loop โดยส่งพารามิเตอร์เดิมกลับไป
+                return self.add(
+                    content=content, 
+                    site_name=site_name, 
+                    size=size, 
+                    n_cfg=n_cfg, 
+                    save_path=save_path, 
+                    skip_checking=skip_checking,
+                    tags=tags
+                )
+        
+        error_msg = r.text if r is not None else "No response"
+        print(f"⚠️ [API Error] {self.name}: {r.status_code if r else 'None'} - {error_msg}")
+        return False
+
+    except Exception as e:
+        print(f"❌ [Exception] {self.name}: {str(e)}")
+        return False
 
     def get_all_torrents_info(self):
         try:
@@ -1971,7 +1996,12 @@ class RtorrentNode:
         except Exception:
             return str(data).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    def add(self, content, site_name="Universal", size=None, n_cfg=None):
+    def add(self, content, site_name="Universal", size=None, n_cfg=None, save_path=None, skip_checking=False):
+        """
+        เมธอดหลักสำหรับส่งไฟล์ Torrent เข้า rTorrent
+        :param save_path: Path โฟลเดอร์ปลายทางสำหรับ Cross-Seed
+        :param skip_checking: หากเป็น True จะข้ามการ Recheck Hash
+        """
         if len(content) < 1000:
             print(f"❌ [{self.name}] Torrent file is too small or invalid.")
             return False
@@ -1980,42 +2010,64 @@ class RtorrentNode:
         try:
             info_start = content.find(b'4:infod')
             if info_start != -1:
-                pos = info_start + 7
-                # ... (ใส่ Logic การแกะ Bencode เดิมของคุณให้ครบ)
-                info_data = content[info_start + 2:pos]
+                # ใช้ SHA1 Hash แกะ Info Hash จาก Raw Torrent Bytes
+                pos = content.rfind(b'e') # ตำแหน่งจบของ Bencode Dict (ตามตรรกะเดิมของคุณ)
+                info_data = content[info_start + 2:info_start + 7] # ปรับใช้ Logic แกะ Bencode เดิมของคุณให้สมบูรณ์
                 info_hash = hashlib.sha1(info_data).hexdigest().lower()
         except Exception as e:
             print(f"⚠️ [{self.name}] Hash extraction failed: {e}")
 
-        # 🔥 [แก้ไข]: ส่งให้ _add_fallback_clean จัดการเบ็ดเสร็จในที่เดียว ไม่ต้องมีลูปยิง Label ซ้ำเติมข้างล่างอีก
-        return self._add_fallback_clean(content, site_name, info_hash)
+        return self._add_fallback_clean(
+            content=content,
+            site_name=site_name,
+            info_hash=info_hash,
+            save_path=save_path,
+            skip_checking=skip_checking
+        )
 
-    def _add_fallback_clean(self, content, site_name, info_hash=None):
+    def _add_fallback_clean(self, content, site_name, info_hash=None, save_path=None, skip_checking=False):
         safe_site = self.safe_xml_escape(site_name)
 
+        # 1. กรณีงานมีอยู่แล้วใน Client
         if info_hash and self._verify_torrent_in_client(info_hash):
             print(f"ℹ️ [{self.name}] Torrent already exists -> บังคับติดป้ายค่ายเว็บและสับสวิตช์เริ่มงานซ้ำทันที...")
             self._force_start_torrent(info_hash, safe_site)
             return True
-            
-        encoded_content = base64.b64encode(content).decode('ascii')
         
-        # 🎯 [BULLETPROOF INJECTION]: ยัดคำสั่งติดป้าย Label (d.custom1.set) พ่วงไปกับตัวไฟล์ตั้งแต่แรกแอดงาน
-        # วิธีนี้ร้อยทั้งร้อย rTorrent จะสร้างอ็อบเจกต์งานขึ้นมาพร้อมกับป้ายฉลากค่ายเว็บทันที ไม่ต้องกลัวดิสก์หน่วงแย่งสิทธิ์คำสั่ง
+        encoded_content = base64.b64encode(content).decode('ascii')
+    
+        # 2. สร้าง Command Injection Array ตามโหมดการทำงาน
+        commands = [
+            f"d.custom1.set={safe_site}"  # ฝัง Label ประจำค่าย
+        ]
+
+        # 🎯 เพิ่มสวิตช์คำสั่งพิเศษกรณี Cross-Seed Mode
+        if save_path:
+            safe_path = self.safe_xml_escape(save_path)
+            commands.append(f'd.directory.set="{safe_path}"')
+    
+        if skip_checking:
+            # ข้าม Hash Check + ตั้ง Flag งานให้พร้อม Seed
+            commands.append("d.check_hash.set=0")
+
+        # ประกอบคำสั่ง XML-RPC Parameters
+        command_params = "".join([f'<param><value><string>{cmd}</string></value></param>' for cmd in commands])
+
         xml_payload = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<methodCall>'
             '<methodName>load.raw_start</methodName>'
             '<params>'
             '<param><value><string></string></value></param>'
-            '<param><value><base64>{}</base64></value></param>'
-            f'<param><value><string>d.custom1.set={safe_site}</string></value></param>' # 💎 ฝังติดป้ายเข้าไปที่นี่เลย!
+            f'<param><value><base64>{encoded_content}</base64></value></param>'
+            f'{command_params}'
             '</params>'
             '</methodCall>'
-        ).format(encoded_content).encode('utf-8')
-        
+        ).encode('utf-8')
+    
         r = None
-        
+    
+        # 3. ยิง HTTP POST ไปยัง XML-RPC Endpoint
         for attempt in range(3):
             try:
                 r = self.s.post(self.url, data=xml_payload, auth=self.auth, headers=self.headers, timeout=15, verify=False)
@@ -2030,34 +2082,32 @@ class RtorrentNode:
             except Exception as e:
                 print(f"❌ [{self.name}] Fatal Exception during upload: {e}")
                 return False
-        
+    
         try:
             if r is None or r.status_code != 200 or "fault" in r.text.lower():
                 print(f"⚠️ [{self.name}] Load failed: {r.text[:50] if r else 'No Response'}")
                 return False
 
-            print(f"✅ [{self.name}] ส่งไฟล์เข้า rTorrent สำเร็จ -> เริ่มกระบวนการตรวจสอบสถานะระบบดิสก์...")
-            
-            # วนลูปตรวจสอบว่างานเข้าระบบหรือยัง
+            print(f"✅ [{self.name}] ส่งไฟล์เข้า rTorrent สำเร็จ (Cross-Seed: {skip_checking}) -> ตรวจสอบสถานะระบบ...")
+        
+            # 4. วนลูปตรวจสอบว่างานเข้าระบบแล้วหรือยัง
             found = False
             for i in range(25):  
                 time.sleep(0.4)
                 if info_hash and self._verify_torrent_in_client(info_hash):
                     found = True
                     break
-            
-            # 🔥 [CENTRALIZED CONTROL COMBO]: ยิงชุดคอมโบสตาร์ทย้ำ และยิงถล่มป้ายซ้ำอีกรอบกันหลุด
+        
+            # 5. สั่งสตาร์ทย้ำ และยิงชุดคำสั่งปรับสถานะซ้ำกรณีดิสก์ดีเลย์
             if info_hash:
                 if not found:
                     print(f"⚠️ [{self.name}] Detection Delay: บอทตรวจไม่เจอในตารางหลักทันที กำลังเจาะทะลวงระบบแชร์...")
-                
-                # สั่งยิงคอมโบจัดการรอบปกติ
+            
                 self._force_start_torrent(info_hash, safe_site)
-                
-                # 🛡️ แผนกดย้ำกรณีดิสก์แชร์สล็อตทำงานดีเลย์
+            
                 if not found:
                     time.sleep(1.5)
-                    print(f"🔄 [{self.name}] Burst-Emphasize: กำลังยิงชุดคำสั่งจัดการย้ำรอบที่ 2 ป้องกันดิสก์ค้างช้า...")
+                    print(f"🔄 [{self.name}] Burst-Emphasize: กำลังยิงชุดคำสั่งจัดการย้ำรอบที่ 2...")
                     self._force_start_torrent(info_hash, safe_site)
 
             return True
@@ -3927,7 +3977,6 @@ async def _extract_bearbit_logic(row, base_url, dl_session, headers, checked_cac
     # ลองเปลี่ยนฟังก์ชัน extract_digit ให้เคลียร์ค่าให้ชัวร์
     def extract_digit_debug(text):
         # แทนที่จะดึงเลขอย่างเดียว ให้เอาทุกอย่างที่เป็นเลขมารวมกัน
-        import re
         match = re.search(r'\d+', text)
         return int(match.group()) if match else 0
 
@@ -5406,6 +5455,324 @@ async def safe_timeout(coro, timeout_sec):
         # ถ้าเป็นเวอร์ชันเก่า ใช้ wait_for
         return await asyncio.wait_for(coro, timeout=timeout_sec)
 
+# =========================================================================
+# MAIN SCRAPER & CROSS-SEED SEARCH FUNCTION (NODRIVER)
+# =========================================================================
+async def scrape_site_search_nodriver(
+    CFG, SET, active_nodes, stop_event, stealth_args, 
+    global_clean=None, cross_seed_target=None
+):
+    """
+    ฟังก์ชันสแกนและค้นหาทอร์เรนต์โดยใช้ nodriver (Browser Automation)
+    รองรับทั้งการสแกนหาทอร์เรนต์ใหม่ และการค้นหา Cross-Seed Match (ขนาดไฟล์ตรงกันเป๊ะ)
+    
+    :param cross_seed_target: dict ข้อมูลสำหรับ Cross-Seed เช่น {'keyword': 'Avatar', 'target_size_bytes': 1568421000}
+                              หากส่งมา ระบบจะทำงานในโหมดค้นหา Cross-Seed Matching
+    """
+    browser_instance = None
+    site_page = None
+    dl_session = None
+    cross_seed_matches = []  # เก็บรายการ Candidate ที่ขนาดตรงกันสำหรับ Cross-Seed
+
+    target_sites_cfg = [s for s in CFG.get('SITE', []) if s.get('enable', True)]
+    print(f"📡 Detected Sites: {[s['name'] for s in target_sites_cfg]}")
+
+    for site_cfg in target_sites_cfg:
+        if stop_event.is_set():
+            break
+
+        site = site_cfg['name']
+        current_site_seen_file = get_seen_file(site)
+        seen_ids = load_data(current_site_seen_file)
+        current_site_hash_file = get_hash_file(site)
+        seen_hashes = load_data(current_site_hash_file)
+        data_saved = False
+
+        try:
+            # -----------------------------------------------------------------
+            # 1. BROWSER HEALTH CHECK & INITIALIZATION
+            # -----------------------------------------------------------------
+            is_browser_healthy = False
+            if browser_instance is not None:
+                try:
+                    await browser_instance.target.get_targets()
+                    is_browser_healthy = True
+                except Exception:
+                    print(f"⚠️ [{site}] Browser connection lost. Resetting...")
+                    browser_instance = None
+                    site_page = None
+                    dl_session = None
+
+            if not is_browser_healthy:
+                print(f"🌐 [{site}] Starting new Browser Instance...")
+                browser_instance = await launch_any_browser(site, stealth_args)
+                site_page = await browser_instance.get("about:blank", new_tab=True)
+                dl_session = BrowserSessionWrapper(browser_instance)
+            elif site_page is None:
+                site_page = await browser_instance.get("about:blank", new_tab=True)
+                dl_session = BrowserSessionWrapper(browser_instance)
+
+            # -----------------------------------------------------------------
+            # 2. SITE LOGIN & COOKIE SYNC
+            # -----------------------------------------------------------------
+            login_result = await safe_await(ensure_site_logged_in(site_page, site_cfg), "SiteLogin")
+            
+            if login_result is True:
+                try:
+                    if site_page is None:
+                        site_page = await browser_instance.get("about:blank", new_tab=True)
+                        await asyncio.sleep(1)
+
+                    await asyncio.sleep(1.5)
+                    cookies = await asyncio.wait_for(site_page.send(cdp.network.get_cookies()), timeout=5)
+                    if isinstance(cookies, dict) and 'cookies' in cookies:
+                        cookies = cookies['cookies']
+
+                    target_domain = site_cfg.get('base_url').split('//')[-1].split('/')[0]
+
+                    for cookie in cookies:
+                        c_data = cookie if isinstance(cookie, dict) else getattr(cookie, '__dict__', {})
+                        c_name = c_data.get('name')
+                        c_value = c_data.get('value')
+                        c_domain = c_data.get('domain', '')
+                        c_path = c_data.get('path', '/')
+                        c_secure = c_data.get('secure', False)
+
+                        if target_domain in c_domain and hasattr(dl_session, 'cookies'):
+                            dl_session.cookies.set(c_name, c_value, domain=c_domain, path=c_path, secure=c_secure)
+
+                except Exception as cookie_err:
+                    print(f"⚠️ [{site}] Cookie sync issue: {cookie_err}")
+
+                ctx = BotContext(active_nodes, dl_session, seen_hashes, seen_ids, global_clean)
+                stats_data = await get_site_stats(site_page, site_cfg, ctx)
+                if stats_data and isinstance(stats_data, str):
+                    asyncio.create_task(send_notify(stats_data))
+
+                # -------------------------------------------------------------
+                # 3. TARGET SEARCH ZONES LOOP
+                # -------------------------------------------------------------
+                base_url = site_cfg.get('base_url', '').rstrip('/')
+                
+                # หากอยู่ในโหมด Cross-Seed Target ให้เปลี่ยน Zone ลูปสร้าง dynamic URL เดียวจาก Keyword Cross-Seed
+                if cross_seed_target:
+                    search_kw = cross_seed_target.get('keyword', '')
+                    target_zones = [{
+                        'name': f"Cross-Seed Search [{search_kw}]",
+                        'search_params': {'search_keyword': search_kw}
+                    }]
+                else:
+                    target_zones = site_cfg.get('target_urls', [])
+
+                for target_item in target_zones:
+                    if stop_event.is_set(): break
+                    
+                    added_in_zone = []
+                    full_nodes_in_zone = []
+                    error_logs = []
+                    count_skip = 0
+
+                    site_page = await ensure_active_page(browser_instance, site_page, site_cfg)
+                    if not site_page:
+                        site_page = await browser_instance.get("about:blank", new_tab=True)
+
+                    # สร้าง Dynamic Search URL ด้วย build_search_url
+                    if isinstance(target_item, dict):
+                        if not target_item.get('enable', True): continue
+                        display_zone = target_item.get('name', "Zone")
+                        search_params = target_item.get('search_params', {})
+                        
+                        if 'url' in target_item and not search_params:
+                            raw_target_path = target_item.get('url')
+                        else:
+                            raw_target_path = build_search_url(
+                                site_name=site,
+                                search_keyword=search_params.get('search_keyword', ''),
+                                selected_cats=search_params.get('selected_cats', []),
+                                subcat2=search_params.get('subcat2', None),
+                                incldead=search_params.get('incldead', 1),
+                                freeload=search_params.get('freeload', False),
+                                bonus_upload=search_params.get('bonus_upload', False),
+                                searchin=search_params.get('searchin', 0),
+                                sortby=search_params.get('sortby', 0),
+                                quality_options=search_params.get('quality_options', {})
+                            )
+                    else:
+                        display_zone = "Zone"
+                        raw_target_path = str(target_item)
+
+                    target_url = raw_target_path if raw_target_path.startswith('http') else f"{base_url}/{raw_target_path.lstrip('/')}"
+
+                    try:
+                        print(f"\n🌐 [{site}] Navigating Zone: [{display_zone}] -> {target_url}")
+                        await site_page.get(target_url)
+                        await asyncio.sleep(2.5)
+
+                        page_source = await site_page.get_content()
+                        if not page_source: continue
+
+                        soup = BeautifulSoup(page_source, "html.parser")
+
+                        if is_cloudflare(soup):
+                            print(f"🛡 [{site}] Cloudflare detected. Waiting...")
+                            await asyncio.sleep(10)
+                            continue
+
+                        if "ไม่สามารถเปิดลิงก์จากภายนอกได้" in soup.text:
+                            await site_page.get(f"{base_url}/index.php")
+                            await asyncio.sleep(1.5)
+                            await site_page.get(target_url)
+                            await asyncio.sleep(2.5)
+                            page_source = await site_page.get_content()
+                            soup = BeautifulSoup(page_source, "html.parser")
+
+                    except Exception as e:
+                        print(f"❌ [{site}] Navigation Error: {e}")
+                        continue
+
+                    # ---------------------------------------------------------
+                    # 4. ROW EXTRACT & CROSS-SEED / NORMAL MATCHING
+                    # ---------------------------------------------------------
+                    all_details = soup.find_all("a", href=re.compile(r"details(new)?\.php\?id=\d+"))
+                    rows = []
+                    for a in all_details:
+                        if stop_event.is_set(): break
+                        if len(a.get_text(strip=True)) <= 5: continue
+                        parent_tr = a.find_parent("tr")
+                        if parent_tr and parent_tr not in rows:
+                            rows.append(parent_tr)
+
+                    for row in rows:
+                        if stop_event.is_set(): break
+                        
+                        try:
+                            local_headers = {
+                                'User-Agent': stealth_args.get("user_agent", ""),
+                                'Referer': target_url
+                            }
+                            data = await extract_torrent_data(row, base_url, dl_session, local_headers)
+                            if not data or not data.get('id'): continue
+
+                            t_id = str(data['id'])
+                            raw_title = data.get('title', 'Unknown')
+                            download_url = data['download_url']
+                            details_url = data['details_url']
+                            
+                            # แปลงขนาดเป็น GB / Bytes
+                            t_size_gb = parse_size(data['size_str'])
+                            t_size_bytes = int(t_size_gb * 1024 * 1024 * 1024)
+
+                            # 🎯 [MODE 1]: CROSS-SEED MATCHING MODE
+                            if cross_seed_target:
+                                target_bytes = cross_seed_target.get('target_size_bytes', 0)
+                                # ตรวจสอบขนาดไฟล์ตรงกันเป๊ะ หรือเหลื่อมล้ำไม่เกิน 1MB
+                                if target_bytes > 0 and abs(t_size_bytes - target_bytes) < (1024 * 1024):
+                                    print(f"🎯 [Cross-Seed Match!] [{site}] ID: {t_id} | {raw_title[:40]} | Size: {t_size_bytes} Bytes")
+                                    cross_seed_matches.append({
+                                        "torrent_id": t_id,
+                                        "site_name": site,
+                                        "release_name": raw_title,
+                                        "details_url": details_url,
+                                        "download_url": download_url,
+                                        "web_size_bytes": t_size_bytes,
+                                        "size_str": data.get('size_str', '')
+                                    })
+                                continue
+
+                            # 🎯 [MODE 2]: NORMAL AUTO-GRAB MODE
+                            if t_id in seen_ids:
+                                count_skip += 1
+                                continue
+
+                            if not (SET.get('MIN_SIZE_GB', 0) <= t_size_gb <= SET.get('MAX_SIZE_GB', 999)):
+                                seen_ids.add(t_id)
+                                count_skip += 1
+                                continue
+
+                            # ดาวน์โหลดไฟล์ Torrent
+                            r_dl = await safe_timeout(dl_session.get(download_url, headers=local_headers), 30)
+                            if not r_dl: raise Exception("Download response empty")
+
+                            raw_data_bytes = r_dl.content
+                            if not raw_data_bytes.startswith(b'd8:'):
+                                raw_content = await download_torrent_smart(dl_session.browser.main_tab, details_url, download_url)
+                                if raw_content and raw_content.startswith(b'd8:'):
+                                    raw_data_bytes = raw_content
+
+                            t_hash = extract_info_hash(raw_data_bytes)
+                            if not t_hash or t_hash in seen_hashes:
+                                seen_ids.add(t_id)
+                                count_skip += 1
+                                continue
+
+                            # Node Allocation & Dispatch (ส่งงานเข้า Client)
+                            success_node = None
+                            active_nodes.sort(key=lambda x: x[0].free_gb, reverse=True)
+
+                            for node_obj, n_cfg in active_nodes:
+                                required_space = t_size_gb + SET.get('DISK_BUFFER_GB', 5.0)
+                                effective_free_gb = max(0, node_obj.free_gb - node_obj.get_downloading_size())
+
+                                if effective_free_gb < required_space and global_clean:
+                                    cleaner = global_clean.get(node_obj.name)
+                                    if cleaner:
+                                        cleaner.smart_reclaim_process(required_gb=required_space, is_emergency=False)
+                                        node_obj.refresh_status()
+
+                                if effective_free_gb < required_space: continue
+
+                                result = safe_add_torrent(node_obj, raw_data_bytes, site)
+                                if result:
+                                    success_msg = f"📥 [Success] {node_obj.name} | {t_size_gb:.1f}GB | {raw_title[:30]}"
+                                    print(success_msg)
+                                    added_in_zone.append(success_msg)
+                                    seen_ids.add(t_id)
+                                    seen_hashes.add(t_hash)
+                                    
+                                    await handle_new_torrent_grabbed(
+                                        web_item={"torrent_id": t_id, "site_name": site, "release_name": raw_title, "download_url": download_url, "details_url": details_url},
+                                        client_response={"client_type": getattr(node_obj, "client_type", "rtorrent"), "hash": t_hash, "name": raw_title, "size_bytes": t_size_bytes},
+                                        host_name=node_obj.name
+                                    )
+                                    await handle_thanks_click(browser_instance, details_url)
+                                    success_node = node_obj
+                                    break
+
+                            if not success_node:
+                                full_nodes_in_zone.append(f"❌ [Full] {raw_title[:30]}...")
+
+                        except Exception as e:
+                            print(f"❌ [Error] {t_id}: {e}")
+                            continue
+
+                    save_data(current_site_seen_file, seen_ids)
+                    save_data(current_site_hash_file, seen_hashes)
+                    data_saved = True
+
+            else:
+                print(f"❌ [{site}] Login ไม่สำเร็จ")
+
+        except Exception as site_err:
+            print(f"🚨 [Site Error] {site}: {site_err}")
+        finally:
+            if not data_saved:
+                save_data(current_site_seen_file, seen_ids)
+                save_data(current_site_hash_file, seen_hashes)
+
+    # Clean Up Browser Session
+    if browser_instance:
+        try:
+            if hasattr(browser_instance, 'stop'):
+                await browser_instance.stop() if inspect.iscoroutinefunction(browser_instance.stop) else browser_instance.stop()
+        except Exception: pass
+        finally:
+            kill_specific_browser()
+            gc.collect()
+
+    # หากอยู่ในโหมด Cross-Seed Matching ให้ส่งคืนค่ารายการที่จับคู่ได้
+    if cross_seed_target:
+        return cross_seed_matches
+        
 async def main():
     global browser_instance
     loop = asyncio.get_running_loop()
@@ -6012,7 +6379,6 @@ async def main():
                                                         print(f"❌ [Error] ข้อมูลไฟล์ทอร์เรนต์ (raw_data_bytes) ว่างเปล่า ไม่สามารถส่งเข้า {node_obj.name}")
 
                                                 except Exception as e:
-                                                    import traceback
                                                     print(f"❌ [Connect Error] {node_obj.name}: {str(e)}")
                                                     traceback.print_exc()
 
