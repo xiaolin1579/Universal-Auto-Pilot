@@ -655,87 +655,6 @@ def process_cross_seed_linking(mapping_data):
     print(f"🔗 [Cross-Seed] เชื่อมโยงไฟล์สำเร็จ ({linked_groups_count} กลุ่ม จากทั้งหมด {len(file_groups)} รายการ)")
     return mapping_data
 
-async def reverse_cross_seed_from_existing_files(active_nodes, scraped_web_items, mapping_data, mapper_func):
-    """
-    ระบบค้นหาไฟล์จากเว็บโดยเทียบจากไฟล์ที่มีอยู่แล้วใน Seedbox
-    - active_nodes: รายการโหนดที่กำลังทำงานอยู่
-    - scraped_web_items: รายการทอร์เรนต์ทั้งหมดที่กวาดมาจากหน้าเว็บในรอบล่าสุด
-    - mapping_data: ข้อมูล mapping ปัจจุบัน
-    """
-    torrents_in_mapping = mapping_data.get('torrents', [])
-    matched_count = 0
-    
-    # สร้าง Index รายการเว็บเพื่อค้นหาได้รวดเร็ว (เทียบด้วยขนาดไฟล์หรือชื่อ)
-    web_catalog_by_size = {}
-    for item in scraped_web_items:
-        sz = item.get('size_bytes', 0)
-        if sz > 0:
-            if sz not in web_catalog_by_size:
-                web_catalog_by_size[sz] = []
-            web_catalog_by_size[sz].append(item)
-
-    for node_obj, n_cfg in active_nodes:
-        # กรองทอร์เรนต์เฉพาะโหนอนี้ที่ดาวน์โหลดเสร็จแล้ว
-        completed_torrents = [
-            t for t in torrents_in_mapping 
-            if t.get('seedbox_host') == node_obj.name and t.get('state', '').lower() in ['completed', 'seeding', 'uploading']
-        ]
-        
-        for local_t in completed_torrents:
-            t_size = local_t.get('size_bytes', 0)
-            save_path = local_t.get('save_path', '')
-            existing_links = [h.lower() for h in local_t.get('cross_seed_links', [])]
-            local_hash = local_t.get('hash', '').lower()
-            
-            if not save_path or t_size not in web_catalog_by_size:
-                continue
-                
-            # ค้นหาทอร์เรนต์บนเว็บที่มีขนาดเท่ากัน
-            candidates = web_catalog_by_size[t_size]
-            for web_item in candidates:
-                web_hash = web_item.get('hash', '').lower()
-                
-                # เงื่อนไข: ต้องไม่ใช่ Hash เดิม และยังไม่เคยลิงก์กัน
-                if web_hash != local_hash and web_hash not in existing_links:
-                    print(f"🎯 [Reverse Cross-Seed] พบไฟล์ตรงกันจากเว็บอื่นสำหรับโหนด {node_obj.name}!")
-                    print(f"   📁 ไฟล์เดิม: {local_t.get('name')}")
-                    print(f"   🌐 พบในเว็บ: {web_item.get('release_name')} (Site: {web_item.get('site_name')})")
-                    
-                    # 1. ดาวน์โหลดไฟล์ .torrent จากเว็บเป้าหมาย
-                    torrent_bytes = await download_torrent_file(web_item.get('download_url'))
-                    
-                    if torrent_bytes:
-                        # 2. สั่งแอดเข้า Seedbox ที่ path เดิม โดยตั้งสถานะเป็น Pause เพื่อรอ Recheck
-                        add_success = node_obj.add_torrent_with_path(
-                            torrent_bytes=torrent_bytes,
-                            save_path=save_path,
-                            paused=True
-                        )
-                        
-                        if add_success:
-                            matched_count += 1
-                            # 3. บันทึกความสัมพันธ์ลง cross_seed_links
-                            local_t.setdefault('cross_seed_links', []).append(web_item.get('hash'))
-                            
-                            # อัปเดตข้อมูลลง mapping ทันที
-                            client_data = {
-                                "client_type": getattr(node_obj, "client_type", "qbittorrent"),
-                                "hash": web_hash,
-                                "name": web_item.get('release_name'),
-                                "size_bytes": t_size,
-                                "state": "paused",
-                                "ratio": 0.0
-                            }
-                            node_data = {
-                                "seedbox_host": node_obj.name,
-                                "save_path": save_path
-                            }
-                            await mapper_func(client_data=client_data, web_data=web_item, node_data=node_data)
-
-    if matched_count > 0:
-        print(f"✨ [Reverse Cross-Seed] ดึงข้อมูลจากเว็บมาประกบคู่ไฟล์เดิมสำเร็จทั้งหมด {matched_count} รายการ")
-    return matched_count
-
 # ========================= BROWSER ENGINE =========================
 
 def get_browser_path_or_fail(override_path=None):
@@ -5148,29 +5067,38 @@ def reset_bot_config_to_default():
         CFG['SETTING']['EXCLUDE_WEB_FREE'] = True
         print(f"❌ Error resetting config to default: {e}")
 
-async def auto_vote_snatched(page: uc.Tab, base_url: str, site_name: str = "BEARBIT") -> bool:
+async def auto_vote_snatched(page, base_url: str, site_name: str = "BEARBIT") -> bool:
     try:
         max_p = 5
         total_voted = 0
-        snatch_url = f"{base_url.rstrip('/')}/snatchdown.php"
+        clean_base = base_url.rstrip('/')
+        snatch_url = f"{clean_base}/snatchdown.php"
         
         print(f"🗳️ [{site_name}] เริ่มระบบ Auto-Vote...")
         
         # 1. บังคับเปลี่ยน URL และรอจนโหลดเสร็จจริงๆ
         await page.get(snatch_url)
-        await asyncio.sleep(3) # รอให้แน่ใจว่าหน้าโหลดครบ
+        await asyncio.sleep(2.5)
         
         vote_img_selector = 'img[src*="v5.1.1.png"], img[title="ยอดเยี่ยม"]'
         
         for p_idx in range(1, max_p + 1):
-            # 2. ป้องกันกรณีหลุดไปหน้าอื่น (เช็ค URL ทุกครั้งก่อนเริ่ม Loop)
-            current_url = await page.evaluate("window.location.href")
+            # 2. ตรวจสอบและดึง Tab กลับหากหลุด URL หลัก
+            try:
+                current_url = await page.evaluate("window.location.href")
+            except Exception:
+                current_url = ""
+
             if "snatchdown.php" not in current_url:
                 print(f"⚠️ [{site_name}] ตรวจพบการแทรกแซง! กำลังดึง Tab กลับมาที่ Snatchdown...")
-                await page.get(snatch_url)
-                await asyncio.sleep(3)
+                await page.get(f"{snatch_url}?page={p_idx}")
+                await asyncio.sleep(2.5)
 
-            all_vote_btns = await page.select_all(vote_img_selector)
+            # Query ปุ่มโหวตในหน้านั้นๆ
+            try:
+                all_vote_btns = await page.select_all(vote_img_selector)
+            except Exception:
+                all_vote_btns = []
             
             if not all_vote_btns:
                 print(f"✅ [{site_name}] หน้า {p_idx} ไม่มีรายการค้าง - ตรวจสอบเสร็จสิ้น")
@@ -5178,24 +5106,49 @@ async def auto_vote_snatched(page: uc.Tab, base_url: str, site_name: str = "BEAR
                 
             print(f"🔍 [{site_name}] พบ {len(all_vote_btns)} รายการ (หน้า {p_idx})")
             
-            for vote_btn in all_vote_btns:
+            # 3. กดคลิกโหวตทีละรายการแบบใช้ JS / Safe Click เพื่อป้องกัน Node -32000
+            for i in range(len(all_vote_btns)):
                 try:
-                    await vote_btn.click()
+                    # ค้นหา Element ณ วินาทีนั้นๆ ใหม่เพื่อป้องกัน Node ID หมดอายุ
+                    fresh_btns = await page.select_all(vote_img_selector)
+                    if not fresh_btns or i >= len(fresh_btns):
+                        break
+                    
+                    target_btn = fresh_btns[i]
+                    await target_btn.click()
                     total_voted += 1
-                    await asyncio.sleep(random.uniform(0.8, 1.5))
-                except Exception:
-                    continue
+                    await asyncio.sleep(random.uniform(0.8, 1.2))
+                except Exception as click_err:
+                    # หาก Node หลุด ให้ลองใช้ JS Click สำรอง
+                    try:
+                        await page.evaluate(f'''
+                            let btns = document.querySelectorAll('{vote_img_selector}');
+                            if (btns[{i}]) {{ btns[{i}].click(); }}
+                        ''')
+                        total_voted += 1
+                        await asyncio.sleep(1.0)
+                    except Exception:
+                        continue
             
-            # 3. เช็คปุ่มถัดไป
-            next_btn = await page.select('img[src*="nextpage.gif"]')
-            if not next_btn or p_idx >= max_p:
+            # 4. เช็คและเปลี่ยนไปหน้าถัดไป
+            if p_idx >= max_p:
                 break
-            
-            print(f"➡️ ไปหน้า {p_idx + 1}...")
-            await next_btn.click()
-            await asyncio.sleep(4.0) 
+
+            try:
+                next_btn = await page.select('img[src*="nextpage.gif"]')
+                if not next_btn:
+                    break
+                
+                print(f"➡️ ไปหน้า {p_idx + 1}...")
+                await next_btn.click()
+                await asyncio.sleep(3.0)
+            except Exception as nav_err:
+                # กรณีคลิกปุ่ม Next แล้วเจอ Error Node -32000 ให้ใช้วิธี Navigate ตรงผ่าน URL
+                print(f"🔄 [{site_name}] สลับใช้วิธีเปิด URL หน้า {p_idx + 1} โดยตรง...")
+                await page.get(f"{snatch_url}?page={p_idx + 1}")
+                await asyncio.sleep(3.0)
         
-        # ส่วน Notify
+        # 5. ระบบแจ้งเตือน (Notify)
         notify_fn = globals().get('send_notify')
         if callable(notify_fn):
             msg = f"🗳️ <b>[{site_name}]</b> Auto-Vote สำเร็จ: <b>{total_voted}</b> รายการ" if total_voted > 0 else f"🗳️ <b>[{site_name}]</b> Auto-Vote : สถานะสะอาดเรียบร้อย ✨"
@@ -5208,6 +5161,7 @@ async def auto_vote_snatched(page: uc.Tab, base_url: str, site_name: str = "BEAR
     except Exception as e:
         print(f"❌ [{site_name}] Vote Error: {e}")
         return False
+
     return True
     
 # ========================= Smart Node Controller =========================
@@ -5509,21 +5463,16 @@ async def safe_timeout(coro, timeout_sec):
 # =========================================================================
 # MAIN SCRAPER & CROSS-SEED SEARCH FUNCTION (NODRIVER)
 # =========================================================================
-async def scrape_site_search_nodriver(
-    CFG, SET, active_nodes, stop_event, stealth_args, 
-    global_clean=None, cross_seed_target=None
-):
+
+async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealth_args, global_clean=None, cross_seed_target=None):
     """
     ฟังก์ชันสแกนและค้นหาทอร์เรนต์โดยใช้ nodriver (Browser Automation)
-    รองรับทั้งการสแกนหาทอร์เรนต์ใหม่ และการค้นหา Cross-Seed Match (ขนาดไฟล์ตรงกันเป๊ะ)
-    
-    :param cross_seed_target: dict ข้อมูลสำหรับ Cross-Seed เช่น {'keyword': 'Avatar', 'target_size_bytes': 1568421000}
-                              หากส่งมา ระบบจะทำงานในโหมดค้นหา Cross-Seed Matching
+    รวมถึงการจัดการ Smart Download และคัดเลือก Node ตาม Capacity / Space
     """
     browser_instance = None
     site_page = None
     dl_session = None
-    cross_seed_matches = []  # เก็บรายการ Candidate ที่ขนาดตรงกันสำหรับ Cross-Seed
+    cross_seed_matches = []  # สำหรับโหมด Cross-Seed
 
     target_sites_cfg = [s for s in CFG.get('SITE', []) if s.get('enable', True)]
     print(f"📡 Detected Sites: {[s['name'] for s in target_sites_cfg]}")
@@ -5572,25 +5521,35 @@ async def scrape_site_search_nodriver(
                 try:
                     if site_page is None:
                         site_page = await browser_instance.get("about:blank", new_tab=True)
-                        await asyncio.sleep(1)
+                    
+                    await asyncio.sleep(1)
+                    
+                    # Sync Cookies เข้า dl_session
+                    if hasattr(browser_instance, 'cookies'):
+                        all_cookies = await browser_instance.cookies.get_all()
+                        raw_domain = site_cfg.get('base_url', '').split('//')[-1].split('/')[0].split(':')[0]
+                        base_domain = raw_domain.lstrip('.')
 
-                    await asyncio.sleep(1.5)
-                    cookies = await asyncio.wait_for(site_page.send(cdp.network.get_cookies()), timeout=5)
-                    if isinstance(cookies, dict) and 'cookies' in cookies:
-                        cookies = cookies['cookies']
+                        synced_count = 0
+                        for c in all_cookies:
+                            is_dict = isinstance(c, dict)
+                            c_name = c.get('name') if is_dict else getattr(c, 'name', None)
+                            c_value = c.get('value') if is_dict else getattr(c, 'value', None)
+                            c_domain = (c.get('domain') if is_dict else getattr(c, 'domain', '')) or ''
+                            c_path = (c.get('path') if is_dict else getattr(c, 'path', '/')) or '/'
+                            c_secure = c.get('secure', False) if is_dict else getattr(c, 'secure', False)
 
-                    target_domain = site_cfg.get('base_url').split('//')[-1].split('/')[0]
+                            if not c_name or not c_value:
+                                continue
 
-                    for cookie in cookies:
-                        c_data = cookie if isinstance(cookie, dict) else getattr(cookie, '__dict__', {})
-                        c_name = c_data.get('name')
-                        c_value = c_data.get('value')
-                        c_domain = c_data.get('domain', '')
-                        c_path = c_data.get('path', '/')
-                        c_secure = c_data.get('secure', False)
+                            clean_c_domain = c_domain.lstrip('.')
+                            if base_domain in clean_c_domain or clean_c_domain in base_domain:
+                                if hasattr(dl_session, 'cookies'):
+                                    dl_session.cookies.set(c_name, c_value, domain=c_domain, path=c_path, secure=c_secure)
+                                    dl_session.cookies.set(c_name, c_value, path=c_path)
+                                    synced_count += 1
 
-                        if target_domain in c_domain and hasattr(dl_session, 'cookies'):
-                            dl_session.cookies.set(c_name, c_value, domain=c_domain, path=c_path, secure=c_secure)
+                        print(f"✅ [{site}] Synchronized {synced_count} cookies to HTTP session successfully.")
 
                 except Exception as cookie_err:
                     print(f"⚠️ [{site}] Cookie sync issue: {cookie_err}")
@@ -5598,6 +5557,7 @@ async def scrape_site_search_nodriver(
                 ctx = BotContext(active_nodes, dl_session, seen_hashes, seen_ids, global_clean)
                 stats_data = await get_site_stats(site_page, site_cfg, ctx)
                 if stats_data and isinstance(stats_data, str):
+                    print(stats_data)
                     asyncio.create_task(send_notify(stats_data))
 
                 # -------------------------------------------------------------
@@ -5605,7 +5565,6 @@ async def scrape_site_search_nodriver(
                 # -------------------------------------------------------------
                 base_url = site_cfg.get('base_url', '').rstrip('/')
                 
-                # หากอยู่ในโหมด Cross-Seed Target ให้เปลี่ยน Zone ลูปสร้าง dynamic URL เดียวจาก Keyword Cross-Seed
                 if cross_seed_target:
                     search_kw = cross_seed_target.get('keyword', '')
                     target_zones = [{
@@ -5616,20 +5575,20 @@ async def scrape_site_search_nodriver(
                     target_zones = site_cfg.get('target_urls', [])
 
                 for target_item in target_zones:
-                    if stop_event.is_set(): break
+                    if stop_event.is_set(): 
+                        break
                     
                     added_in_zone = []
                     full_nodes_in_zone = []
-                    error_logs = []
                     count_skip = 0
 
                     site_page = await ensure_active_page(browser_instance, site_page, site_cfg)
                     if not site_page:
                         site_page = await browser_instance.get("about:blank", new_tab=True)
 
-                    # สร้าง Dynamic Search URL ด้วย build_search_url
                     if isinstance(target_item, dict):
-                        if not target_item.get('enable', True): continue
+                        if not target_item.get('enable', True): 
+                            continue
                         display_zone = target_item.get('name', "Zone")
                         search_params = target_item.get('search_params', {})
                         
@@ -5660,7 +5619,8 @@ async def scrape_site_search_nodriver(
                         await asyncio.sleep(2.5)
 
                         page_source = await site_page.get_content()
-                        if not page_source: continue
+                        if not page_source: 
+                            continue
 
                         soup = BeautifulSoup(page_source, "html.parser")
 
@@ -5682,41 +5642,63 @@ async def scrape_site_search_nodriver(
                         continue
 
                     # ---------------------------------------------------------
-                    # 4. ROW EXTRACT & CROSS-SEED / NORMAL MATCHING
+                    # 4. ROW EXTRACT & PARSING
                     # ---------------------------------------------------------
                     all_details = soup.find_all("a", href=re.compile(r"details(new)?\.php\?id=\d+"))
                     rows = []
                     for a in all_details:
-                        if stop_event.is_set(): break
-                        if len(a.get_text(strip=True)) <= 5: continue
+                        if stop_event.is_set(): 
+                            break
+                        if len(a.get_text(strip=True)) <= 5: 
+                            continue
                         parent_tr = a.find_parent("tr")
                         if parent_tr and parent_tr not in rows:
+                            row_raw_text = parent_tr.get_text().lower()
+                            user_stat_keywords = ['ratio:', 'bonus:', 'upload:', 'download:', 'อัพโหลด:', 'ดาวน์โหลด:']
+                        
+                            if any(key in row_raw_text for key in user_stat_keywords):
+                                continue
                             rows.append(parent_tr)
 
                     for row in rows:
-                        if stop_event.is_set(): break
+                        if stop_event.is_set(): 
+                            break
                         
+                        t_id = None
                         try:
-                            local_headers = {
+                            extract_headers = {
                                 'User-Agent': stealth_args.get("user_agent", ""),
                                 'Referer': target_url
                             }
-                            data = await extract_torrent_data(row, base_url, dl_session, local_headers)
-                            if not data or not data.get('id'): continue
+                            data = await extract_torrent_data(row, base_url, dl_session, extract_headers)
+                            if not data or not data.get('id'): 
+                                continue
 
                             t_id = str(data['id'])
                             raw_title = data.get('title', 'Unknown')
                             download_url = data['download_url']
                             details_url = data['details_url']
-                            
-                            # แปลงขนาดเป็น GB / Bytes
-                            t_size_gb = parse_size(data['size_str'])
-                            t_size_bytes = int(t_size_gb * 1024 * 1024 * 1024)
 
-                            # 🎯 [MODE 1]: CROSS-SEED MATCHING MODE
+                            if not download_url:
+                                with open(f"debug_failed_{t_id}.html", "w", encoding="utf-8") as f:
+                                    f.write(page_source)
+                                print(f" ⚠️ [{t_id}] ข้าม: ไม่พบลิงก์ดาวน์โหลด")
+                                continue
+                                    
+                            safe_title = clean_name(raw_title)
+                            is_stat = any(word in safe_title.lower() for word in ['ratio', 'bonus', 'upload', 'download'])
+                                        
+                            if not is_stat and len(safe_title) >= 10:
+                                t_name = safe_title
+                            else:
+                                t_name = f"Torrent_ID_{t_id}"
+                            
+                            t_size_gb = parse_size(data['size_str'])
+                            t_size_bytes = data.get('size_bytes') or int(round(t_size_gb * 1024 * 1024 * 1024))
+
+                            # 🎯 CROSS-SEED MATCHING MODE
                             if cross_seed_target:
                                 target_bytes = cross_seed_target.get('target_size_bytes', 0)
-                                # ตรวจสอบขนาดไฟล์ตรงกันเป๊ะ หรือเหลื่อมล้ำไม่เกิน 1MB
                                 if target_bytes > 0 and abs(t_size_bytes - target_bytes) < (1024 * 1024):
                                     print(f"🎯 [Cross-Seed Match!] [{site}] ID: {t_id} | {raw_title[:40]} | Size: {t_size_bytes} Bytes")
                                     cross_seed_matches.append({
@@ -5730,100 +5712,289 @@ async def scrape_site_search_nodriver(
                                     })
                                 continue
 
-                            # 🎯 [MODE 2]: NORMAL AUTO-GRAB MODE
+                            # 🎯 NORMAL AUTO-GRAB MODE
+                            print(f"🔍 [{site.upper()}] Checking: {t_name[:50]}... (ID: {t_id})")
+                            if not is_fresh_and_racing(data):
+                                count_skip += 1
+                                continue 
                             if t_id in seen_ids:
+                                print(f" ❌ ข้าม: เคยเพิ่มไปแล้ว (ใน {site})")
                                 count_skip += 1
                                 continue
 
                             if not (SET.get('MIN_SIZE_GB', 0) <= t_size_gb <= SET.get('MAX_SIZE_GB', 999)):
+                                print(f" ❌ ข้าม: ขนาด {t_size_gb:.2f}GB ไม่ตรงเงื่อนไข")
                                 seen_ids.add(t_id)
                                 count_skip += 1
                                 continue
 
-                            # ดาวน์โหลดไฟล์ Torrent
-                            r_dl = await safe_timeout(dl_session.get(download_url, headers=local_headers), 30)
-                            if not r_dl: raise Exception("Download response empty")
+                            is_free_to_go = False
+                            freeload_enable = SET.get('FREELOAD_ENABLE', True)
+                            item_discount = SET.get('CURRENT_DISCOUNT', 0)     
+                            min_free_req = SET.get('MIN_FREE_PERCENT', 0)      
+                            site_name = site.lower()
+                                        
+                            if details_url and dl_session:
+                                if await check_pending_status(dl_session, details_url):
+                                    print(f" ⏳ ข้าม: ไฟล์นี้ยังอยู่ในสถานะ (รอการอนุมัติ) -> {details_url}")
+                                    count_skip += 1
+                                    continue
 
-                            raw_data_bytes = r_dl.content
-                            if not raw_data_bytes.startswith(b'd8:'):
-                                raw_content = await download_torrent_smart(dl_session.browser.main_tab, details_url, download_url)
+                            if not freeload_enable:
+                                is_free_to_go = True
+                            elif "bearbit" in site_name:
+                                free_p = check_freeload_status(row)
+                                if item_discount > 0:
+                                    if free_p > item_discount:
+                                        print(f" ❌ ข้าม: หน้าเว็บฟรี {free_p}% ซึ่งดีกว่าไอเทม {item_discount}%")
+                                        count_skip += 1
+                                        continue
+                                    else:
+                                        is_free_to_go = True
+                                        print(f" 🎫 [ITEM MODE] บังคับใช้ไอเทม {item_discount}% (หน้าเว็บฟรี {free_p}%)")
+                                else:
+                                    if free_p >= min_free_req:
+                                        is_free_to_go = True
+                                        print(f" ✅ [NORMAL MODE] หน้าเว็บฟรี {free_p}% ผ่านเกณฑ์ขั้นต่ำ ({min_free_req}%)")
+                                    else:
+                                        print(f" ❌ ข้าม: หน้าเว็บ ({free_p}%) ต่ำกว่าเกณฑ์ที่กำหนด ({min_free_req}%)")
+                                        count_skip += 1
+                                        continue
+                            else:
+                                free_p_others = check_freeload_status(row)
+                                if free_p_others == 100:
+                                    is_free_to_go = True
+                                else:
+                                    print(f" ❌ ข้าม: ไฟล์นี้ไม่ฟรี 100% ({free_p_others}%)")
+                                    count_skip += 1
+                                    continue
+
+                            if not is_free_to_go:
+                                continue
+
+                            # -------------------------------------------------
+                            # 5. SMART DOWNLOAD & NODE ALLOCATION LOGIC
+                            # -------------------------------------------------
+                            current_url = "unknown"
+                            local_headers = {
+                                'User-Agent': stealth_args.get("user_agent", ""),
+                                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                                'Accept-Language': 'th-TH,th;q=0.9,en-US;q=0.8,en;q=0.7',
+                                'Connection': 'keep-alive',
+                                'Referer': details_url
+                            }
+
+                            print(f"🚀 เริ่มดาวน์โหลดไฟล์: {t_id}")
+                            r_dl = None
+                            try:
+                                r_dl = await safe_timeout(dl_session.get(download_url, headers=local_headers), 30)
+                            except asyncio.TimeoutError:
+                                print("หมดเวลาดาวน์โหลด!")
+
+                            if not r_dl:
+                                raise Exception("ไม่สามารถดึงข้อมูลจาก BrowserSessionWrapper ได้")
+
+                            current_url = getattr(getattr(dl_session, 'browser', None), 'main_tab', site_page).url if hasattr(getattr(dl_session, 'browser', None), 'main_tab') else "unknown"
+                            raw_data_bytes = getattr(r_dl, 'content', b'')
+                            raw_data_text = getattr(r_dl, 'text', '')
+                            is_torrent = raw_data_bytes.startswith(b'd8:')
+
+                            t_hash = None
+                            download_ready = False
+
+                            if is_torrent:
+                                t_hash = extract_info_hash(raw_data_bytes)
+                                if t_hash:
+                                    download_ready = True
+                                    print(f"✅ พบไฟล์ทอร์เรนต์ Hash: {t_hash}")
+                            else:
+                                print(f"🔄 พบปัญหาการดาวน์โหลด (URL: {current_url}), กำลังเข้าสู่โหมดกู้คืนการคลิกผ่าน Browser...")
+                                tab_target = site_page if site_page else (dl_session.browser.main_tab if hasattr(dl_session, 'browser') else None)
+                                raw_content = await download_torrent_smart(
+                                    tab_target, 
+                                    details_url, 
+                                    download_url
+                                )
+
                                 if raw_content and raw_content.startswith(b'd8:'):
                                     raw_data_bytes = raw_content
+                                    t_hash = extract_info_hash(raw_data_bytes)
+                                    if t_hash:
+                                        download_ready = True
+                                        print(f"✅ กู้คืนการดาวน์โหลดสำเร็จ! Hash: {t_hash}")
+                                else:
+                                    print("❌ ไม่สามารถดาวน์โหลดไฟล์ได้แม้จะลองคลิกผ่าน Browser แล้ว")
 
-                            t_hash = extract_info_hash(raw_data_bytes)
-                            if not t_hash or t_hash in seen_hashes:
-                                seen_ids.add(t_id)
-                                count_skip += 1
-                                continue
+                            # 6. CHECK DUPLICATE HASH & SYNC
+                            if download_ready:
+                                is_duplicate = False
+                                target_node_name = ""
 
-                            # Node Allocation & Dispatch (ส่งงานเข้า Client)
-                            success_node = None
-                            active_nodes.sort(key=lambda x: x[0].free_gb, reverse=True)
+                                if t_hash in seen_hashes:
+                                    is_duplicate = True
+                                    for node_obj, _ in active_nodes:
+                                        if hasattr(node_obj, 'is_torrent_exists') and node_obj.is_torrent_exists(t_hash):
+                                            target_node_name = node_obj.name
+                                            break
+                                else:
+                                    for node_obj, _ in active_nodes:
+                                        if hasattr(node_obj, 'is_torrent_exists') and node_obj.is_torrent_exists(t_hash):
+                                            is_duplicate = True
+                                            target_node_name = node_obj.name
+                                            break
 
-                            for node_obj, n_cfg in active_nodes:
-                                required_space = t_size_gb + SET.get('DISK_BUFFER_GB', 5.0)
-                                effective_free_gb = max(0, node_obj.free_gb - node_obj.get_downloading_size())
+                                if is_duplicate:
+                                    effective_node_name = target_node_name
+                                    if not effective_node_name and active_nodes:
+                                        effective_node_name = active_nodes[0][0].name
+                                        print(f" ⚠ [Mapper]: ไม่พบชื่อ Node ของแฮชนี้ กำลังใช้ Node สำรอง: {effective_node_name}")
 
-                                if effective_free_gb < required_space and global_clean:
-                                    cleaner = global_clean.get(node_obj.name)
-                                    if cleaner:
-                                        cleaner.smart_reclaim_process(required_gb=required_space, is_emergency=False)
-                                        node_obj.refresh_status()
-
-                                if effective_free_gb < required_space: continue
-
-                                result = safe_add_torrent(node_obj, raw_data_bytes, site)
-                                if result:
-                                    success_msg = f"📥 [Success] {node_obj.name} | {t_size_gb:.1f}GB | {raw_title[:30]}"
-                                    print(success_msg)
-                                    added_in_zone.append(success_msg)
+                                    print(f" ❌ ข้าม: ตรวจพบ Hash [...{t_hash[-5:]}] ซ้ำในระบบ/วิ่งอยู่ใน {effective_node_name or 'Unknown Node'}")
                                     seen_ids.add(t_id)
                                     seen_hashes.add(t_hash)
-                                    
-                                    await handle_new_torrent_grabbed(
-                                        web_item={"torrent_id": t_id, "site_name": site, "release_name": raw_title, "download_url": download_url, "details_url": details_url},
-                                        client_response={"client_type": getattr(node_obj, "client_type", "rtorrent"), "hash": t_hash, "name": raw_title, "size_bytes": t_size_bytes},
-                                        host_name=node_obj.name
-                                    )
+
+                                    if effective_node_name:
+                                        sync_data = dict(data)
+                                        sync_data.update({
+                                            'hash': t_hash, 'id': t_id, 'torrent_id': t_id,
+                                            'site': site, 'site_name': site, 'release_name': raw_title,
+                                            'web_size': data.get('size_str', ''),
+                                            'download_url': download_url, 'details_url': details_url
+                                        })
+
+                                        synced = False
+                                        for node_obj, _ in active_nodes:
+                                            if node_obj.name == effective_node_name:
+                                                if hasattr(node_obj, 'sync_to_mapping'):
+                                                    await node_obj.sync_to_mapping(web_data_list=[sync_data])
+                                                synced = True
+                                                break
+                                        
+                                        if not synced and active_nodes and hasattr(active_nodes[0][0], 'sync_to_mapping'):
+                                            await active_nodes[0][0].sync_to_mapping(web_data_list=[sync_data])
+
                                     await handle_thanks_click(browser_instance, details_url)
-                                    success_node = node_obj
-                                    break
+                                    count_skip += 1
+                                    download_ready = False
 
-                            if not success_node:
-                                full_nodes_in_zone.append(f"❌ [Full] {raw_title[:30]}...")
+                            # 7. SEND TO CLIENT NODE
+                            if download_ready:
+                                print(f"✅ [{site}] พร้อมส่งไฟล์เข้า Client (Hash: {t_hash})")
+                                
+                                target_node = None
+                                best_free_space = -1
 
-                        except Exception as e:
-                            print(f"❌ [Error] {t_id}: {e}")
-                            continue
+                                for node_obj, node_cfg in active_nodes:
+                                    try:
+                                        is_available = True
+                                        if hasattr(node_obj, 'is_available'):
+                                            is_available = await node_obj.is_available()
+                                        
+                                        if not is_available:
+                                            continue
 
-                    save_data(current_site_seen_file, seen_ids)
-                    save_data(current_site_hash_file, seen_hashes)
-                    data_saved = True
+                                        free_bytes = 0
+                                        if hasattr(node_obj, 'get_free_space'):
+                                            free_bytes = await node_obj.get_free_space()
+                                        
+                                        required_bytes = t_size_bytes + (5 * 1024 * 1024 * 1024)
+                                        if free_bytes > required_bytes and free_bytes > best_free_space:
+                                            best_free_space = free_bytes
+                                            target_node = node_obj
 
-            else:
-                print(f"❌ [{site}] Login ไม่สำเร็จ")
+                                    except Exception as node_err:
+                                        print(f"⚠️ [{site}] เกิดข้อผิดพลาดขณะตรวจสอบ Node {getattr(node_obj, 'name', 'Unknown')}: {node_err}")
 
-        except Exception as site_err:
-            print(f"🚨 [Site Error] {site}: {site_err}")
-        finally:
-            if not data_saved:
+                                if target_node:
+                                    print(f"🎯 เลือก Node: [{target_node.name}] (พื้นที่คงเหลือ: {best_free_space / (1024**3):.2f} GB)")
+                                    
+                                    add_success = False
+                                    if hasattr(target_node, 'add_torrent'):
+                                        add_success = await target_node.add_torrent(
+                                            torrent_bytes=raw_data_bytes,
+                                            save_path=None,
+                                            category=site,
+                                            is_paused=False
+                                        )
+
+                                    if add_success:
+                                        print(f"🎉 [{site}] เพิ่ม Torrent สำเร็จ -> ID: {t_id} | Node: {target_node.name}")
+                                        seen_ids.add(t_id)
+                                        seen_hashes.add(t_hash)
+                                        data_saved = True
+                                        
+                                        # บันทึกรายการที่เพิ่มสำเร็จ
+                                        added_in_zone.append(f"📥 [Success] {target_node.name} | {t_size_gb:.1f}GB | {raw_title}")
+
+                                        if hasattr(target_node, 'sync_to_mapping'):
+                                            sync_data = dict(data)
+                                            sync_data.update({
+                                                'hash': t_hash, 'id': t_id, 'torrent_id': t_id,
+                                                'site': site, 'site_name': site, 'release_name': raw_title,
+                                                'web_size': data.get('size_str', ''),
+                                                'download_url': download_url, 'details_url': details_url
+                                            })
+                                            await target_node.sync_to_mapping(web_data_list=[sync_data])
+
+                                        await handle_thanks_click(browser_instance, details_url)
+                                    else:
+                                        full_nodes_in_zone.append(f"❌ [Full] {raw_title}")
+                                else:
+                                    # หากไม่มี Node ใดมีพื้นที่พอ ให้ลงรายการในกลุ่ม Queue Full
+                                    full_nodes_in_zone.append(f"❌ [Full] {raw_title}")
+
+                        except Exception as row_err:
+                            print(f"⚠️ [{site}] เกิดข้อผิดพลาดขณะประมวลผลแถว Torrent (ID: {t_id}): {row_err}")
+                            traceback.print_exc()
+
+                    # ---------------------------------------------------------
+                    # 📊 สรุปและแจ้งเตือนประจำ Zone
+                    # ---------------------------------------------------------
+                    summary_msg = []
+
+                    # ใช้ฟังก์ชัน generate_main_status เพื่อดึงบรรทัดเงื่อนไข (รองรับ % Freeleech สำหรับบางเว็บ)
+                    condition_text = generate_main_status(CFG, site_name=site)
+                    summary_msg.append(condition_text)
+                    summary_msg.append(f"🌐 Scanning: [{display_zone}] {target_url}\n")
+
+                    if not added_in_zone and not full_nodes_in_zone:
+                        summary_msg.append("❌ ไม่มีไฟล์เข้าเงื่อนไข")
+                    else:
+                        if added_in_zone:
+                            summary_msg.append("✅ Added:")
+                            summary_msg.extend(added_in_zone)
+
+                        if full_nodes_in_zone:
+                            # ใส่เว้นวรรคบรรทัดใหม่ก่อนขึ้นส่วน Queue Full หากมีรายการ Added ด้านบน
+                            if added_in_zone:
+                                summary_msg.append("")
+                            summary_msg.append("⚠️ Queue Full:")
+                            summary_msg.extend(full_nodes_in_zone)
+
+                    summary_msg.append(f"\n📊 สรุป {display_zone}: เพิ่ม {len(added_in_zone)} | เต็ม {len(full_nodes_in_zone)} | ข้าม {count_skip}")
+
+                    full_report = "\n".join(summary_msg)
+                    print("\n" + full_report + "\n")
+
+                    # ส่งแจ้งเตือนผ่าน Discord Webhook / Notification Handler (ถ้ามี)
+                    if 'send_notify' in globals():
+                        await send_notify(full_report)
+
+            if data_saved:
                 save_data(current_site_seen_file, seen_ids)
                 save_data(current_site_hash_file, seen_hashes)
+                print(f"💾 [{site}] บันทึกประวัติ Seen IDs ({len(seen_ids)}) และ Hashes ({len(seen_hashes)}) เรียบร้อย")
 
-    # Clean Up Browser Session
-    if browser_instance:
-        try:
-            if hasattr(browser_instance, 'stop'):
-                await browser_instance.stop() if inspect.iscoroutinefunction(browser_instance.stop) else browser_instance.stop()
-        except Exception: pass
-        finally:
-            kill_specific_browser()
-            gc.collect()
+        except Exception as site_err:
+            print(f"❌ [{site}] เกิดข้อผิดพลาดระดับเว็บ: {site_err}")
+            traceback.print_exc()
 
-    # หากอยู่ในโหมด Cross-Seed Matching ให้ส่งคืนค่ารายการที่จับคู่ได้
     if cross_seed_target:
+        print(f"\n🎯 [Cross-Seed Summary] พบรายการที่ตรงกันทั้งหมด {len(cross_seed_matches)} รายการ")
         return cross_seed_matches
-        
+
+    print("\n🏁 สแกนและประมวลผลทุกเว็บไซต์เสร็จสิ้น")
+
 async def main():
     global browser_instance
     loop = asyncio.get_running_loop()
@@ -5912,655 +6083,39 @@ async def main():
             # =================================================================
             # 2. BROWSER SECTION (nodriver Implementation)
             # =================================================================
+            print("\n🌐 STARTING SITE SEARCH & SCRAPING...")
 
-            target_sites_cfg = [s for s in CFG.get('SITE', []) if s.get('enable', True)]
-            print(f"📡 Detected Sites: {[s['name'] for s in target_sites_cfg]}")
+            # เตรียมพารามิเตอร์ stealth_args จาก SET หรือ CFG (ปรับ Key ตามที่ระบบคุณใช้)
+            stealth_args = SET.get('stealth_args', {})
 
-            for site_cfg in target_sites_cfg:
-                if stop_event.is_set(): break
-                site = site_cfg['name']
-                current_site_seen_file = get_seen_file(site)
-                seen_ids = load_data(current_site_seen_file) 
-                current_site_hash_file = get_hash_file(site)
-                seen_hashes = load_data(current_site_hash_file)
-                data_saved = False
-        
-                try:
-                   # ตรวจสอบว่ามี instance หรือไม่ และยังเชื่อมต่ออยู่หรือไม่ (Is connected?)
-                    is_browser_healthy = False
-                    if browser_instance is not None:
-                        try:
-                            await browser_instance.target.get_targets()
-                            is_browser_healthy = True
-                        
-                        except Exception:
-                            print("⚠️ ตรวจพบการเชื่อมต่อ Browser ขัดข้อง, กำลังรีเซ็ต...")
-                            browser_instance = None
-                            # รีเซ็ตตัวแปรที่เกี่ยวข้องไปด้วยเพื่อให้มั่นใจว่าต้องสร้างใหม่
-                            site_page = None
-                            dl_session = None
+            # หากมีเป้าหมาย Cross-seed ที่เตรียมไว้ สามารถระบุใส่ตัวแปรนี้ได้
+            cross_seed_target = SET.get('cross_seed_target', None)
 
-                    if not is_browser_healthy:
-                        # ใช้ค่า site ที่กำหนดไว้แล้ว หากยังไม่มีค่าในลูปให้ใช้ 'system_init'
-                        target_site = site if 'site' in locals() else "system_init"
-                        print(f"🌐 กำลังเริ่ม Browser instance ใหม่สำหรับ: {target_site}...")
-                        browser_instance = await launch_any_browser(target_site, stealth_args)
-            
-                        site_page = await browser_instance.get("about:blank", new_tab=True)
-                        dl_session = BrowserSessionWrapper(browser_instance)
-                    
-                    # กรณีที่ Browser ปกติ แต่เรายังไม่มี site_page หรือ dl_session (รอบแรก)
-                    elif 'site_page' not in locals():
-                        site_page = await browser_instance.get("about:blank", new_tab=True)
-                        dl_session = BrowserSessionWrapper(browser_instance)
+            try:
+                # เนื่องจาก scrape_site_search_nodriver ถูกดีไซน์ให้รับ active_nodes และ CFG แบบภาพรวม
+                # สามารถเรียกใช้งานแบบ await ได้เลย (หาก scrape_site_search_nodriver เป็น async def)
+                await scrape_site_search_nodriver(
+                    CFG=CFG,
+                    SET=SET,
+                    active_nodes=active_nodes,
+                    stop_event=stop_event,
+                    stealth_args=stealth_args,
+                    global_clean=global_clean,
+                    cross_seed_target=cross_seed_target
+                )
+                
+                # รีเซ็ตจำนวน Error สะสมเมื่อทำงานสำเร็จครบถ้วน
+                consecutive_errors = 0
 
-                    login_result = await safe_await(ensure_site_logged_in(site_page, site_cfg), "SiteLogin")
-                    if login_result is True:
-                        try:
-                            # 1. เช็คก่อนว่า Tab ยังเปิดอยู่หรือไม่
-                            if site_page is None:
-                                print(f"⚠️ [{site}] site_page เป็น None, กำลังกู้คืน...")
-                                # พยายามสร้างใหม่ทันที
-                                site_page = await browser_instance.get("about:blank", new_tab=True)
-                                # รอให้หน้าเว็บโหลดสักนิดก่อนไปต่อ
-                                await asyncio.sleep(1)
+            except Exception as e:
+                consecutive_errors += 1
+                print(f"❌ [Error] การ Scrape ขัดข้อง ({consecutive_errors} ครั้งติดต่อกัน): {e}")
+                
+                # แจ้งเตือนผ่าน Discord/Telegram หากเกิด Error ต่อเนื่อง
+                if consecutive_errors >= 3:
+                    err_msg = f"⚠️ <b>System Alert</b>\nพบข้อผิดพลาดใน Browser Loop ติดต่อกัน {consecutive_errors} ครั้ง\n<code>{e}</code>"
+                    asyncio.create_task(send_notify(err_msg))
 
-                            # 2. เพิ่มการรอ Network ให้เงียบก่อนสั่งดึง Cookie
-                            # (จำเป็นมากเพื่อเลี่ยงการดึงขณะหน้าเว็บกำลังเปลี่ยนสถานะ)
-                            await asyncio.sleep(1.5) 
-                            
-                            # 3. ดึง Cookie โดยใช้ Timeout ป้องกันการค้าง
-                            cookies = await asyncio.wait_for(site_page.send(cdp.network.get_cookies()), timeout=5)
-
-                            # ในบาง library ผลลัพธ์ที่ได้อาจอยู่ใน ['cookies']
-                            if isinstance(cookies, dict) and 'cookies' in cookies:
-                                cookies = cookies['cookies']
-
-                            target_domain = site_cfg.get('base_url').split('//')[-1].split('/')[0]
-
-                            for cookie in cookies:
-                                # 1. จัดการข้อมูลให้เป็น dictionary เสมอ
-                                # ถ้า cookie เป็น object ให้แปลงเป็น dict ด้วย .__dict__ หรือเข้าถึงแบบ dict
-                                c_data = cookie if isinstance(cookie, dict) else getattr(cookie, '__dict__', {})
-    
-                                c_name = c_data.get('name')
-                                c_value = c_data.get('value')
-                                c_domain = c_data.get('domain', '')
-                                c_path = c_data.get('path', '/')
-                                c_secure = c_data.get('secure', False)
-
-                                if target_domain in c_domain:
-                                    # หาก dl_session เป็น requests.Session
-                                    if hasattr(dl_session, 'cookies'):
-                                        dl_session.cookies.set(c_name, c_value, domain=c_domain, path=c_path, secure=c_secure)
-            
-                            print(f"✅ [{site}] ดึงคุกกี้สดเข้า Session สำเร็จ ({len(cookies)} cookies)")
-
-                            # 3. บันทึกไฟล์
-                            auth_file = get_auth_file(site)
-                            with open(auth_file, "w") as f:
-                                cookie_list = [{
-                                    'name': (c.name if hasattr(c, 'name') else c['name']),
-                                    'value': (c.value if hasattr(c, 'value') else c['value']),
-                                    'domain': (c.domain if hasattr(c, 'domain') else c['domain']),
-                                    'path': (c.path if hasattr(c, 'path') else c.get('path', '/')),
-                                    'secure': (c.secure if hasattr(c, 'secure') else c.get('secure', False))
-                                } for c in cookies if target_domain in (c.domain if hasattr(c, 'domain') else c['domain'])]
-                                json.dump(cookie_list, f)
-
-                        except (asyncio.TimeoutError, Exception) as cookie_err:
-                            print(f"⚠️ [{site}] ดึงคุกกี้ล้มเหลว: {cookie_err}")
-                            
-                            # ถ้าเจอ error เกี่ยวกับ Session หรือ WebSocket ให้ถือว่า Tab นี้พัง
-                            if "-32001" in str(cookie_err) or "no close frame" in str(cookie_err).lower():
-                                print(f"🔄 [{site}] Session พัง, กำลังสร้าง Tab ใหม่...")
-                                try:
-                                    site_page = await browser_instance.get("about:blank", new_tab=True)
-                                    # หลังจากสร้างใหม่ ต้องลอง Login อีกรอบ
-                                    await ensure_site_logged_in(site_page, site_cfg)
-                                    await asyncio.sleep(2)
-                                except Exception as e:
-                                    print(f"❌ ไม่สามารถกู้คืน Tab ได้: {e}")
-                                    continue # ข้ามไซต์นี้ไปเลย
-
-                        ctx = BotContext(active_nodes, dl_session, seen_hashes, seen_ids, global_clean)
-                        stats_data = await get_site_stats(site_page, site_cfg, ctx)
-                        print(stats_data)
-
-                        if stats_data and isinstance(stats_data, str):
-                            asyncio.create_task(send_notify(stats_data))
-                        else:
-                            print(f"⚠️ [{site}] ข้อมูลสถิติไม่สมบูรณ์ หรือได้ NoneType, ข้ามการส่ง Notification")
-
-                        base_url = site_cfg.get('base_url')
-                        site_target_urls = site_cfg.get('target_urls', [])
-                            
-                        for target_item in site_target_urls:
-                            if stop_event.is_set(): break
-                            site_page = await ensure_active_page(browser_instance, site_page, site_cfg)
-                            if not site_page:
-                                # พยายามสร้างใหม่แค่ครั้งเดียวต่อโซน ถ้าไม่ได้ให้ข้ามโซนนี้ไป ไม่ใช่ข้ามทั้งเว็บ
-                                print(f"⚠️ [{site}] Tab พัง พยายามสร้างใหม่...")
-                                site_page = await browser_instance.get("about:blank", new_tab=True)
-                                await site_page.get(site_cfg['url'])
-
-                            if isinstance(target_item, dict):
-                                if not target_item.get('enable', True): continue
-                                target_url = target_item.get('url')
-                                display_zone = target_item.get('name', "Zone")
-                            else:
-                                target_url, display_zone = target_item, "Zone"
-
-                            if target_url.startswith('/') or not target_url.startswith('http'):
-                                target_url = f"{base_url.rstrip('/')}/{target_url.lstrip('/')}"
-
-                            try:
-                                print(f"\n🌐 [{site}] Scanning: [{display_zone}]")
-                                    
-                                if site_page is None: continue
-                                    
-                                await site_page.get(target_url)
-                                await asyncio.sleep(2.5)
-                                    
-                                page_source = await site_page.get_content()
-                                if not page_source:
-                                    print(f"⚠️ [{site}] ได้หน้าว่างเปล่า... พยายามกู้คืน Tab")
-                                    try:
-                                        site_page = await browser_instance.get("about:blank", new_tab=True)
-                                    except:
-                                        site_page = None # หากกู้คืนไม่ได้จริงๆ ถึงค่อยยอมให้เป็น None
-                                    continue
-
-                                soup = BeautifulSoup(page_source, "html.parser")
-                                
-                                if is_cloudflare(soup):
-                                    print(f"🛡️ [{site}] ตรวจพบ Cloudflare! กำลังเข้าสู่กระบวนการกู้คืน...")
-                                    # ใส่ logic การรอ หรือแก้ Challenge ที่นี่
-                                    await asyncio.sleep(10) 
-                                    continue
-    
-                                if "ไม่สามารถเปิดลิงก์จากภายนอกได้" in soup.text:
-                                    print(f"⚠️ [{site}] ติด Hotlink... กำลังใช้มาตรการย้ำหน้ากระตุ้นระบบ Referer")
-                                    index_url = f"{base_url.rstrip('/')}/index.php"
-                                    await site_page.get(index_url)
-                                    await asyncio.sleep(1.5)
-                                    print(f"DEBUG: กำลังเรียก site_page.get({target_url})")    
-                                    await site_page.get(target_url)
-                                    await asyncio.sleep(2.5)
-                                        
-                                    page_source = await site_page.get_content()
-                                    soup = BeautifulSoup(page_source, "html.parser")
-                                    
-                                if "ไม่สามารถเปิดลิงก์จากภายนอกได้" in soup.text:
-                                    print(f"❌ [{site}] ระบบความปลอดภัยเข้มงวดเกินไป ข้ามโซน [{display_zone}] ไปก่อน")
-                                    continue
-                            except Exception as e:
-                                print(f"❌ [{site}] Error ระหว่างเข้าหน้า {display_zone}: {e}")
-                                continue
-
-                            added_in_zone = [] 
-                            full_nodes_in_zone = []
-                            error_logs = []
-                            count_skip = 0    
-                                
-                            all_details = soup.find_all("a", href=re.compile(r"details(new)?\.php\?id=\d+"))
-                            rows = []
-
-                            for a in all_details:
-                                if stop_event.is_set(): break
-                                t_text = a.get_text(strip=True)
-                                if len(t_text) <= 5: 
-                                    continue
-                                    
-                                parent_tr = a.find_parent("tr")
-                                if parent_tr and parent_tr not in rows:
-                                    row_raw_text = parent_tr.get_text().lower()
-                                    user_stat_keywords = ['ratio:', 'bonus:', 'upload:', 'download:', 'อัพโหลด:', 'ดาวน์โหลด:']
-                        
-                                    if any(key in row_raw_text for key in user_stat_keywords):
-                                        continue
-                                    rows.append(parent_tr)
-
-                            for row in rows:
-                                if stop_event.is_set(): break
-                                t_id = "UNKNOWN"
-                                try:
-                                    local_headers = {
-                                        'User-Agent': stealth_args["user_agent"],
-                                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-                                        'Accept-Language': 'th-TH,th;q=0.9,en-US;q=0.8,en;q=0.7',
-                                        'Connection': 'keep-alive',
-                                        'Referer': f"{target_url}"
-                                    }
-                                    data = await extract_torrent_data(row, base_url, dl_session, local_headers)
-                                    
-                                    if not data or not data.get('id'):
-                                        print(f" ⚠️ ข้าม: สกัดข้อมูล ID ไม่สำเร็จ")
-                                        continue
-
-                                    t_id = str(data['id']) 
-                                    download_url = data['download_url']
-                                    details_url = data['details_url']
-                                    raw_title = data.get('title', 'Unknown')
-
-                                    if not download_url:
-                                        with open(f"debug_failed_{t_id}.html", "w", encoding="utf-8") as f:
-                                            f.write(resp.text)
-                                        print(f" ⚠️ [{t_id}] ข้าม: ไม่พบลิงก์ดาวน์โหลด")
-                                        continue
-                                    
-                                    safe_title = clean_name(raw_title)
-                                    is_stat = any(word in safe_title.lower() for word in ['ratio', 'bonus', 'upload', 'download'])
-                                        
-                                    if not is_stat and len(safe_title) >= 10:
-                                        t_name = safe_title
-                                    else:
-                                        t_name = f"Torrent_ID_{t_id}"
-
-                                    print(f"🔍 [{site.upper()}] Checking: {t_name[:50]}... (ID: {t_id})")
-                                    
-                                    if not is_fresh_and_racing(data):
-                                        count_skip += 1
-                                        continue  
-
-                                    if t_id in seen_ids:
-                                        print(f" ❌ ข้าม: เคยเพิ่มไปแล้ว (ใน {site})")
-                                        count_skip += 1
-                                        continue
-
-                                    t_size_gb = parse_size(data['size_str'])
-                                    if not (SET.get('MIN_SIZE_GB', 0) <= t_size_gb <= SET.get('MAX_SIZE_GB', 999)):
-                                        print(f" ❌ ข้าม: ขนาด {t_size_gb:.2f}GB ไม่ตรงเงื่อนไข")
-                                        seen_ids.add(t_id) 
-                                        count_skip += 1
-                                        continue
-
-                                    is_free_to_go = False
-                                    is_use_item = False
-
-                                    freeload_enable = SET.get('FREELOAD_ENABLE', True)
-                                    item_discount = SET.get('CURRENT_DISCOUNT', 0)     
-                                    min_free_req = SET.get('MIN_FREE_PERCENT', 0)      
-                                    site_name = site.lower()
-                                        
-                                    if details_url and dl_session:
-                                        if await check_pending_status(dl_session, details_url):
-                                            print(f" ⏳ ข้าม: ไฟล์นี้ยังอยู่ในสถานะ (รอการอนุมัติ) -> {details_url}")
-                                            count_skip += 1
-                                            continue
-
-                                    if not freeload_enable:
-                                        is_free_to_go = True
-                                        is_use_item = False
-                                    elif "bearbit" in site_name:
-                                        free_p = check_freeload_status(row)
-                                        if item_discount > 0:
-                                            if free_p > item_discount:
-                                                print(f" ❌ ข้าม: หน้าเว็บฟรี {free_p}% ซึ่งดีกว่าไอเทม {item_discount}% (เก็บไอเทมไว้ก่อน)")
-                                                count_skip += 1
-                                                continue
-                                            else:
-                                                is_use_item = True
-                                                is_free_to_go = True
-                                                print(f" 🎫 [ITEM MODE] บังคับใช้ไอเทม {item_discount}% (หน้าเว็บฟรีแค่ {free_p}%)")
-                                        else:
-                                            if free_p >= min_free_req:
-                                                is_free_to_go = True
-                                                is_use_item = False
-                                                print(f" ✅ [NORMAL MODE] หน้าเว็บฟรี {free_p}% ผ่านเกณฑ์ขั้นต่ำ ({min_free_req}%)")
-                                            else:
-                                                print(f" ❌ ข้าม: ไม่มีไอเทม และหน้าเว็บ ({free_p}%) ต่ำกว่าเกณฑ์ที่กำหนด ({min_free_req}%)")
-                                                count_skip += 1
-                                                continue
-                                    else:
-                                        free_p_others = check_freeload_status(row)
-                                        if free_p_others == 100:
-                                            is_free_to_go = True
-                                        else:
-                                            print(f" ❌ ข้าม: ไฟล์นี้ไม่ฟรี 100% (หน้าเว็บแจ้ง {free_p_others}%)")
-                                            count_skip += 1
-                                            continue
-
-                                    if not is_free_to_go:
-                                        continue
-
-                                    current_url = "unknown"
-                                    try:
-                                        print(f"🚀 เริ่มดาวน์โหลดไฟล์: {t_id}")
-    
-                                        # 1. ใช้ Wrapper .get() ซึ่งจัดการ Browser Tab และคืนค่า MockResponse
-                                        # MockResponse นี้จะมี .text (สำหรับเช็ค HTML) และ .content (สำหรับไฟล์ทอร์เรนต์)
-                                        try:
-                                            r_dl = await safe_timeout(dl_session.get(download_url, headers=local_headers), 30)
-                                        except asyncio.TimeoutError:
-                                            print("หมดเวลา!")
-    
-                                        if not r_dl:
-                                            raise Exception("ไม่สามารถดึงข้อมูลจาก BrowserSessionWrapper ได้")
-
-                                        # 2. ใช้ค่าจาก r_dl แทนการเรียกเมธอดที่ไม่มีอยู่
-                                        current_url = dl_session.browser.main_tab.url
-                                        raw_data_bytes = r_dl.content
-                                        raw_data_text = r_dl.text
-                                        is_torrent = raw_data_bytes.startswith(b'd8:')
-
-                                        t_hash = None
-                                        download_ready = False
-
-                                        # 3. Logic ตรวจสอบและดาวน์โหลด
-                                        if is_torrent:
-                                            t_hash = extract_info_hash(raw_data_bytes)
-                                            if t_hash:
-                                                download_ready = True
-                                                print(f"✅ พบไฟล์ทอร์เรนต์ Hash: {t_hash}")
-                                        else:
-                                            print(f"🔄 พบปัญหาการดาวน์โหลด (URL: {current_url}), กำลังเข้าสู่โหมดกู้คืนการคลิกผ่าน Browser...")
-    
-                                            # เรียกใช้ฟังก์ชันคลิกปุ่มผ่าน tab ที่มี Session ล็อกอินอยู่แล้ว
-                                            raw_content = await download_torrent_smart(
-                                                dl_session.browser.main_tab, 
-                                                details_url, 
-                                                download_url
-                                            )
-    
-                                            if raw_content and raw_content.startswith(b'd8:'):
-                                                raw_data_bytes = raw_content
-                                                t_hash = extract_info_hash(raw_data_bytes)
-                                                if t_hash:
-                                                    download_ready = True
-                                                    print(f"✅ กู้คืนการดาวน์โหลดสำเร็จ! Hash: {t_hash}")
-                                            else:
-                                                print("❌ ไม่สามารถดาวน์โหลดไฟล์ได้แม้จะลองคลิกผ่าน Browser แล้ว")
-
-                                        # 4. ส่วนการส่งเข้า Node
-                                        if download_ready:
-                                            is_duplicate = False
-                                            target_node_name = ""
-
-                                            # เช็คว่าซ้ำใน seen_hashes หรือมีอยู่แล้วใน Node ใด Node หนึ่ง
-                                            if t_hash in seen_hashes:
-                                                is_duplicate = True
-                                                # พยายามหาว่ามันอยู่ Node ไหน เพื่อเอาชื่อ Node ไปซิงค์
-                                                for node_obj, _ in active_nodes:
-                                                    if node_obj.is_torrent_exists(t_hash):
-                                                        target_node_name = node_obj.name
-                                                        break
-                                            else:
-                                                for node_obj, _ in active_nodes:
-                                                    if node_obj.is_torrent_exists(t_hash):
-                                                        is_duplicate = True
-                                                        target_node_name = node_obj.name
-                                                        break
-
-                                            if is_duplicate:
-                                                # 🛠️ ปรับปรุง: ถ้าหา target_node_name ไม่เจอ ให้ใช้ Node ตัวแรกใน active_nodes เป็นค่าสำรองทันที
-                                                effective_node_name = target_node_name
-                                                if not effective_node_name and active_nodes:
-                                                    effective_node_name = active_nodes[0][0].name
-                                                    print(f" ⚠️ [Mapper]: ไม่พบชื่อ Node ของแฮชนี้ กำลังใช้ Node สำรอง: {effective_node_name}")
-
-                                                print(f" ❌ ข้าม: ตรวจพบ Hash [...{t_hash[-5:]}] ซ้ำในระบบ/วิ่งอยู่ใน {effective_node_name or 'Unknown Node'}")
-                                                seen_hashes.add(t_hash)
-        
-                                                # 🛠️ ทำการซิงค์ข้อมูลลง Mapping โดยใช้ effective_node_name ที่เตรียมไว้
-                                                if effective_node_name:
-                                                    sync_data = dict(data)
-                                                    sync_data['hash'] = t_hash
-                                                    sync_data['id'] = t_id
-                                                    sync_data['torrent_id'] = t_id
-                                                    sync_data['site'] = site
-                                                    sync_data['site_name'] = site
-                                                    sync_data['release_name'] = raw_title
-                                                    sync_data['web_size'] = data.get('size_str', '')
-                                                    sync_data['download_url'] = download_url
-                                                    sync_data['details_url'] = details_url
-
-                                                    synced = False
-                                                    for node_obj, _ in active_nodes:
-                                                        if node_obj.name == effective_node_name:
-                                                            await node_obj.sync_to_mapping(web_data_list=[sync_data])
-                                                            synced = True
-                                                            break
-                                                
-                                                    # ถ้ายังหา Node object ไม่เจอจริงๆ ให้บังคับส่งเข้า Node ตัวแรกสุดตรงๆ เลย
-                                                    if not synced and active_nodes:
-                                                        await active_nodes[0][0].sync_to_mapping(web_data_list=[sync_data])
-
-                                                # กดปุ่ม Thanks
-                                                await handle_thanks_click(browser_instance, details_url)
-                                                count_skip += 1
-                                                download_ready = False
-
-                                        if download_ready:
-                                            print(f"✅ [{site}] พร้อมส่งไฟล์เข้า Client (Hash: {t_hash})")
-                                            active_nodes.sort(key=lambda x: x[0].free_gb, reverse=True)
-                                            success_node = None
-                                            task_weight = calculate_task_weight(t_size_gb)
-
-                                            for node_obj, n_cfg in active_nodes:
-                                                if stop_event.is_set(): break
-                                                
-                                                # 1. ตรวจสอบ Load (Weight) ก่อน
-                                                d_type = n_cfg.get('disk_type', 'HDD')
-                                                dynamic_max_cap, _ = get_node_dynamic_cap(node_obj, d_type)
-                                                current_load = round(get_node_current_weight(node_obj), 1)
-
-                                                if (current_load + task_weight) > dynamic_max_cap:
-                                                    continue
-                                                
-                                                # 2. ปรับการคำนวณพื้นที่ให้ "กันพื้นที่" (Buffer) ไว้ชัดเจน
-                                                # ใช้ max(0, ...) ป้องกันค่าติดลบที่มักเกิดจาก get_downloading_size()
-                                                downloading_size = max(0, node_obj.get_downloading_size())
-                                                effective_free_gb = max(0, node_obj.free_gb - downloading_size)
-                                                
-                                                # 3. Smart Reclaim
-                                                required_space = t_size_gb + 15.0
-                                                if effective_free_gb < required_space:
-                                                    cleaner = NodeCleaner(node_obj, n_cfg, global_clean)
-                                                    cleaner.smart_reclaim_process(required_gb=required_space, is_emergency=False)
-                                                    node_obj.refresh_status()
-                                                    
-                                                    # อัปเดตค่าหลังทำความสะอาด
-                                                    downloading_size = max(0, node_obj.get_downloading_size())
-                                                    effective_free_gb = max(0, node_obj.free_gb - downloading_size)
-
-                                                # 4. Final Check & Emergency Flush
-                                                if effective_free_gb < (t_size_gb + 5.0):
-                                                    # ลองทำ Reclaim รอบที่ 2 แบบ Emergency
-                                                    print(f"🔄 [{node_obj.name}] Reclaim รอบที่ 1 ยังไม่พอ, ลอง Emergency Flush...")
-                                                    cleaner.smart_reclaim_process(required_gb=required_space, is_emergency=True)
-                                                    node_obj.refresh_status()
-                                                    
-                                                    # คำนวณใหม่รอบสุดท้าย
-                                                    effective_free_gb = max(0, node_obj.free_gb - node_obj.get_downloading_size())
-                                                    
-                                                    if effective_free_gb < (t_size_gb + 5.0):
-                                                        print(f"⚠️ [{node_obj.name}] พื้นที่ไม่พอจริงๆ (เหลือ {effective_free_gb:.1f}G) -> ข้าม")
-                                                        continue
-
-                                                try:
-                                                    
-                                                    # 1. ตรวจสอบให้แน่ใจว่า raw_data_bytes มีข้อมูลอยู่จริงก่อนเรียกใช้งาน
-                                                    if 'raw_data_bytes' in locals() and raw_data_bytes:
-        
-                                                        # 2. ส่งไฟล์เข้า Seedbox โดยใช้ตัวแปรที่ถูกต้อง
-                                                        result = safe_add_torrent(node_obj, raw_data_bytes, site)
-                                                        if result:
-                                                            success_msg = f"📥 [Success] {node_obj.name} | {t_size_gb:.1f}GB | {t_name[:40]}"
-                                                            print(success_msg)
-                                            
-                                                            # อัปเดตสถานะ Node
-                                                            node_obj.free_gb = max(0.0, node_obj.free_gb - (t_size_gb + 0.1))
-                                                            added_in_zone.append(success_msg)
-                                                            seen_ids.add(t_id)
-                                                            seen_hashes.add(t_hash)
-                                                            success_node = node_obj
-                                            
-                                                            # --- ประกอบข้อมูล web_item และ client_response เพื่อส่งเข้าฟังก์ชัน Mapping ---
-                                                            web_item_payload = {
-                                                                "torrent_id": t_id,
-                                                                "site_name": site,
-                                                                "release_name": raw_title,
-                                                                "web_size": data.get('size_str', ''),
-                                                                "download_url": download_url,
-                                                                "details_url": details_url
-                                                            }
-                                            
-                                                            # รองรับกรณีที่ safe_add_torrent คืนค่าเป็น dict หรือเป็นค่าจริงจาก client
-                                                            client_response_payload = {
-                                                                "client_type": getattr(node_obj, "client_type", "rtorrent"), # ปรับตามประเภท client เช่น qbittorrent/rtorrent
-                                                                "hash": t_hash,
-                                                                "name": t_name,
-                                                                "size_bytes": int(t_size_gb * 1024 * 1024 * 1024),
-                                                                "state": "downloading",
-                                                                "save_path": getattr(node_obj, "save_path", "")
-                                                            }
-                                            
-                                                            await handle_new_torrent_grabbed(
-                                                                web_item=web_item_payload, 
-                                                                client_response=client_response_payload, 
-                                                                host_name=node_obj.name
-                                                            )
-
-                                                            # กดปุ่ม Thanks
-                                                            await handle_thanks_click(browser_instance, details_url)
-
-                                                            break # ส่งเข้า Node สำเร็จแล้ว ให้หยุด Loop
-                                                    else:
-                                                        print(f"❌ [Error] ข้อมูลไฟล์ทอร์เรนต์ (raw_data_bytes) ว่างเปล่า ไม่สามารถส่งเข้า {node_obj.name}")
-
-                                                except Exception as e:
-                                                    print(f"❌ [Connect Error] {node_obj.name}: {str(e)}")
-                                                    traceback.print_exc()
-
-                                            if not success_node:
-                                                full_nodes_in_zone.append(f"❌ [Full] {t_name[:30]}...")
-
-                                    except asyncio.TimeoutError:
-                                        print(f"⚠️ [Timeout] {t_id} ค้างนานเกินไป")
-                                        continue 
-                                    except Exception as e:
-                                        print(f"❌ [Error] เกิดปัญหาที่ {t_id}: {str(e)}")
-                                        continue
-
-                                    
-                                except Exception as e:
-                                    if consecutive_errors > 3:
-                                        print("⚠️ พบ Error ติดต่อกันเกิน 3 ครั้ง! กำลังรีเซ็ต Browser ด้วย nodriver...")
-                                        
-                                        # 1. ทำลายซาก Browser อย่างระมัดระวัง
-                                        if dl_session is not None:
-                                            try:
-                                                # ใช้ getattr เพื่อความปลอดภัยสูงสูด
-                                                browser_obj = getattr(dl_session, 'browser', None)
-                                                if browser_obj is not None:
-                                                    await browser_obj.stop()
-                                            except Exception as stop_err:
-                                                print(f"⚠️ ปิด Browser เดิมไม่สมบูรณ์: {stop_err}")
-                                            finally:
-                                                # ล้างค่าทิ้งเพื่อป้องกันการเรียกใช้ซ้ำ
-                                                dl_session = None 
-                                        
-                                        # 2. สร้าง Browser ใหม่ (ต้องมั่นใจว่าฟังก์ชันนี้ไม่มีการอ้างอิงของเก่า)
-                                        try:
-                                            print("🚀 กำลังสร้าง Browser Instance ใหม่...")
-                                            new_browser = await launch_any_browser(site)
-                                            dl_session = BrowserSessionWrapper(new_browser)
-                                            consecutive_errors = 0
-                                            await asyncio.sleep(10)
-                                        except Exception as launch_err:
-                                            print(f"❌ ล้มเหลวในการสร้าง Browser ใหม่: {launch_err}")
-                                            break
-                                    else:
-                                        # ถ้ายังไม่ถึง 3 ครั้ง ให้พักสั้นๆ
-                                        await asyncio.sleep(5)
-    
-                                    continue
-
-                                if len(added_in_zone) >= SET.get('MAX_NEW_PER_ZONE', 5): 
-                                    break
-
-                            # Summary Section
-                            if len(added_in_zone) > 0 or count_skip > 0 or len(full_nodes_in_zone) > 0 or len(error_logs) > 0:
-                                condition_header = generate_main_status(CFG)
-                                summary_msg = (
-                                    f"⚙️ <b>{condition_header}</b>\n"
-                                    f"🌐 <b>Scanning:</b> [{display_zone}] {target_url}\n\n"
-                                )
-                                if added_in_zone: 
-                                    summary_msg += "✅ <b>Added:</b>\n" + "\n".join(added_in_zone) + "\n\n"
-                                
-                                if full_nodes_in_zone: 
-                                    summary_msg += "⚠️ <b>Queue Full:</b>\n" + "\n".join(full_nodes_in_zone) + "\n\n"
-                                
-                                if error_logs: 
-                                    summary_msg += "🚨 <b>System Errors:</b>\n" + "\n".join(error_logs) + "\n\n"
-                                
-                                if not added_in_zone and not full_nodes_in_zone and not error_logs:
-                                    summary_msg += "❌ ไม่มีไฟล์เข้าเงื่อนไข\n\n"
-
-                                footer = f"📊 <b>สรุป {display_zone}:</b> เพิ่ม {len(added_in_zone)} | เต็ม {len(full_nodes_in_zone)} | ข้าม {count_skip}"
-                                summary_msg += footer
-                                print(f"\n{footer}")
-                                    
-                                await send_notify(summary_msg)
-
-                            # ✅ [FIX 3] ย้ายการเซฟประวัติเข้ามาบันทึกในจบลูปโซนย่อยทันที ข้อมูลสดใหม่ตลอดเวลา ไม่สูญหาย
-                            save_data(current_site_seen_file, seen_ids)
-                            save_data(current_site_hash_file, seen_hashes)
-                            data_saved = True
-                    else:
-                        # ถ้าเป็น None (จาก Warning) หรือเป็น False (จาก logic ของฟังก์ชัน)
-                        # ให้ข้ามไซต์นี้ไปทันที
-                        print(f"❌ [{site}] Login ไม่สำเร็จหรือข้อมูลตอบกลับผิดพลาด")
-                        continue
-                except Exception as site_err:
-                    print(f"🚨 [Site System Error] พังทั้งเว็บ {site}: {site_err}")
-                finally:
-                    # 1. เซฟข้อมูล (เผื่อกรณี error ก่อนเซฟข้อมูล)
-                    if not data_saved:
-                        save_data(current_site_seen_file, seen_ids)
-                        save_data(current_site_hash_file, seen_hashes)
-                    # ปิด Tab ของไซต์นี้ทันทีเมื่อสแกนจบ (ไม่ว่าจะพังหรือไม่)
-                    if site_page:
-                        await site_page.close()
-                        print(f"📂 ปิด Tab ของ {site} เรียบร้อย")
-
-            # ปิด Browser หลังจากปิด Tab แล้ว
-            active_browser = browser_instance 
-            
-            if active_browser:
-                try:
-                    # ใช้เงื่อนไขตรวจสอบให้ชัดเจน
-                    if hasattr(active_browser, 'stop'):
-                        if inspect.iscoroutinefunction(active_browser.stop):
-                            await active_browser.stop()
-                        else:
-                            active_browser.stop()
-                except Exception as e:
-                    print(f"⚠️ Error ในระหว่างปิด Browser: {e}")
-                finally:
-                    # 1. ฆ่า process ทิ้งเสมอเพื่อเคลียร์สถานะ
-                    kill_specific_browser()
-    
-                    # 2. เคลียร์ reference ทันที
-                    browser_instance = None
-                    active_browser = None
-    
-                    # 3. บังคับ Garbage Collector ให้ทำงาน
-                    gc.collect()
-    
-                    # 4. พักการทำงานให้ OS เคลียร์ File Handles
-                    await asyncio.sleep(2) 
-    
-                    # 5. ลบ Profile
-                    await cleanup_profile()
-                        
-                    print("🔒 [System] ปิด Browser และเคลียร์หน่วยความจำแล้ว")
-            else:
-                print("ℹ️ Browser instance ไม่มีอยู่แล้ว")
-            
-            
             #รันรายงานสถิติ (ยิง api ตรง)
             stats_report = format_site_stats_report([n[0] for n in active_nodes])
             if stats_report:
