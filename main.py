@@ -17,7 +17,7 @@ import re
 from functools import lru_cache
 import hashlib
 import json
-import bencodepy
+import bcoding
 import requests
 import urllib3
 import ssl
@@ -365,24 +365,56 @@ async def save_mapping(data):
 
     await asyncio.to_thread(_save)
 
-def extract_info_hash(torrent_content):
+def extract_info_hash(torrent_content: bytes) -> str | None:
+    if not torrent_content:
+        return None
+
+    # 1. คลายบีบอัดกรณีข้อมูลติด Gzip (\x1f\x8b)
+    if torrent_content.startswith(b'\x1f\x8b'):
+        try:
+            torrent_content = gzip.decompress(torrent_content)
+        except Exception as e:
+            print(f"DEBUG: คลาย Gzip ไม่สำเร็จ: {e}")
+            return None
+
+    # 2. ป้องกันกรณีได้ HTML Response (ติด Referer Check หรือ Session หมดอายุ)
+    lowered = torrent_content[:200].lower()
+    if b'<html' in lowered or b'<!doctype' in lowered or b'<script' in lowered:
+        print("⚠️ [BEARBIT ERROR] ข้อมูลที่ได้เป็น HTML (ติด Referer Check หรือ Session หมดอายุ)")
+        return None
+
+    # 3. ตรวจสอบว่าขึ้นต้นด้วย 'd' ตามมาตรฐาน Bencode
+    if not torrent_content.startswith(b'd'):
+        print(f"DEBUG: ไม่ใช่ Bencode Data (Header: {torrent_content[:15]!r})")
+        return None
+
     try:
-        # ใช้ bencodepy ในการ decode ไฟล์ .torrent
-        # ข้อมูลที่ได้จะเป็น OrderedDict หรือ dict ที่ key เป็น bytes
-        metadata = bencodepy.decode(torrent_content)
-        
-        # เข้าถึงคีย์ 'info' ด้วย byte string b'info'
-        info_data = metadata[b'info']
-        
-        # เข้ารหัสส่วน info กลับเป็น bencode เพื่อคำนวณ hash
-        info_encoded = bencodepy.encode(info_data)
-        
-        # คำนวณ SHA1 Hash
-        return hashlib.sha1(info_encoded).hexdigest().lower()
-        
+        # Decode ด้วย bcoding
+        metadata = bcoding.bdecode(torrent_content)
+
+        if not isinstance(metadata, dict):
+            return None
+
+        # 4. ค้นหาคีย์ 'info' (bcoding มักใช้ bytes keys)
+        info_data = metadata.get(b'info') or metadata.get('info')
+        if not info_data:
+            for k, v in metadata.items():
+                k_str = k.decode('utf-8', errors='ignore') if isinstance(k, bytes) else str(k)
+                if k_str == 'info':
+                    info_data = v
+                    break
+
+        if not info_data:
+            keys_found = [k.decode('utf-8', errors='ignore') if isinstance(k, bytes) else str(k) for k in metadata.keys()]
+            print(f"⚠️ DEBUG: ไม่พบ info ใน Dictionary! Keys ที่พบ: {keys_found}")
+            return None
+
+        # Re-encode เฉพาะส่วน info กลับเป็น bytes แล้วทำ SHA-1
+        info_bytes = bcoding.bencode(info_data)
+        return hashlib.sha1(info_bytes).hexdigest().lower()
+
     except Exception as e:
-        # หาก decode ไม่สำเร็จ แสดงว่าไฟล์อาจไม่ใช่ torrent หรือ corrupted
-        print(f"DEBUG: ไม่สามารถสกัด Hash ได้: {e}")
+        print(f"DEBUG: bcoding Parsing Error: {e}")
         return None
 
 def parse_size(size_str):
@@ -1226,73 +1258,75 @@ class QbitNode:
             return False
 
     def add(self, content, site_name="Universal", size=None, n_cfg=None, save_path=None, skip_checking=False, tags="AutoPilot"):
-    """
-    เพิ่ม Torrent เข้า qBittorrent รองรับทั้ง Normal Grab และ Cross-Seed Mode
+        """
+        เพิ่ม Torrent เข้า qBittorrent รองรับทั้ง Normal Grab และ Cross-Seed Mode
     
-    :param save_path: ตำแหน่งโฟลเดอร์สำหรับเซฟไฟล์ (จำเป็นมากสำหรับ Cross-Seed)
-    :param skip_checking: หากเป็น True จะข้ามการตรวจ Hash และเริ่ม Seed ทันที
-    """
-    try:
-        if len(content) < 1000:
+        :param save_path: ตำแหน่งโฟลเดอร์สำหรับเซฟไฟล์ (จำเป็นมากสำหรับ Cross-Seed)
+        :param skip_checking: หากเป็น True จะข้ามการตรวจ Hash และเริ่ม Seed ทันที
+        """
+        try:
+            if len(content) < 1000:
+                return False
+
+            files = {"torrents": ("f.torrent", content, "application/x-bittorrent")}
+        
+            data = {
+                "paused": "false",
+                "firstLastPiecePrio": "true" if not skip_checking else "false",
+                "sequentialDownload": "false",
+                "category": site_name,
+                "tags": tags,
+                "autoTMM": "false"  # ปิด TMM เพื่อให้บังคับใช้ savepath ที่ส่งไปได้แม่นยำ
+            }
+
+            # 🎯 เพิ่มพารามิเตอร์พิเศษสำหรับ Cross-Seed
+            if save_path:
+                data["savepath"] = save_path
+        
+            if skip_checking:
+                data["skip_checking"] = "true"
+                data["tags"] = f"{tags},Cross-Seed" if tags else "Cross-Seed"
+
+            # ส่ง Request ไปยัง qBittorrent WebUI
+            r = self._execute_request(
+                'POST',
+                f"{self.url}/api/v2/torrents/add",
+                files=files,
+                data=data,
+                headers={'Referer': self.url},
+                auth=self.auth,
+                verify=False,
+                timeout=30
+            )
+
+            # 1. ตรวจสอบ Response สำเร็จ (รองรับทั้งแบบ text "Ok" และ JSON ผลลัพธ์ที่มี success_count หรือ added_torrent_ids)
+            if r is not None and r.status_code == 200:
+                resp_text = r.text.strip()
+                if "Ok" in resp_text or "success_count" in resp_text or "added_torrent_ids" in resp_text:
+                    return True
+            
+            # 2. กรณี Session หลุด (401/403) - Re-login แล้วลองอีกครั้ง
+            if r is not None and r.status_code in [401, 403]:
+                print(f" 🔄 [{self.name}] Session expired during add(), re-logging...")
+                if self.login():
+                    # ส่ง flag ป้องกัน loop โดยส่งพารามิเตอร์เดิมกลับไป
+                    return self.add(
+                        content=content, 
+                        site_name=site_name, 
+                        size=size, 
+                        n_cfg=n_cfg, 
+                        save_path=save_path, 
+                        skip_checking=skip_checking,
+                        tags=tags
+                    )
+        
+            error_msg = r.text if r is not None else "No response"
+            print(f"⚠️ [API Error] {self.name}: {r.status_code if r else 'None'} - {error_msg}")
             return False
 
-        files = {"torrents": ("f.torrent", content, "application/x-bittorrent")}
-        
-        data = {
-            "paused": "false",
-            "firstLastPiecePrio": "true" if not skip_checking else "false",
-            "sequentialDownload": "false",
-            "category": site_name,
-            "tags": tags,
-            "autoTMM": "false"  # ปิด TMM เพื่อให้บังคับใช้ savepath ที่ส่งไปได้แม่นยำ
-        }
-
-        # 🎯 เพิ่มพารามิเตอร์พิเศษสำหรับ Cross-Seed
-        if save_path:
-            data["savepath"] = save_path
-        
-        if skip_checking:
-            data["skip_checking"] = "true"
-            data["tags"] = f"{tags},Cross-Seed" if tags else "Cross-Seed"
-
-        # ส่ง Request ไปยัง qBittorrent WebUI
-        r = self._execute_request(
-            'POST',
-            f"{self.url}/api/v2/torrents/add",
-            files=files,
-            data=data,
-            headers={'Referer': self.url},
-            auth=self.auth,
-            verify=False,
-            timeout=30
-        )
-
-        # 1. ตรวจสอบ Response สำเร็จ (qBittorrent คืนค่า 200 พร้อมข้อความ "Ok.")
-        if r is not None and r.status_code == 200 and "Ok" in r.text:
-            return True
-            
-        # 2. กรณี Session หลุด (401/403) - Re-login แล้วลองอีกครั้ง
-        if r is not None and r.status_code in [401, 403]:
-            print(f" 🔄 [{self.name}] Session expired during add(), re-logging...")
-            if self.login():
-                # ส่ง flag ป้องกัน loop โดยส่งพารามิเตอร์เดิมกลับไป
-                return self.add(
-                    content=content, 
-                    site_name=site_name, 
-                    size=size, 
-                    n_cfg=n_cfg, 
-                    save_path=save_path, 
-                    skip_checking=skip_checking,
-                    tags=tags
-                )
-        
-        error_msg = r.text if r is not None else "No response"
-        print(f"⚠️ [API Error] {self.name}: {r.status_code if r else 'None'} - {error_msg}")
-        return False
-
-    except Exception as e:
-        print(f"❌ [Exception] {self.name}: {str(e)}")
-        return False
+        except Exception as e:
+            print(f"❌ [Exception] {self.name}: {str(e)}")
+            return False
 
     def get_all_torrents_info(self):
         try:
@@ -4600,27 +4634,44 @@ async def perform_quest_cleanup(site_key, db, current_quest_ids):
     return stats_completed
 
 async def get_torrent_details_full(page, base_url, details_url, torrent_id):
-    """ฟังก์ชันใหม่: ดึงข้อมูลครบจบในที่เดียว"""
+    """ฟังก์ชันดึงข้อมูลครบจบในที่เดียว (ความปลอดภัยสูง)"""
     await page.get(details_url)
     await asyncio.sleep(1.5)
     content = await page.get_content()
     
-    # ดึง Metadata
+    # 1. ดึง Metadata
     t_name, t_size_gb = extract_torrent_metadata(content)
     
-    # ดึง Download URL
+    # 2. ดึง Download URL
     soup = BeautifulSoup(content, 'html.parser')
     dl_tag = soup.find("a", href=re.compile(r"download(new)?\.php\?id=" + str(torrent_id), re.I))
     download_url = urljoin(base_url, dl_tag['href']) if dl_tag else None
     
-    # ดึง Hash
+    # 3. ดึงและสกัด Hash
     real_hash = "UNKNOWN"
     if download_url:
         raw_data = await download_torrent_smart(page, details_url, download_url)
-        if raw_data and raw_data.startswith(b'd'):
-            real_hash = extract_info_hash(raw_data).lower()
-            
-    return {"hash": real_hash, "name": t_name, "size_gb": t_size_gb, "download_url": download_url}
+        
+        # ป้องกันกรณีโหลดได้ HTML หรือ data ว่างเปล่า
+        if raw_data:
+            if raw_data.startswith(b'd'):
+                extracted = extract_info_hash(raw_data)
+                # ✅ เช็กความปลอดภัยก่อนใช้ .lower()
+                if extracted:
+                    real_hash = extracted.lower()
+                else:
+                    print(f"⚠️ [BEARBIT] ID {torrent_id}: โครงสร้าง Bencode สมบูรณ์แต่ไม่พบ b'info'")
+            else:
+                # กรณีดาวน์โหลดมาได้เป็นหน้า HTML Error/Login
+                preview = raw_data[:150].decode('utf-8', errors='ignore').replace('\n', ' ')
+                print(f"⚠️ [BEARBIT] ID {torrent_id}: ข้อมูลที่ได้ไม่ใช่ไฟล์ .torrent (Preview: {preview})")
+
+    return {
+        "hash": real_hash, 
+        "name": t_name, 
+        "size_gb": t_size_gb, 
+        "download_url": download_url
+    }
 
 def extract_torrent_metadata(html_content):
     soup = BeautifulSoup(html_content, 'lxml')

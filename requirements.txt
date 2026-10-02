@@ -21,7 +21,7 @@ ddddocr
 chardet
 cloudscraper
 pyvirtualdisplay
-bencodepy
 httpx
 aiohttp
 qbittorrent-api
+bcoding

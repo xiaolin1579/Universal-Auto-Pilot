@@ -6,9 +6,9 @@ SET PYTHON_FILE=main.py
 SET LOG_FILE=script_run.log
 chcp 65001 >nul
 
-echo 🚀 Starting TorrentDD Auto-Pilot (Wine/Windows Compatible)...
+echo 🚀 Starting Universal Auto-Pilot (nodriver Edition)...
 
-:: 1. ค้นหา Python (เหมือนเดิม)
+:: 1. ค้นหา Python
 SET PYTHON_EXE=python
 %PYTHON_EXE% --version >nul 2>&1
 if %errorlevel% neq 0 (
@@ -19,8 +19,11 @@ if %errorlevel% neq 0 (
     )
 )
 
-:: 2. ข้าม venv ไปเลยถ้าอยู่บน Wine (เพื่อความเสถียร)
-:: แต่ถ้าอยากใช้ venv ก็ให้ลบโฟลเดอร์เก่าทิ้งก่อนรันสคริปต์นี้
+:: 2. ตรวจสอบและลบแพ็กเกจส่วนเกินที่ไม่อยู่ใน requirements.txt ทิ้งอัตโนมัติ
+echo 🧹 Checking for obsolete packages...
+%PYTHON_EXE% -c "import importlib.metadata, subprocess, pathlib; req_file=pathlib.Path('requirements.txt'); reqs={l.split('#')[0].strip().lower().split('==')[0].split('>=')[0].split('<=')[0].split('>')[0].split('<')[0].strip() for l in req_file.read_text(encoding='utf-8', errors='ignore').splitlines() if l.strip() and not l.startswith('#')}; installed={d.metadata['Name'].lower() for d in importlib.metadata.distributions()}; obsolete=installed - reqs - {'pip','setuptools','wheel'}; [subprocess.run(['pip','uninstall','-y',p]) for p in obsolete]"
+
+:: 3. ติดตั้ง/อัปเดตแพ็กเกจ
 echo 📥 Installing Libraries...
 %PYTHON_EXE% -m pip install --upgrade pip
 %PYTHON_EXE% -m pip install -r requirements.txt
@@ -28,8 +31,7 @@ echo 📥 Installing Libraries...
 echo ----------------------------------------
 echo 📝 Running %PYTHON_FILE%...
 
-:: 3. เช็ค PowerShell แบบเน้นๆ
-:: ถ้ากัปตันรันบน Wine แล้วไม่ได้ลง 'wine powershell' ไว้ มันจะรันบรรทัดล่างนี้ทันที
+:: 4. รันสคริปต์พร้อมระบบจัดการ Log
 powershell -command "exit" >nul 2>&1
 if %errorlevel% neq 0 (
     echo [System] PowerShell not found, running direct mode...
