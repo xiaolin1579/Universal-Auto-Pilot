@@ -5825,11 +5825,14 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                 else:
                                     print("❌ ไม่สามารถดาวน์โหลดไฟล์ได้แม้จะลองคลิกผ่าน Browser แล้ว")
 
+                            # ---------------------------------------------------------
                             # 6. CHECK DUPLICATE HASH & SYNC
+                            # ---------------------------------------------------------
                             if download_ready:
                                 is_duplicate = False
                                 target_node_name = ""
 
+                                # ตรวจสอบว่าแฮชซ้ำใน seen_hashes หรือมีอยู่อยู่แล้วใน Node
                                 if t_hash in seen_hashes:
                                     is_duplicate = True
                                     for node_obj, _ in active_nodes:
@@ -5847,12 +5850,13 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                     effective_node_name = target_node_name
                                     if not effective_node_name and active_nodes:
                                         effective_node_name = active_nodes[0][0].name
-                                        print(f" ⚠ [Mapper]: ไม่พบชื่อ Node ของแฮชนี้ กำลังใช้ Node สำรอง: {effective_node_name}")
+                                        print(f" ⚠️ [Mapper]: ไม่พบชื่อ Node ของแฮชนี้ กำลังใช้ Node สำรอง: {effective_node_name}")
 
                                     print(f" ❌ ข้าม: ตรวจพบ Hash [...{t_hash[-5:]}] ซ้ำในระบบ/วิ่งอยู่ใน {effective_node_name or 'Unknown Node'}")
                                     seen_ids.add(t_id)
                                     seen_hashes.add(t_hash)
 
+                                    # ซิงค์ข้อมูลลง Mapping
                                     if effective_node_name:
                                         sync_data = dict(data)
                                         sync_data.update({
@@ -5869,131 +5873,217 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                                     await node_obj.sync_to_mapping(web_data_list=[sync_data])
                                                 synced = True
                                                 break
-                                        
+
                                         if not synced and active_nodes and hasattr(active_nodes[0][0], 'sync_to_mapping'):
                                             await active_nodes[0][0].sync_to_mapping(web_data_list=[sync_data])
 
+                                    # กดปุ่ม ขอบคุณ (Thanks) และข้าม
                                     await handle_thanks_click(browser_instance, details_url)
                                     count_skip += 1
                                     download_ready = False
 
-                            # 7. SEND TO CLIENT NODE
+                            # ---------------------------------------------------------
+                            # 7. PROCESS & SEND TO CLIENT NODE
+                            # ---------------------------------------------------------
                             if download_ready:
                                 print(f"✅ [{site}] พร้อมส่งไฟล์เข้า Client (Hash: {t_hash})")
                                 
-                                target_node = None
-                                best_free_space = -1
+                                # เรียงลำดับ Node ที่มีพื้นที่ว่างมากที่สุดขึ้นก่อน
+                                active_nodes.sort(key=lambda x: getattr(x[0], 'free_gb', 0), reverse=True)
+                                success_node = None
+                                task_weight = calculate_task_weight(t_size_gb) if 'calculate_task_weight' in globals() else 1.0
 
-                                for node_obj, node_cfg in active_nodes:
-                                    try:
-                                        is_available = True
-                                        if hasattr(node_obj, 'is_available'):
-                                            is_available = await node_obj.is_available()
+                                for node_obj, n_cfg in active_nodes:
+                                    if stop_event.is_set(): 
+                                        break
+                                    
+                                    node_name = getattr(node_obj, 'name', 'Unknown Node')
+
+                                    # 1. ตรวจสอบ Load (Weight)
+                                    d_type = n_cfg.get('disk_type', 'HDD') if isinstance(n_cfg, dict) else 'HDD'
+                                    dynamic_max_cap = 100.0
+                                    if 'get_node_dynamic_cap' in globals():
+                                        dynamic_max_cap, _ = get_node_dynamic_cap(node_obj, d_type)
+                                    
+                                    current_load = 0.0
+                                    if 'get_node_current_weight' in globals():
+                                        current_load = round(get_node_current_weight(node_obj), 1)
+
+                                    if (current_load + task_weight) > dynamic_max_cap:
+                                        print(f"⚠️ [{node_name}] โหลดเกินกำหนด (Load: {current_load}/{dynamic_max_cap}) -> ข้าม")
+                                        continue
+                                    
+                                    # 2. คำนวณพื้นที่ (Buffer)
+                                    downloading_size = 0
+                                    if hasattr(node_obj, 'get_downloading_size'):
+                                        downloading_size = max(0, node_obj.get_downloading_size())
+                                    
+                                    node_free_gb = getattr(node_obj, 'free_gb', 0)
+                                    effective_free_gb = max(0, node_free_gb - downloading_size)
+                                    
+                                    required_space = t_size_gb + 15.0
+                                    cleaner = None
+                                    if 'NodeCleaner' in globals():
+                                        cleaner = NodeCleaner(node_obj, n_cfg, global_clean if 'global_clean' in globals() else None)
+
+                                    # 3. Smart Reclaim ล้างดิสก์อัตโนมัติหากพื้นที่ไม่พอ
+                                    if effective_free_gb < required_space and cleaner:
+                                        cleaner.smart_reclaim_process(required_gb=required_space, is_emergency=False)
+                                        if hasattr(node_obj, 'refresh_status'):
+                                            node_obj.refresh_status()
                                         
-                                        if not is_available:
+                                        downloading_size = max(0, node_obj.get_downloading_size()) if hasattr(node_obj, 'get_downloading_size') else 0
+                                        effective_free_gb = max(0, getattr(node_obj, 'free_gb', 0) - downloading_size)
+
+                                    # 4. Final Check & Emergency Flush
+                                    if effective_free_gb < (t_size_gb + 5.0):
+                                        if cleaner:
+                                            print(f"🔄 [{node_name}] Reclaim รอบแรกพื้นที่ไม่พอ Try Emergency Flush...")
+                                            cleaner.smart_reclaim_process(required_gb=required_space, is_emergency=True)
+                                            if hasattr(node_obj, 'refresh_status'):
+                                                node_obj.refresh_status()
+                                            
+                                            dl_size = max(0, node_obj.get_downloading_size()) if hasattr(node_obj, 'get_downloading_size') else 0
+                                            effective_free_gb = max(0, getattr(node_obj, 'free_gb', 0) - dl_size)
+                                        
+                                        if effective_free_gb < (t_size_gb + 5.0):
+                                            print(f"⚠️ [{node_name}] พื้นที่ไม่พอจริงๆ (เหลือ {effective_free_gb:.1f}GB) -> ข้าม")
                                             continue
 
-                                        free_bytes = 0
-                                        if hasattr(node_obj, 'get_free_space'):
-                                            free_bytes = await node_obj.get_free_space()
-                                        
-                                        required_bytes = t_size_bytes + (5 * 1024 * 1024 * 1024)
-                                        if free_bytes > required_bytes and free_bytes > best_free_space:
-                                            best_free_space = free_bytes
-                                            target_node = node_obj
+                                    # =========================================================================
+                                    # 5. ส่งไฟล์เข้า Client Node & ประมวลผล Payload
+                                    # =========================================================================
+                                    try:
+                                        raw_bytes = raw_data_bytes if 'raw_data_bytes' in locals() else None
+                                        if not raw_bytes:
+                                            print(f"❌ [Error] ข้อมูลไฟล์ทอร์เรนต์ (raw_data_bytes) ว่างเปล่า ไม่สามารถส่งเข้า {node_name}")
+                                            continue
 
-                                    except Exception as node_err:
-                                        print(f"⚠️ [{site}] เกิดข้อผิดพลาดขณะตรวจสอบ Node {getattr(node_obj, 'name', 'Unknown')}: {node_err}")
+                                        result = False
+                                        if 'safe_add_torrent' in globals():
+                                            result = safe_add_torrent(node_obj, raw_bytes, site)
+                                        elif hasattr(node_obj, 'add_torrent'):
+                                            result = await node_obj.add_torrent(torrent_bytes=raw_bytes, category=site)
 
-                                if target_node:
-                                    print(f"🎯 เลือก Node: [{target_node.name}] (พื้นที่คงเหลือ: {best_free_space / (1024**3):.2f} GB)")
-                                    
-                                    add_success = False
-                                    if hasattr(target_node, 'add_torrent'):
-                                        add_success = await target_node.add_torrent(
-                                            torrent_bytes=raw_data_bytes,
-                                            save_path=None,
-                                            category=site,
-                                            is_paused=False
-                                        )
+                                        if result:
+                                            size_gb_val = t_size_gb if t_size_gb is not None else 0.0
+                                            success_msg = f"📥 [Success] {node_name} | {size_gb_val:.1f}GB | {raw_title[:40]}"
+                                            print(f"🎯 เลือก Node: [{node_name}] -> {success_msg}")
+                                            
+                                            current_free = getattr(node_obj, 'free_gb', 0.0)
+                                            node_obj.free_gb = max(0.0, current_free - (size_gb_val + 0.1))
+                                            
+                                            added_in_zone.append(success_msg)
+                                            seen_ids.add(t_id)
+                                            seen_hashes.add(t_hash)
+                                            data_saved = True
+                                            success_node = node_obj
 
-                                    if add_success:
-                                        print(f"🎉 [{site}] เพิ่ม Torrent สำเร็จ -> ID: {t_id} | Node: {target_node.name}")
-                                        seen_ids.add(t_id)
-                                        seen_hashes.add(t_hash)
-                                        data_saved = True
-                                        
-                                        # บันทึกรายการที่เพิ่มสำเร็จ
-                                        added_in_zone.append(f"📥 [Success] {target_node.name} | {t_size_gb:.1f}GB | {raw_title}")
+                                            web_item_payload = {
+                                                "torrent_id": t_id,
+                                                "site_name": site,
+                                                "release_name": raw_title,
+                                                "web_size": data.get('size_str', ''),
+                                                "download_url": download_url,
+                                                "details_url": details_url
+                                            }
 
-                                        if hasattr(target_node, 'sync_to_mapping'):
-                                            sync_data = dict(data)
-                                            sync_data.update({
-                                                'hash': t_hash, 'id': t_id, 'torrent_id': t_id,
-                                                'site': site, 'site_name': site, 'release_name': raw_title,
-                                                'web_size': data.get('size_str', ''),
-                                                'download_url': download_url, 'details_url': details_url
-                                            })
-                                            await target_node.sync_to_mapping(web_data_list=[sync_data])
+                                            client_response_payload = {
+                                                "client_type": getattr(node_obj, "client_type", "rtorrent"),
+                                                "hash": t_hash,
+                                                "name": t_name if 't_name' in locals() else raw_title,
+                                                "size_bytes": int(size_gb_val * 1024 * 1024 * 1024),
+                                                "state": "downloading",
+                                                "save_path": getattr(node_obj, "save_path", "")
+                                            }
 
-                                        await handle_thanks_click(browser_instance, details_url)
-                                    else:
-                                        full_nodes_in_zone.append(f"❌ [Full] {raw_title}")
-                                else:
-                                    # หากไม่มี Node ใดมีพื้นที่พอ ให้ลงรายการในกลุ่ม Queue Full
-                                    full_nodes_in_zone.append(f"❌ [Full] {raw_title}")
+                                            if 'handle_new_torrent_grabbed' in globals():
+                                                await handle_new_torrent_grabbed(
+                                                    web_item=web_item_payload, 
+                                                    client_response=client_response_payload, 
+                                                    host_name=node_name
+                                                )
+
+                                            await handle_thanks_click(browser_instance, details_url)
+                                            break  # ส่งเข้า Node สำเร็จ ออกจาก loop node
+
+                                    except Exception as send_err:
+                                        print(f"❌ เกิดข้อผิดพลาดขณะส่งไฟล์เข้า Node [{node_name}]: {send_err}")
+
+                                if not success_node:
+                                    print(f"⛔ [{site}] ไม่มี Node ใดสามารถรับไฟล์ขนาด {t_size_gb:.2f} GB ได้")
+                                    full_nodes_in_zone.append(f"❌ [Full] {raw_title[:40]}")
 
                         except Exception as row_err:
-                            print(f"⚠️ [{site}] เกิดข้อผิดพลาดขณะประมวลผลแถว Torrent (ID: {t_id}): {row_err}")
-                            traceback.print_exc()
+                            print(f"⚠️ [{site}] เกิดข้อผิดพลาดขณะประมวลผลรายการ Torrent (ID: {t_id if 't_id' in locals() else 'N/A'}): {row_err}")
+                            if 'traceback' in globals():
+                                traceback.print_exc()
 
-                    # ---------------------------------------------------------
-                    # 📊 สรุปและแจ้งเตือนประจำ Zone
-                    # ---------------------------------------------------------
-                    summary_msg = []
+                    # =========================================================================
+                    # 📊 สรุปและแจ้งเตือนประจำ Zone (ทำงานหลังจบการวนลูป Torrent ใน Zone นั้นๆ)
+                    # =========================================================================
+                    try:
+                        summary_msg = []
 
-                    # ใช้ฟังก์ชัน generate_main_status เพื่อดึงบรรทัดเงื่อนไข (รองรับ % Freeleech สำหรับบางเว็บ)
-                    condition_text = generate_main_status(CFG, site_name=site)
-                    summary_msg.append(condition_text)
-                    summary_msg.append(f"🌐 Scanning: [{display_zone}] {target_url}\n")
+                        min_gb = SET.get('MIN_SIZE_GB', 0) if 'SET' in globals() else 0
+                        max_gb = SET.get('MAX_SIZE_GB', 999) if 'SET' in globals() else 999
 
-                    if not added_in_zone and not full_nodes_in_zone:
-                        summary_msg.append("❌ ไม่มีไฟล์เข้าเงื่อนไข")
-                    else:
-                        if added_in_zone:
-                            summary_msg.append("✅ Added:")
-                            summary_msg.extend(added_in_zone)
+                        if 'generate_main_status' in globals() and 'CFG' in globals():
+                            condition_text = generate_main_status(CFG, site_name=site)
+                        else:
+                            condition_text = f"⚙️ เงื่อนไข: ขนาด {min_gb:.1f}-{max_gb:.1f}GB"
 
-                        if full_nodes_in_zone:
-                            # ใส่เว้นวรรคบรรทัดใหม่ก่อนขึ้นส่วน Queue Full หากมีรายการ Added ด้านบน
+                        summary_msg.append(condition_text)
+                        summary_msg.append(f"🌐 Scanning: [{display_zone}] {target_url if 'target_url' in locals() else ''}\n")
+
+                        if not added_in_zone and not full_nodes_in_zone:
+                            summary_msg.append("❌ ไม่มีไฟล์เข้าเงื่อนไข")
+                        else:
                             if added_in_zone:
-                                summary_msg.append("")
-                            summary_msg.append("⚠️ Queue Full:")
-                            summary_msg.extend(full_nodes_in_zone)
+                                summary_msg.append("✅ Added:")
+                                summary_msg.extend(added_in_zone)
 
-                    summary_msg.append(f"\n📊 สรุป {display_zone}: เพิ่ม {len(added_in_zone)} | เต็ม {len(full_nodes_in_zone)} | ข้าม {count_skip}")
+                            if full_nodes_in_zone:
+                                if added_in_zone:
+                                    summary_msg.append("")
+                                summary_msg.append("⚠️ Queue Full:")
+                                summary_msg.extend(full_nodes_in_zone)
 
-                    full_report = "\n".join(summary_msg)
-                    print("\n" + full_report + "\n")
+                        summary_msg.append(f"\n📊 สรุป {display_zone}: เพิ่ม {len(added_in_zone)} | เต็ม {len(full_nodes_in_zone)} | ข้าม {count_skip}")
 
-                    # ส่งแจ้งเตือนผ่าน Discord Webhook / Notification Handler (ถ้ามี)
-                    if 'send_notify' in globals():
-                        await send_notify(full_report)
+                        full_report = "\n".join(summary_msg)
+                        print("\n" + full_report + "\n")
 
-            if data_saved:
-                save_data(current_site_seen_file, seen_ids)
-                save_data(current_site_hash_file, seen_hashes)
-                print(f"💾 [{site}] บันทึกประวัติ Seen IDs ({len(seen_ids)}) และ Hashes ({len(seen_hashes)}) เรียบร้อย")
+                        if 'send_discord_notify' in globals():
+                            await send_discord_notify(full_report)
+
+                    except Exception as zone_err:
+                        print(f"❌ [{site}] เกิดข้อผิดพลาดขณะสรุปผล Zone [{display_zone}]: {zone_err}")
 
         except Exception as site_err:
             print(f"❌ [{site}] เกิดข้อผิดพลาดระดับเว็บ: {site_err}")
-            traceback.print_exc()
+            if 'traceback' in globals():
+                traceback.print_exc()
 
-    if cross_seed_target:
+        finally:
+            # บันทึกข้อมูลประวัติ Seen IDs & Hashes ประจำเว็บ
+            if 'data_saved' in locals() and data_saved:
+                try:
+                    save_data(current_site_seen_file, seen_ids)
+                    save_data(current_site_hash_file, seen_hashes)
+                    print(f"💾 [{site}] บันทึกประวัติ Seen IDs ({len(seen_ids)}) และ Hashes ({len(seen_hashes)}) เรียบร้อย")
+                except Exception as save_err:
+                    print(f"⚠️ [{site}] ไม่สามารถบันทึก Seen Data ได้: {save_err}")
+
+    # =========================================================================
+    # 🏁 สรุปผลการสแกนทั้งหมด (ทำงานเมื่อวนครบทุก Site แล้ว)
+    # =========================================================================
+    if 'cross_seed_target' in locals() and cross_seed_target:
         print(f"\n🎯 [Cross-Seed Summary] พบรายการที่ตรงกันทั้งหมด {len(cross_seed_matches)} รายการ")
         return cross_seed_matches
 
     print("\n🏁 สแกนและประมวลผลทุกเว็บไซต์เสร็จสิ้น")
+    return True
 
 async def main():
     global browser_instance
