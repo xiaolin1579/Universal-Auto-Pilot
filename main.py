@@ -6086,8 +6086,8 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                         full_report = "\n".join(summary_msg)
                         print("\n" + full_report + "\n")
 
-                        if 'send_discord_notify' in globals():
-                            await send_discord_notify(full_report)
+                        if 'send_notify' in globals():
+                            await send_notify(full_report)
 
                     except Exception as zone_err:
                         print(f"❌ [{site}] เกิดข้อผิดพลาดขณะสรุปผล Zone [{display_zone}]: {zone_err}")
