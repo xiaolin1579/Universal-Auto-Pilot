@@ -1123,52 +1123,69 @@ class QbitNode:
             self.is_connected = False
             return False
 
-    def refresh_status(self):
-        if not self.is_connected: return False
+    def refresh_status(self, retry_login=True):
+        if not self.is_connected:
+            return False
         
         try:
             # 1. ดึงข้อมูล Maindata
-            # ใช้ _execute_request พร้อมระบุ timeout ให้ชัดเจน
             r_main = self._execute_request('GET', f"{self.url}/api/v2/sync/maindata", timeout=10)
             
+            # ตรวจสอบ Session Expired / Unauthorized
             if r_main is None or r_main.status_code in [401, 403]:
-                print(f" 🔄 [{self.name}] Session expired or connection failed, re-logging...")
-                return self.login() and self.refresh_status()
+                if retry_login:
+                    print(f" 🔄 [{self.name}] Session expired, re-logging...")
+                    return self.login() and self.refresh_status(retry_login=False)
+                return False
+
+            if r_main.status_code != 200:
+                print(f"⚠️ [{self.name}] Sync maindata failed with status: {r_main.status_code}")
+                return False
 
             try:
                 main_data = r_main.json()
                 server_state = main_data.get('server_state', {})
-            except Exception:
+            except Exception as e:
+                print(f"⚠️ [{self.name}] Failed to parse maindata JSON: {e}")
                 return False
 
             # 2. ดึงลิสต์ทอร์เรนต์ทั้งหมด
             r_torrents = self._execute_request('GET', f"{self.url}/api/v2/torrents/info", timeout=15)
             if r_torrents is None or r_torrents.status_code in [401, 403]:
-                return self.login() and self.refresh_status()
+                if retry_login:
+                    return self.login() and self.refresh_status(retry_login=False)
+                return False
+
+            if r_torrents.status_code != 200:
+                print(f"⚠️ [{self.name}] Torrents info failed with status: {r_torrents.status_code}")
+                return False
+
+            try:
+                torrents = r_torrents.json()
+            except Exception as e:
+                print(f"⚠️ [{self.name}] Failed to parse torrents JSON: {e}")
+                return False
             
-            torrents = r_torrents.json()
+            # นับจำนวนทอร์เรนต์ทั้งหมด
+            active_count = len(torrents) if isinstance(torrents, list) else 0
             
-            # --- ปรับแก้: นับจำนวนทอร์เรนต์ทั้งหมดโดยไม่สนใจสถานะ ---
-            active_count = len(torrents) 
-            
-            # 3. คำนวณพื้นที่ (ใช้ตัวแปรเหมือนเดิม)
+            # 3. คำนวณพื้นที่
             capacity_limit_gb = getattr(self, 'total_disk_gb', self.quota_gb) 
             real_disk_free_gb = server_state.get('free_space_on_disk', 0) / (1024**3)
-            used_gb = max(0, capacity_limit_gb - real_disk_free_gb)
-            quota_free_gb = max(0, self.quota_gb - used_gb)
+            used_gb = max(0.0, capacity_limit_gb - real_disk_free_gb)
+            quota_free_gb = max(0.0, self.quota_gb - used_gb)
             
             # 4. สรุปผล
             safety_buffer = 15.0
             display_free = min(quota_free_gb, real_disk_free_gb)
             
-            # ในส่วนของ stat_msg จะแสดงผล A (All) แทน A (Active) เพื่อความชัดเจน
             self.stat_msg = (
                 f"FREE(Q): {quota_free_gb:.1f}GB | FREE(D): {real_disk_free_gb:.1f}GB | "
                 f"Total: {active_count} | Used: {used_gb:.1f}G / {self.quota_gb:.0f}G | "
-                f"Safe: {max(0, display_free - safety_buffer):.1f}G"
+                f"Safe: {max(0.0, display_free - safety_buffer):.1f}G"
             )
 
-            self.free_gb = max(0, display_free - safety_buffer)
+            self.free_gb = max(0.0, display_free - safety_buffer)
             
             return True
             
@@ -1665,9 +1682,11 @@ class RtorrentNode:
         return False
 
     def refresh_status(self):
-        if not self.is_connected: return False
+        if not self.is_connected:
+            return False
+
         try:
-            # 1. ยิง XML-RPC ดึง 4 ฟิลด์ (เพิ่ม d.hash= เพื่อใช้นับจำนวนทั้งหมด)
+            # 1. ยิง XML-RPC ดึงข้อมูล (d.is_active=, d.size_bytes=, d.bytes_done=, d.hash=)
             xml = (
                 '<?xml version="1.0"?>'
                 '<methodCall>'
@@ -1682,70 +1701,83 @@ class RtorrentNode:
                 '</params>'
                 '</methodCall>'
             )
-        
-            # 🔥 วนลูป Retry
+
             r = None
             for attempt in range(3):
                 try:
                     r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=10, verify=False)
                     break
                 except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-                    if attempt < 2: time.sleep(1.0)
-                    else: return True 
-        
+                    if attempt < 2:
+                        time.sleep(1.0)
+                    else:
+                        print(f"⚠️ [{self.name}] rTorrent connection timed out after 3 retries")
+                        return False
+
+            if r is None:
+                return False
+
             if r.status_code in [401, 403]:
-                if self.login(): return False
-        
+                print(f"🔄 [{self.name}] Session expired, attempting re-login...")
+                if self.login():
+                    return False
+                return False
+
+            if r.status_code != 200:
+                print(f"⚠️ [{self.name}] XML-RPC returned HTTP {r.status_code}")
+                return False
+
             soup = BeautifulSoup(r.text, "xml")
-            
+
             active = 0
-            total_count = 0  # เพิ่มตัวแปรสำหรับนับทอร์เรนต์ทั้งหมด
+            total_count = 0
             used_bytes = 0
-        
+
             # หาโหนดข้อมูล
             torrent_nodes = soup.find_all("data")
             if len(torrent_nodes) > 1:
                 for node in torrent_nodes[1:]:
                     items = node.find_all("value", recursive=False)
-                    if len(items) >= 4: # มี 4 ฟิลด์แล้ว
+                    if len(items) >= 4:
                         try:
                             is_active = int(items[0].get_text().strip())
                             bytes_done = int(items[2].get_text().strip())
-                            
+
                             if is_active == 1:
                                 active += 1
-                            total_count += 1 # นับทอร์เรนต์ทั้งหมด
+                            total_count += 1
                             used_bytes += bytes_done
                         except ValueError:
                             pass
-        
+
             used_gb = used_bytes / (1024**3)
             safety_buffer = 15.0
 
-            # 2. ดึง Disk Free
+            # 2. ดึง Disk Free space
             xml_disk = '<?xml version="1.0"?><methodCall><methodName>network.disk_free_4gb</methodName></methodCall>'
-            r_free = self.s.post(self.url, data=xml_disk, auth=self.auth, headers=self.headers, timeout=10, verify=False)
-            
-            real_free = 0.0
-            if r_free.status_code == 200:
-                free_soup = BeautifulSoup(r_free.text, "xml")
-                free_node = free_soup.find(["i8", "int", "i4", "value"])
-                if free_node:
-                    real_free = (int(free_node.get_text().strip()) * 4096) / (1024**3)
-            
-            real_free_gb = real_free
+            real_free_gb = 0.0
 
-            # 3. คำนวณพื้นที่
-            quota_free_gb = max(0, self.quota_gb - used_gb) if self.quota_gb > 0 else float('inf')
-            
+            try:
+                r_free = self.s.post(self.url, data=xml_disk, auth=self.auth, headers=self.headers, timeout=10, verify=False)
+                if r_free and r_free.status_code == 200:
+                    free_soup = BeautifulSoup(r_free.text, "xml")
+                    free_node = free_soup.find(["i8", "int", "i4", "value"])
+                    if free_node:
+                        real_free_gb = (int(free_node.get_text().strip()) * 4096) / (1024**3)
+            except Exception as disk_err:
+                print(f"⚠️ [{self.name}] Disk free check warning: {disk_err}")
+
+            # 3. คำนวณพื้นที่ Quota & Display Free
+            quota_free_gb = max(0.0, self.quota_gb - used_gb) if self.quota_gb > 0 else float('inf')
+
             if self.quota_gb > 0:
                 display_free = min(quota_free_gb, real_free_gb)
             else:
                 display_free = real_free_gb
 
-            self.free_gb = max(0, display_free - safety_buffer)
+            self.free_gb = max(0.0, display_free - safety_buffer)
 
-            # 4. ประกอบร่างข้อความ (เปลี่ยน A เป็น Total)
+            # 4. แสดงผลลัพธ์
             if self.quota_gb > 0:
                 self.stat_msg = (
                     f"FREE(Q): {quota_free_gb:.1f}GB | FREE(D): {real_free_gb:.1f}GB | "
@@ -1754,9 +1786,9 @@ class RtorrentNode:
                 )
             else:
                 self.stat_msg = f"FREE: {display_free:.1f}GB | Total: {total_count} | Used: {used_gb:.1f}G | Safe: {self.free_gb:.1f}G"
-                
+
             return True
-        
+
         except Exception as e:
             print(f"⚠️ [{self.name}] rTorrent Refresh Status Error: {e}")
             return False
