@@ -5458,27 +5458,36 @@ class BrowserSessionWrapper:
             self.text = raw_bytes.decode('utf-8', errors='ignore')
             self.status_code = 200
 
-    async def get(self, url, headers=None, timeout=15):
-        try:
-            tab = self.browser.main_tab
-            
-            # ลงทะเบียน Handler Headers
-            async def add_headers(event):
-                if headers: event.request.headers.update(headers)
-            
-            tab.add_handler(uc.cdp.network.RequestWillBeSent, add_headers)
 
-            # โหลด URL
-            await tab.get(url)
-            await tab.wait(timeout)
-        
-            # 3. ดึง Content
-            content = await tab.get_content()
-        
+    async def get(self, url, headers=None, timeout=15):
+        tab = self.browser.main_tab
+
+        async def add_headers(event):
+            if headers:
+                event.request.headers.update(headers)
+
+        try:
+            tab.add_handler(
+                uc.cdp.network.RequestWillBeSent,
+                add_headers
+            )
+            try:
+                await tab.get(url)
+                await tab.wait(timeout)
+                content = await tab.get_content()
+            finally:
+                tab.remove_handler(
+                    uc.cdp.network.RequestWillBeSent,
+                    add_headers
+                )
+
             if not content:
                 return None
-            
-            return self.MockResponse(content.encode('utf-8', errors='ignore'))
+
+            return self.MockResponse(
+                content.encode('utf-8', errors='ignore')
+            )
+
         except Exception as e:
             print(f"❌ Error: {e}")
             return None
