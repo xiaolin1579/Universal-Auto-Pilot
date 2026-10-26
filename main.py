@@ -1380,35 +1380,61 @@ class QbitNode:
         except Exception:
             return 0.0
             
+    
     def get_active_downloads(self):
-        # ไม่จำเป็นต้องสั่ง login() ตรงนี้ ถ้า _execute_request ของคุณจัดการ re-login ให้แล้ว
-        # แต่ถ้าต้องการเช็คก่อนก็ทำได้ครับ
-        
+        """ดึง torrent ที่กำลังดาวน์โหลดหรือตรวจสอบจาก qBittorrent"""
         results = []
-        # วนลูปดึงข้อมูลด้วย _execute_request
-        for filter_type in ['downloading', 'checking']:
+        seen_hashes = set()
+
+        for filter_type in ("downloading", "checking"):
             try:
                 r = self._execute_request(
-                    'GET', 
-                    f"{self.url}/api/v2/torrents/info", 
-                    params={'filter': filter_type},
-                    timeout=10
+                    "GET",
+                    f"{self.url}/api/v2/torrents/info",
+                    params={"filter": filter_type},
+                    timeout=10,
                 )
 
-                if r is not None and r.status_code == 200:
-                    torrents = r.json()
-                    for t in torrents:
-                        results.append({
-                            'hash': t.get('hash'),
-                            'size_bytes': t.get('size', 0),
-                            'state': t.get('state'),
-                            'amount_left': t.get('amount_left', 0)
-                        })
-                elif r is not None and r.status_code in [401, 403]:
+                if r is None:
+                    continue
+
+                if r.status_code in (401, 403):
                     self.is_connected = False
-                    
-            except Exception:
-                continue # ข้ามกรณีที่ Parse JSON ผิดพลาดหรือ network มีปัญหา
+                    continue
+
+                if r.status_code != 200:
+                    print(
+                        f"⚠️ [{self.name}] "
+                        f"torrents/info HTTP {r.status_code}"
+                    )
+                    continue
+
+                for t in r.json():
+                    torrent_hash = (t.get("hash") or "").lower()
+
+                    # ป้องกันการนับซ้ำ หาก torrent ปรากฏในทั้งสองผลลัพธ์
+                    if not torrent_hash or torrent_hash in seen_hashes:
+                        continue
+                    seen_hashes.add(torrent_hash)
+
+                    results.append({
+                        "hash": torrent_hash,
+                        "name": t.get("name", ""),
+                        "size_bytes": int(t.get("size") or 0),
+                        "state": t.get("state", ""),
+                        "dlspeed": int(t.get("dlspeed") or 0),
+                        "progress": float(t.get("progress") or 0),
+                        "last_activity": int(
+                            t.get("last_activity") or 0
+                        ),
+                        "amount_left": int(t.get("amount_left") or 0),
+                    })
+
+            except Exception as e:
+                print(
+                    f"⚠️ [{self.name}] "
+                    f"get_active_downloads ({filter_type}): {e}"
+                )
 
         return results
 
@@ -5260,41 +5286,67 @@ def get_node_dynamic_cap(node, disk_type):
 
 def get_node_current_weight(node):
     active_torrents = node.get_active_downloads()
-    total_weight = 0
+    total_weight = 0.0
     now = time.time()
 
     for t in active_torrents:
-        # ดึงค่าสถานะตรงๆ จาก qBittorrent
-        state = t.get('state', '').lower()
-        dl_speed = t.get('dlspeed', 0)
-        progress = t.get('progress', 0)
-        size_gb = t.get('size_bytes', 0) / (1024**3)
-        
-        # คำนวณ Weight มาตรฐานตามขนาดไฟล์
+        state = str(t.get("state") or "").lower()
+        dl_speed = max(0, int(t.get("dlspeed") or 0))
+        progress = float(t.get("progress") or 0)
+        size_bytes = max(0, int(t.get("size_bytes") or 0))
+        size_gb = size_bytes / (1024 ** 3)
+
         weight = calculate_task_weight(size_gb)
 
-        # --- [NEW] Logic สำหรับจัดการไฟล์กั๊กที่ (Stalled / Queued) ---
-        
-        # ถ้าสถานะเป็น Stalled หรือโดน Queue ไว้ (ยังไม่วิ่ง)
-        # หรือความเร็วเป็น 0 นานเกิน 5 นาที (idle_time)
-        last_activity = t.get('last_activity', now)
-        idle_time = now - last_activity
+        last_activity = t.get("last_activity")
+        idle_time = None
 
-        # 1. ระดับรุนแรงที่สุด: Stalled หรือนิ่งสนิท
-        if 'stalled' in state or (dl_speed == 0 and idle_time > 300):
-            weight *= 0.1 
-            
-        # 2. ระดับกั๊กหนัก: วิ่งต่ำกว่า 500 KB/s (พวกกั๊กเม็ดชัดเจน)
+        # 0 หรือ None ถือว่าไม่มีข้อมูลเวลา ไม่ใช้คำนวณ idle
+        if last_activity is not None:
+            try:
+                last_activity = float(last_activity)
+                if last_activity > 0:
+                    idle_time = max(0, now - last_activity)
+            except (TypeError, ValueError):
+                idle_time = None
+
+        # ลดน้ำหนักเฉพาะสถานะที่ยืนยันว่าหยุด/รออยู่
+        is_stalled = "stalled" in state
+        is_queued = "queued" in state
+
+        if is_stalled:
+            weight *= 0.1
+
+        elif is_queued and dl_speed == 0:
+            # Queued ไม่ได้ใช้ disk I/O ดาวน์โหลดอยู่ในขณะนั้น
+            weight *= 0.1
+
+        elif (
+            dl_speed == 0
+            and idle_time is not None
+            and idle_time > 300
+        ):
+            weight *= 0.1
+
         elif dl_speed < (500 * 1024) and progress > 0.05:
             weight *= 0.2
-            print(f"🕵️ [Anti-Gak] พบไฟล์กั๊กสปีดต่ำมาก: {t.get('name')[:20]}... | Weight -> {weight:.2f}")
+            print(
+                f"🕵️ [Anti-Gak] {t.get('name', 'Unknown')[:40]} "
+                f"| speed={dl_speed / 1024:.1f} KiB/s "
+                f"| Weight={weight:.2f}"
+            )
 
-        # 3. ระดับกั๊กปานกลาง: วิ่งต่ำกว่า 2 MB/s (สปีดไม่สมศักดิ์ศรี Seedbox)
         elif dl_speed < (2 * 1024 * 1024) and progress > 0.01:
-            weight *= 0.4 # ปรับเพิ่มจาก 0.3 เป็น 0.4 เพื่อไม่ให้รับงานใหม่รัวจน Disk พัง
+            weight *= 0.4
 
         total_weight += weight
-            
+
+    print(
+        f"[WEIGHT SUMMARY] [{getattr(node, 'name', 'Unknown')}] "
+        f"active_count={len(active_torrents)} "
+        f"total_weight={total_weight:.1f}"
+    )
+
     return total_weight
 
 # ========================= MAIN FUNCTIONS =========================
