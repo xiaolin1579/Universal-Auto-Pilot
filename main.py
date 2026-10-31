@@ -53,50 +53,20 @@ ocr = ddddocr.DdddOcr(show_ad=False)
 
 stop_event = asyncio.Event()
 
-async def handle_exit(sig):
-    if stop_event.is_set(): return
+# GRACEFUL_SHUTDOWN_PATCH_V1
+# Signal Handler มีหน้าที่ร้องขอหยุดเท่านั้น
+# Main Loop เป็นเจ้าของการ Cleanup ทั้งหมด
+
+def handle_exit(sig):
+    if stop_event.is_set():
+        return
+
+    print(
+        f"\n🛑 ได้รับสัญญาณ {sig}; "
+        "กำลังรอ Main Loop หยุดอย่างปลอดภัย..."
+    )
     stop_event.set()
-    
-    print(f"\n🛑 ได้รับสัญญาณ {sig}, กำลังสั่งปิดระบบแบบเร่งด่วน...")
 
-    # 1. ปิด Browser และ Xvfb ไปพร้อมกัน (ไม่รอทีละขั้นตอน)
-    async def fast_close_browser():
-        global browser_instance
-        if browser_instance:
-            print("⏳ [Step 1/3] กำลังหยุด Browser...")
-            try:
-                if hasattr(browser_instance, 'stop'):
-                    await asyncio.wait_for(browser_instance.stop(), timeout=3)
-            except: pass
-            kill_specific_browser()
-            await cleanup_profile()
-            browser_instance = None
-            kill_xvfb()
-            print("✅ [Step 1/3] Browser ปิดเรียบร้อย")
-
-    # สั่งงานปิด Browser และ Xvfb แบบคู่ขนาน
-    cleanup_tasks = [
-        asyncio.create_task(fast_close_browser()),
-        asyncio.create_task(asyncio.to_thread(kill_xvfb)) 
-    ]
-
-    # 2. ยกเลิก Task อื่นๆ ในระบบทันที
-    print("⏳ [Step 2/3] กำลังเคลียร์ Task ค้าง...")
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and t not in cleanup_tasks]
-    for task in tasks:
-        task.cancel()
-    
-    # 3. แจ้งเตือน (ทำไปพร้อมกับการปิดของ)
-    print("⏳ [Step 3/3] กำลังส่งข้อความแจ้งเตือน...")
-    try:
-        await send_notify(f"🛑 Universal Auto-Pilot : Stopped\nReason: Signal {sig}")
-    except: pass
-
-    # รอให้ทุกอย่างจบลงอย่างสมบูรณ์
-    await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-    
-    print("👋 ระบบปิดตัวสมบูรณ์")
-    os._exit(0)
 
 urllib3.disable_warnings()
 
@@ -107,6 +77,18 @@ CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 STATS_CACHE_FILE = os.path.join(BASE_DIR, "stats_cache.json")
 STATS_HISTORY_FILE = os.path.join(BASE_DIR, "stats_history.json")
 MAPPING_FILE = os.path.join(BASE_DIR, "torrent_mapping.json")
+
+# PURGE_AUTH_DRYRUN_PATCH_V1
+# Phase A: Read-only authorization; deletion remains disabled.
+PURGE_AUTH_DRY_RUN = True
+
+# Exact tracker hostname aliases supplied and verified by operator.
+PURGE_TRACKER_HOST_ALIASES = {
+    "files.bit-sv.net": "BEARBIT",
+    "tracker.cab": "DEDBIT",
+}
+
+
 DB_DIR = os.path.join(BASE_DIR, "db")
 CFG = {} 
 ORIGINAL_SETTING = None
@@ -492,104 +474,357 @@ async def check_pending_status(session, details_url):
         print(f"      ⚠️ Error checking pending status: {e}")
         return False
 
+def _canonical_mapping_site(value):
+    """
+    Accept only exact configured SITE names.
+    Never infer a tracker from torrent name or seedbox node.
+    """
+    candidate = str(value or "").strip()
+
+    if not candidate:
+        return ""
+
+    cfg = globals().get("CFG", {})
+    site_configs = (
+        cfg.get("SITE", [])
+        if isinstance(cfg, dict)
+        else []
+    )
+
+    for site_cfg in site_configs:
+        if not isinstance(site_cfg, dict):
+            continue
+
+        configured_name = str(
+            site_cfg.get("name") or ""
+        ).strip()
+
+        if (
+            configured_name
+            and configured_name.casefold() == candidate.casefold()
+        ):
+            return configured_name
+
+    return ""
+
+
 async def add_or_update_torrent(client_data, web_data=None, node_data=None):
     """
-    รองรับการเพิ่มหรืออัปเดตเรกคอร์ดทอร์เรนต์แบบ Asynchronous 
-    จากทั้ง qBittorrent และ rTorrent พร้อมเก็บ details_url
+    Mapping provenance rules:
+
+    source_site:
+        Only assigned from explicitly verified successful web additions.
+
+    known_sites:
+        Sites where a manifest-verified candidate has been observed.
+        This never establishes source-site provenance.
+
+    Unknown source metadata is never promoted from observed_site.
     """
     data = await load_mapping()
-    torrents = data.get('torrents', [])
-    
-    target_hash = client_data.get('hash', '').upper()
+    torrents = data.get("torrents", [])
+
+    if not isinstance(client_data, dict):
+        print("⚠️ [Mapper] Invalid client_data")
+        return False
+
+    target_hash = str(
+        client_data.get("hash") or ""
+    ).strip().upper()
+
     if not target_hash:
-        print("⚠️ [Mapper]: ไม่พบค่า Hash ใน client_data ไม่สามารถดำเนินการต่อได้")
-        return
+        print(
+            "⚠️ [Mapper]: ไม่พบค่า Hash "
+            "ไม่สามารถดำเนินการต่อได้"
+        )
+        return False
 
-    web_data = web_data or {}
-    node_data = node_data or {}
-    client_type = client_data.get('client_type', 'unknown')
-    
-    existing = next((t for t in torrents if t.get('client_info', {}).get('hash', '').upper() == target_hash), None)
-    
+    web_data = (
+        web_data if isinstance(web_data, dict) else {}
+    )
+    node_data = (
+        node_data if isinstance(node_data, dict) else {}
+    )
+
+    client_type = client_data.get(
+        "client_type", "unknown"
+    )
+
+    # An explicit verification flag is mandatory.
+    incoming_verified = (
+        web_data.get("source_site_verified") is True
+    )
+
+    incoming_source = (
+        _canonical_mapping_site(
+            web_data.get("source_site")
+            or web_data.get("site_name")
+        )
+        if incoming_verified
+        else ""
+    )
+
+    if not incoming_source:
+        incoming_verified = False
+
+    observed_site = _canonical_mapping_site(
+        web_data.get("observed_site")
+    )
+
+    existing = next(
+        (
+            record
+            for record in torrents
+            if isinstance(record, dict)
+            and isinstance(record.get("client_info"), dict)
+            and str(
+                record["client_info"].get("hash") or ""
+            ).upper() == target_hash
+        ),
+        None
+    )
+
     if existing:
-        # 1. อัปเดตข้อมูลฝั่ง client_info
-        existing['client_info'].update({
-            'state': client_data.get('state', existing['client_info'].get('state')),
-            'ratio': client_data.get('ratio', existing['client_info'].get('ratio')),
-            'name': client_data.get('name', existing['client_info'].get('name'))
+        # ----------------------------------------------------
+        # 1. Client metadata
+        # ----------------------------------------------------
+
+        if not isinstance(existing.get("client_info"), dict):
+            existing["client_info"] = {}
+
+        existing["client_info"].update({
+            "state": client_data.get(
+                "state",
+                existing["client_info"].get("state")
+            ),
+            "ratio": client_data.get(
+                "ratio",
+                existing["client_info"].get("ratio")
+            ),
+            "name": client_data.get(
+                "name",
+                existing["client_info"].get("name")
+            )
         })
-        
-        # 2. อัปเดต save_path ใน node_info
-        if 'node_info' not in existing:
-            existing['node_info'] = {}
-            
-        if node_data.get('save_path'):
-            existing['node_info']['save_path'] = node_data.get('save_path')
-        elif client_data.get('save_path'):
-            existing['node_info']['save_path'] = client_data.get('save_path')
 
-        # 3. อัปเดตข้อมูลฝั่งเว็บ (รวมถึง details_url)
-        if web_data:
-            if web_data.get('torrent_id') and not existing.get('torrent_id'):
-                existing['torrent_id'] = web_data.get('torrent_id')
-            
-            if web_data.get('site_name') and existing.get('site_name', 'Unknown') == 'Unknown':
-                existing['site_name'] = web_data.get('site_name')
-                
-            if web_data.get('release_name') and (not existing.get('release_name') or existing.get('release_name') == 'Unknown'):
-                existing['release_name'] = web_data.get('release_name')
+        # ----------------------------------------------------
+        # 2. Node metadata
+        # ----------------------------------------------------
 
-            # 🛠️ อัปเดต details_url หากในเรกคอร์ดเดิมยังไม่มี
-            if web_data.get('details_url') and not existing.get('details_url'):
-                existing['details_url'] = web_data.get('details_url')
+        if not isinstance(existing.get("node_info"), dict):
+            existing["node_info"] = {}
 
-        print(f"🔄 [Mapper]: อัปเดตสถานะและพาธ ({client_type}) ของ {existing.get('release_name', target_hash)} สำเร็จ")
+        current_host = str(
+            node_data.get("seedbox_host") or ""
+        ).strip()
+
+        if current_host:
+            existing["node_info"]["seedbox_host"] = current_host
+
+        if node_data.get("save_path"):
+            existing["node_info"]["save_path"] = (
+                node_data["save_path"]
+            )
+        elif client_data.get("save_path"):
+            existing["node_info"]["save_path"] = (
+                client_data["save_path"]
+            )
+
+        # ----------------------------------------------------
+        # 3. Merge known_sites without changing source_site
+        # ----------------------------------------------------
+
+        raw_known = existing.get("known_sites", [])
+
+        if not isinstance(raw_known, (list, tuple, set)):
+            raw_known = []
+
+        known_sites = []
+
+        for value in raw_known:
+            canonical = _canonical_mapping_site(value)
+            if canonical and canonical not in known_sites:
+                known_sites.append(canonical)
+
+        for value in (observed_site, incoming_source):
+            if value and value not in known_sites:
+                known_sites.append(value)
+
+        existing["known_sites"] = known_sites
+
+        # ----------------------------------------------------
+        # 4. Preserve previously verified source metadata
+        # ----------------------------------------------------
+
+        current_source_verified = (
+            existing.get("source_site_verified") is True
+        )
+
+        current_source = (
+            _canonical_mapping_site(
+                existing.get("source_site")
+            )
+            if current_source_verified
+            else ""
+        )
+
+        if current_source:
+            existing["source_site"] = current_source
+            existing["source_site_verified"] = True
+            existing["site_name"] = current_source
+
+        elif incoming_verified:
+            # First confirmed source attribution.
+            existing["source_site"] = incoming_source
+            existing["source_site_verified"] = True
+            existing["site_name"] = incoming_source
+
+            if (
+                web_data.get("torrent_id")
+                and not existing.get("torrent_id")
+            ):
+                existing["torrent_id"] = (
+                    web_data["torrent_id"]
+                )
+
+            if (
+                web_data.get("details_url")
+                and not existing.get("details_url")
+            ):
+                existing["details_url"] = (
+                    web_data["details_url"]
+                )
+
+            if (
+                web_data.get("release_name")
+                and existing.get("release_name")
+                in ("", None, "Unknown")
+            ):
+                existing["release_name"] = (
+                    web_data["release_name"]
+                )
+
+        else:
+            # Preserve legacy site_name for reference, but do not
+            # treat it as verified provenance.
+            existing["source_site"] = "Unknown"
+            existing["source_site_verified"] = False
+
+        print(
+            f"🔄 [Mapper]: อัปเดต ({client_type}) "
+            f"{existing.get('release_name', target_hash)} "
+            f"| source={existing.get('source_site', 'Unknown')} "
+            f"| verified={existing.get('source_site_verified', False)} "
+            f"| known_sites={existing.get('known_sites', [])}"
+        )
+
     else:
-        # เรกคอร์ดใหม่ เพิ่มโครงสร้าง details_url
+        # ----------------------------------------------------
+        # 5. New record
+        # ----------------------------------------------------
+
+        known_sites = []
+
+        for value in (observed_site, incoming_source):
+            if value and value not in known_sites:
+                known_sites.append(value)
+
+        source_name = (
+            incoming_source if incoming_verified else "Unknown"
+        )
+
         new_record = {
-            "torrent_id": web_data.get('torrent_id', None),
-            "site_name": web_data.get('site_name', 'Unknown'),
-            "release_name": web_data.get('release_name', client_data.get('name', 'Unknown')),
-            "details_url": web_data.get('details_url', ''),  # 🛠️ เพิ่ม details_url
-            "web_size": web_data.get('web_size', client_data.get('size_bytes', 0)),
+            "torrent_id": (
+                web_data.get("torrent_id")
+                if incoming_verified
+                else None
+            ),
+            "site_name": source_name,
+            "source_site": source_name,
+            "source_site_verified": bool(incoming_verified),
+            "known_sites": known_sites,
+            "release_name": (
+                web_data.get("release_name")
+                if incoming_verified
+                else client_data.get("name", "Unknown")
+            ),
+            "details_url": (
+                web_data.get("details_url", "")
+                if incoming_verified
+                else ""
+            ),
+            "web_size": (
+                web_data.get(
+                    "web_size",
+                    client_data.get("size_bytes", 0)
+                )
+                if incoming_verified
+                else client_data.get("size_bytes", 0)
+            ),
             "client_info": {
                 "client_type": client_type,
                 "hash": target_hash,
-                "name": client_data.get('name'),
-                "size_bytes": client_data.get('size_bytes', 0),
-                "state": client_data.get('state', 'unknown'),
-                "ratio": client_data.get('ratio', 0.0)
+                "name": client_data.get("name"),
+                "size_bytes": client_data.get("size_bytes", 0),
+                "state": client_data.get("state", "unknown"),
+                "ratio": client_data.get("ratio", 0.0)
             },
             "node_info": {
-                "seedbox_host": node_data.get('seedbox_host', 'Localhost'),
-                "save_path": node_data.get('save_path', '')
+                "seedbox_host": node_data.get(
+                    "seedbox_host", "Localhost"
+                ),
+                "save_path": node_data.get("save_path", "")
             },
             "cross_seed_links": [],
             "status": "active"
         }
+
         torrents.append(new_record)
-        print(f"✨ [Mapper]: เพิ่มเรกคอร์ดใหม่ผ่าน {client_type} สำเร็จ ({new_record['release_name']})")
-        
-    data['torrents'] = torrents
+
+        print(
+            f"✨ [Mapper]: เพิ่มเรกคอร์ด ({client_type}) "
+            f"{new_record['release_name']} "
+            f"| source={source_name} "
+            f"| verified={incoming_verified} "
+            f"| known_sites={known_sites}"
+        )
+
+    data["torrents"] = torrents
     await save_mapping(data)
+    return True
 
 
 async def handle_new_torrent_grabbed(web_item, client_response, host_name):
     """
-    web_item = ข้อมูลจากเว็บ เช่น {"torrent_id": 999, "site_name": "BEARBIT", "details_url": "https://...", ...}
+    Called after a successful torrent addition.
+
+    Only this confirmed-add path can establish source provenance.
     """
+    web_item = (
+        dict(web_item)
+        if isinstance(web_item, dict)
+        else {}
+    )
+
+    source_name = _canonical_mapping_site(
+        web_item.get("site_name")
+    )
+
+    web_item["source_site"] = source_name
+    web_item["source_site_verified"] = bool(source_name)
+
     client_data = {
-        "client_type": client_response.get('type', 'qbittorrent'),
-        "hash": client_response['hash'],
-        "name": client_response['name'],
-        "size_bytes": client_response.get('size_bytes', 0),
-        "state": client_response.get('state', 'downloading'),
+        "client_type": client_response.get("type", "qbittorrent"),
+        "hash": client_response["hash"],
+        "name": client_response["name"],
+        "size_bytes": client_response.get("size_bytes", 0),
+        "state": client_response.get("state", "downloading"),
         "ratio": 0.0
     }
 
     node_data = {
         "seedbox_host": host_name,
-        "save_path": client_response.get('save_path', '')
+        "save_path": client_response.get("save_path", "")
     }
 
     await add_or_update_torrent(
@@ -599,61 +834,309 @@ async def handle_new_torrent_grabbed(web_item, client_response, host_name):
     )
 
 
-def process_cross_seed_linking(mapping_data):
+
+async def record_cross_seed_known_sites(updates):
     """
-    เชื่อมโยง cross_seed_links โดยใช้ save_path + size_bytes 
-    และเก็บรายละเอียดวัตถุ cross-seed (hash, site_name, details_url)
+    Persist verified candidate-site observations against SOURCE hashes.
+
+    Only known_sites is modified.
+    Source provenance and torrent/tracker state are never changed.
     """
-    torrents = mapping_data.get('torrents', [])
-    file_groups = {}
+    normalized = {}
 
-    for t in torrents:
-        node_info = t.get('node_info', {})
-        client_info = t.get('client_info', {})
+    for source_hash, raw_sites in (updates or {}).items():
+        source_hash = str(source_hash or "").strip().upper()
 
-        save_path = node_info.get('save_path', '').strip().rstrip('/')
-        size_bytes = client_info.get('size_bytes') or t.get('web_size') or 0
-
-        if not save_path or not size_bytes:
+        if not re.fullmatch(r"[0-9A-F]{40}", source_hash):
             continue
 
-        unique_file_key = f"{save_path}|{size_bytes}"
+        if isinstance(raw_sites, str):
+            raw_sites = [raw_sites]
 
-        if unique_file_key not in file_groups:
-            file_groups[unique_file_key] = []
-        file_groups[unique_file_key].append(t)
+        if not isinstance(raw_sites, (list, tuple, set)):
+            continue
 
-    linked_groups_count = 0
+        for raw_site in raw_sites:
+            canonical = _canonical_mapping_site(raw_site)
 
-    for file_key, group in file_groups.items():
-        if len(group) > 1:
-            linked_groups_count += 1
-            
-            for item in group:
-                current_hash = item.get('client_info', {}).get('hash', '').strip().upper()
-                
-                # 🛠️ รวบรวมรายการ Torrent ตัวอื่นในกลุ่ม โดยสร้าง Dict เก็บ hash, site_name และ details_url
-                linked_items = []
-                seen_hashes = set()
+            if canonical:
+                normalized.setdefault(source_hash, set()).add(canonical)
 
-                for other in group:
-                    other_hash = other.get('client_info', {}).get('hash', '').strip().upper()
-                    
-                    if other_hash and other_hash != current_hash and other_hash not in seen_hashes:
-                        seen_hashes.add(other_hash)
-                        linked_items.append({
-                            "hash": other_hash,
-                            "site_name": other.get('site_name', 'Unknown'),
-                            "details_url": other.get('details_url', '')
-                        })
+    if not normalized:
+        print("ℹ️ [Cross-Seed Known Sites] No valid updates")
+        return False
 
-                item['cross_seed_links'] = linked_items
+    if not os.path.isfile(MAPPING_FILE):
+        print("🛑 [Cross-Seed Known Sites] Mapping file missing; aborted")
+        return False
+
+    data = await load_mapping()
+
+    if not isinstance(data, dict) or not isinstance(data.get("torrents"), list):
+        print("🛑 [Cross-Seed Known Sites] Invalid Mapping structure; aborted")
+        return False
+
+    matched_records = 0
+    changed_records = 0
+
+    for record in data["torrents"]:
+        if not isinstance(record, dict):
+            continue
+
+        client_info = record.get("client_info")
+
+        if not isinstance(client_info, dict):
+            continue
+
+        record_hash = str(
+            client_info.get("hash") or ""
+        ).strip().upper()
+
+        requested_sites = normalized.get(record_hash)
+
+        if not requested_sites:
+            continue
+
+        matched_records += 1
+
+        raw_known = record.get("known_sites")
+
+        if isinstance(raw_known, list):
+            known_sites = list(raw_known)
+        elif isinstance(raw_known, (tuple, set)):
+            known_sites = list(raw_known)
         else:
-            for item in group:
-                item['cross_seed_links'] = []
+            known_sites = []
 
-    print(f"🔗 [Cross-Seed] เชื่อมโยงไฟล์สำเร็จ ({linked_groups_count} กลุ่ม จากทั้งหมด {len(file_groups)} รายการ)")
+        known_keys = {
+            canonical.casefold()
+            for value in known_sites
+            if (canonical := _canonical_mapping_site(value))
+        }
+
+        changed = False
+
+        for site in sorted(requested_sites):
+            if site.casefold() not in known_keys:
+                known_sites.append(site)
+                known_keys.add(site.casefold())
+                changed = True
+
+        if changed:
+            record["known_sites"] = known_sites
+            changed_records += 1
+
+    if not matched_records:
+        print(
+            "⚠️ [Cross-Seed Known Sites] No source hash matched Mapping; "
+            "no write performed"
+        )
+        return False
+
+    if changed_records:
+        def _atomic_write_mapping():
+            import tempfile
+            import stat
+
+            # Resolve symlinks so the actual Mapping file is replaced.
+            mapping_path = os.path.realpath(os.fspath(MAPPING_FILE))
+            mapping_dir = os.path.dirname(mapping_path)
+
+            original_stat = os.stat(mapping_path)
+
+            fd, temp_path = tempfile.mkstemp(
+                prefix=".torrent_mapping.",
+                suffix=".tmp",
+                dir=mapping_dir,
+            )
+
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        data,
+                        handle,
+                        indent=4,
+                        ensure_ascii=False,
+                    )
+                    handle.flush()
+                    os.fsync(handle.fileno())
+
+                os.chown(
+                    temp_path,
+                    original_stat.st_uid,
+                    original_stat.st_gid,
+                )
+                os.chmod(
+                    temp_path,
+                    stat.S_IMODE(original_stat.st_mode),
+                )
+
+                # Atomic replacement in the same filesystem.
+                os.replace(temp_path, mapping_path)
+
+                try:
+                    dir_fd = os.open(
+                        mapping_dir,
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                    )
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except OSError:
+                    pass
+
+            except Exception:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+                raise
+
+        try:
+            await asyncio.to_thread(_atomic_write_mapping)
+        except Exception as exc:
+            print(
+                "❌ [Cross-Seed Known Sites] Atomic Mapping write failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+
+    # Verify persistence by reading the actual file again.
+    verified_data = await load_mapping()
+
+    if not isinstance(verified_data, dict):
+        print("❌ [Cross-Seed Known Sites] Reload failed")
+        return False
+
+    verified_records = {}
+
+    for record in verified_data.get("torrents", []):
+        if not isinstance(record, dict):
+            continue
+
+        client_info = record.get("client_info")
+
+        if not isinstance(client_info, dict):
+            continue
+
+        record_hash = str(
+            client_info.get("hash") or ""
+        ).strip().upper()
+
+        if record_hash in normalized:
+            verified_records.setdefault(record_hash, []).append(record)
+
+    failed = []
+    verified_count = 0
+
+    for source_hash, sites in normalized.items():
+        records = verified_records.get(source_hash, [])
+
+        if not records:
+            failed.append(source_hash)
+            continue
+
+        for site in sites:
+            site_key = site.casefold()
+
+            all_records_verified = all(
+                site_key in {
+                    canonical.casefold()
+                    for value in (record.get("known_sites") or [])
+                    if (canonical := _canonical_mapping_site(value))
+                }
+                for record in records
+            )
+
+            if all_records_verified:
+                verified_count += 1
+            else:
+                failed.append(f"{source_hash}:{site}")
+
+    if failed:
+        print(
+            f"⚠️ [Cross-Seed Known Sites] Verification incomplete: {failed!r}"
+        )
+        return False
+
+    print(
+        f"✅ [Cross-Seed Known Sites] "
+        f"verified associations={verified_count} | "
+        f"source records={len(verified_records)} | "
+        f"updated records={changed_records}"
+    )
+    print(
+        "🔒 [Cross-Seed Known Sites] "
+        "Source provenance and qBittorrent/tracker state unchanged"
+    )
+
+    return True
+
+
+def process_cross_seed_linking(mapping_data):
+    """
+    Conservative linker:
+    never infer identical content from save_path + size_bytes alone.
+    Keep explicitly verified links; archive legacy unverified associations.
+    """
+    torrents = mapping_data.get("torrents", [])
+    archived_count = 0
+    kept_verified_count = 0
+
+    def _archive_key(item):
+        return json.dumps(
+            item, sort_keys=True, ensure_ascii=False, default=str
+        )
+
+    for record in torrents:
+        if not isinstance(record, dict):
+            continue
+
+        current = record.get("cross_seed_links")
+        if not isinstance(current, list):
+            current = []
+
+        verified = []
+        legacy = []
+
+        for link in current:
+            if (
+                isinstance(link, dict)
+                and link.get("verified") is True
+                and str(link.get("verification_method") or "").strip()
+            ):
+                verified.append(link)
+                kept_verified_count += 1
+            else:
+                legacy.append(link)
+
+        old_archive = record.get("cross_seed_links_legacy_unverified")
+        if not isinstance(old_archive, list):
+            old_archive = []
+
+        archive = list(old_archive)
+        known = {_archive_key(item) for item in archive}
+
+        for link in legacy:
+            key = _archive_key(link)
+            if key not in known:
+                archive.append(link)
+                known.add(key)
+                archived_count += 1
+
+        record["cross_seed_links"] = verified
+
+        if archive:
+            record["cross_seed_links_legacy_unverified"] = archive
+
+    print(
+        "[Cross-Seed] Conservative linking: "
+        f"verified links retained={kept_verified_count}, "
+        f"legacy unverified links archived={archived_count}; "
+        "no links inferred from path/size."
+    )
     return mapping_data
+
+
 
 # ========================= BROWSER ENGINE =========================
 
@@ -765,10 +1248,15 @@ def load_xvfb_config():
 async def launch_any_browser(sitename="default", custom_args=None):
     global _global_display, _active_browser_instance, _current_profile_path
     
-    # 1. เคลียร์ Browser เก่า, Xvfb และลบโปรไฟล์เก่าทิ้งให้สะอาดก่อนเริ่ม
-    if "kill_specific_browser" in globals(): kill_specific_browser()
-    if "kill_xvfb" in globals(): kill_xvfb()
-    if "cleanup_profile" in globals(): await cleanup_profile()
+    # 1. ปิดเฉพาะ Browser ของ profile ที่ติดตามได้; หากไม่สำเร็จให้หยุดแบบ fail-closed
+    if "kill_specific_browser" in globals():
+        if kill_specific_browser() is False:
+            raise RuntimeError("ยกเลิก Browser launch: ปิด Browser เก่าอย่างปลอดภัยไม่สำเร็จ")
+    if "kill_xvfb" in globals():
+        kill_xvfb()
+    if "cleanup_profile" in globals():
+        if await cleanup_profile() is False:
+            raise RuntimeError("ยกเลิก Browser launch: ยังลบ profile เก่าอย่างปลอดภัยไม่ได้")
 
     # 2. อ่านค่าคอนฟิก Xvfb_enable จาก config.json ผ่านฟังก์ชันที่คุณมี
     xvfb_enabled_in_config = load_xvfb_config() if "load_xvfb_config" in globals() else False
@@ -794,8 +1282,31 @@ async def launch_any_browser(sitename="default", custom_args=None):
 
     # 4. กำหนด Profile Path ใหม่
     _current_profile_path = os.path.abspath(f"./profiles/{sitename}_uc_profile")
-    if not os.path.exists(_current_profile_path):
-        os.makedirs(_current_profile_path, exist_ok=True)
+
+    # Clean stale profile from an earlier Python process before reusing this path.
+    # Do not call cleanup_profile() here: it clears _current_profile_path on success.
+    if os.path.exists(_current_profile_path):
+        profile_to_reset = _current_profile_path
+        if not _terminate_chrome_for_profile(profile_to_reset):
+            raise RuntimeError(
+                f"ยกเลิก Browser launch: ยังมี Chrome ใช้ profile นี้อยู่: "
+                f"{profile_to_reset}"
+            )
+        await asyncio.sleep(0.5)
+        try:
+            shutil.rmtree(profile_to_reset, ignore_errors=False)
+        except Exception as exc:
+            raise RuntimeError(
+                f"ยกเลิก Browser launch: ลบ stale profile ไม่สำเร็จ: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if os.path.exists(profile_to_reset):
+            raise RuntimeError(
+                f"ยกเลิก Browser launch: profile ยังอยู่หลัง cleanup: "
+                f"{profile_to_reset}"
+            )
+
+    os.makedirs(_current_profile_path, exist_ok=True)
 
     # 5. ตั้งค่า Config ของ nodriver
     config = uc.Config()
@@ -856,112 +1367,345 @@ async def launch_any_browser(sitename="default", custom_args=None):
         selected_path = config.browser_executable_path or "System Default"
         print(f"📂 [System] Path ที่ตรวจพบและใช้งาน: {selected_path}")
 
-        # 🔴 เพิ่ม no_sandbox=True เข้าไปตรงนี้ เพื่อแก้ปัญหาบน Ubuntu 24.04 (Root)
-        _active_browser_instance = await uc.start(
-            config=config,
-            no_sandbox=True
-        )
+        # nodriver ignores extra start kwargs when an existing Config is supplied.
+        # Explicitly disable sandbox on the Config object before launching as root.
+        config.sandbox = False
+        # Keep the Browser object before start(); start() may raise after Chrome spawned.
+        from nodriver.core.browser import Browser as NodriverBrowser
+        browser_candidate = NodriverBrowser(config)
+        _active_browser_instance = browser_candidate
+        await browser_candidate.start()
         
         print(f"🚀 [System] Browser (nodriver) รันสำเร็จ (Headless: {headless_mode})")
         return _active_browser_instance
 
     except Exception as e:
-        print(f"❌ [Critical] Nodriver Start Error: {e}")
+        print(f"❌ [Critical] Nodriver Start Error: {type(e).__name__}: {e}")
+        cleanup_ok = False
         try:
-            if "kill_specific_browser" in globals(): kill_specific_browser()
-            if "kill_xvfb" in globals(): kill_xvfb()
-        except:
+            cleanup_ok = (
+                kill_specific_browser()
+                if "kill_specific_browser" in globals()
+                else False
+            )
+        except Exception as cleanup_error:
+            print(
+                f"⚠️ [Browser Cleanup] {type(cleanup_error).__name__}: "
+                f"{cleanup_error}"
+            )
+
+        # Keep Xvfb alive if Chrome cleanup cannot be verified.
+        if cleanup_ok and "kill_xvfb" in globals():
+            kill_xvfb()
+        elif not cleanup_ok:
+            print("🔒 [Browser Cleanup] คง Xvfb ไว้ เพราะยังยืนยันการปิด Chrome ไม่ได้")
+        raise
+
+
+def _normalise_browser_profile_path(value):
+    """Return a canonical profile path, or None when it cannot be resolved."""
+    try:
+        if value is None:
+            return None
+        return os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(value))))
+    except Exception:
+        return None
+
+
+def _cmdline_profile_path(cmdline):
+    """Extract Chrome's --user-data-dir argument (supports both CLI forms)."""
+    if not isinstance(cmdline, (list, tuple)):
+        return None
+    for index, arg in enumerate(cmdline):
+        if not isinstance(arg, str):
+            continue
+        if arg.startswith("--user-data-dir="):
+            return arg.split("=", 1)[1]
+        if arg == "--user-data-dir" and index + 1 < len(cmdline):
+            return cmdline[index + 1]
+    return None
+
+
+def _terminate_chrome_for_profile(profile_path, timeout=5.0):
+    """Stop only Chrome processes whose exact user-data-dir matches profile_path.
+
+    Returns True only when no matching Chrome process remains. This function
+    never uses pkill and never terminates browsers using another profile.
+    """
+    expected = _normalise_browser_profile_path(profile_path)
+    if not expected:
+        print("🔒 [Browser Cleanup] ไม่มี profile path ที่ยืนยันได้; ปฏิเสธการปิด")
+        return False
+
+    try:
+        import psutil
+    except Exception as exc:
+        print(f"🔒 [Browser Cleanup] โหลด psutil ไม่ได้: {type(exc).__name__}: {exc}")
+        return False
+
+    allowed_names = {"chrome", "chromium", "chromium-browser", "brave"}
+
+    def find_matching_processes():
+        matches = []
+        uncertain = []
+        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                name = (proc.info.get("name") or "").lower()
+                if name not in allowed_names:
+                    continue
+                cmdline = proc.info.get("cmdline") or proc.cmdline()
+                actual_path = _normalise_browser_profile_path(
+                    _cmdline_profile_path(cmdline)
+                )
+                if actual_path == expected:
+                    matches.append(proc)
+            except psutil.NoSuchProcess:
+                continue
+            except psutil.AccessDenied:
+                # As root this should be unusual. Fail closed rather than
+                # deleting a profile while a Chrome process cannot be checked.
+                try:
+                    name = (proc.name() or "").lower()
+                except Exception:
+                    name = ""
+                if name in allowed_names:
+                    uncertain.append(getattr(proc, "pid", "?"))
+            except Exception as exc:
+                print(
+                    f"⚠️ [Browser Cleanup] ตรวจ PID {getattr(proc, 'pid', '?')} ไม่ได้: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                uncertain.append(getattr(proc, "pid", "?"))
+        return matches, uncertain
+
+    matches, uncertain = find_matching_processes()
+    if uncertain:
+        print(
+            "🔒 [Browser Cleanup] ตรวจ Chrome บาง process ไม่ได้ "
+            f"(PID: {uncertain}); ปฏิเสธการลบ Profile"
+        )
+        return False
+
+    if not matches:
+        return True
+
+    pids = sorted({proc.pid for proc in matches})
+    print(
+        f"🧹 [Browser Cleanup] พบ Chrome {len(pids)} process ที่ใช้ Profile นี้: "
+        f"{pids}"
+    )
+
+    # Terminate only processes whose command line proves exact profile ownership.
+    for proc in matches:
+        try:
+            proc.terminate()
+        except psutil.NoSuchProcess:
             pass
-        raise e
+        except psutil.AccessDenied as exc:
+            print(f"🔒 [Browser Cleanup] ปิด PID {proc.pid} ไม่ได้: {exc}")
+            return False
+        except Exception as exc:
+            print(
+                f"⚠️ [Browser Cleanup] terminate PID {proc.pid} ไม่สำเร็จ: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+
+    _, alive = psutil.wait_procs(matches, timeout=max(1.0, float(timeout)))
+    for proc in alive:
+        try:
+            # Recheck ownership immediately before force-kill.
+            cmdline = proc.cmdline()
+            actual_path = _normalise_browser_profile_path(
+                _cmdline_profile_path(cmdline)
+            )
+            if actual_path != expected:
+                print(
+                    f"🔒 [Browser Cleanup] PID {proc.pid} เปลี่ยน profile; "
+                    "ปฏิเสธการ force-kill"
+                )
+                return False
+            proc.kill()
+        except psutil.NoSuchProcess:
+            pass
+        except Exception as exc:
+            print(
+                f"🔒 [Browser Cleanup] kill PID {proc.pid} ไม่สำเร็จ: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+
+    if alive:
+        psutil.wait_procs(alive, timeout=2.0)
+
+    remaining, uncertain = find_matching_processes()
+    if uncertain or remaining:
+        remain_pids = [proc.pid for proc in remaining]
+        print(
+            "🔒 [Browser Cleanup] ยังมี Chrome ใช้ Profile อยู่ "
+            f"(remaining={remain_pids}, uncertain={uncertain}); ห้ามลบ Profile"
+        )
+        return False
+
+    print(f"✅ [Browser Cleanup] ไม่มี Chrome ใช้ Profile นี้แล้ว: {profile_path}")
+    return True
+
 
 def kill_specific_browser():
+    """Stop the tracked Browser and all Chrome processes using its exact profile."""
     global _active_browser_instance
-    
-    # 1. ปิดตาม PID ของ Instance ที่เก็บไว้ (แม่นยำที่สุด)
-    if _active_browser_instance and hasattr(_active_browser_instance, 'browser_pid') and _active_browser_instance.browser_pid:
-        pid = _active_browser_instance.browser_pid
+
+    browser = _active_browser_instance
+    if browser is None:
+        return True
+
+    config = getattr(browser, "config", None)
+    profile_path = getattr(config, "user_data_dir", None)
+    if not profile_path:
+        print("🔒 [System] Browser ไม่มี user_data_dir ที่ยืนยันได้; ไม่ลบ reference")
+        return False
+
+    # If nodriver already created a PID, verify it belongs to this exact profile.
+    process_obj = getattr(browser, "_process", None)
+    pid = (
+        getattr(browser, "_process_pid", None)
+        or getattr(process_obj, "pid", None)
+        or getattr(browser, "browser_pid", None)
+    )
+    if pid:
         try:
-            print(f"🔪 [System] กำลังตรวจสอบและฆ่า Browser PID: {pid}")
-            
-            if sys.platform == "win32":
-                os.system(f"taskkill /F /PID {pid} /T")
-            else:
-                try:
-                    os.kill(pid, 0)
-                    pgid = os.getpgid(pid)
-                    os.killpg(pgid, signal.SIGKILL)
-                    print(f"✅ [System] ฆ่า Browser PID {pid} และลูกหลานเรียบร้อย")
-                except ProcessLookupError:
-                    print(f"ℹ️ PID {pid} ไม่พบในระบบ (อาจปิดไปแล้ว)")
-        except Exception as e:
-            print(f"⚠️ ไม่สามารถฆ่า PID {pid}: {e}")
-        finally:
-            _active_browser_instance = None
-    
-    # 2. ปิดเผื่อกรณีที่มี Instance ค้างอยู่แต่ไม่มี PID อ้างอิง
-    try:
-        if _active_browser_instance and hasattr(_active_browser_instance, 'stop'):
+            import psutil
+        except Exception as exc:
+            print(
+                f"🔒 [System] โหลด psutil ไม่ได้; คง Browser reference ไว้: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+        try:
+            proc = psutil.Process(int(pid))
+            cmdline = proc.cmdline()
+            actual = _normalise_browser_profile_path(_cmdline_profile_path(cmdline))
+            expected = _normalise_browser_profile_path(profile_path)
+            if actual != expected:
+                print(
+                    f"🔒 [System] ปฏิเสธปิด PID {pid}: "
+                    f"profile ไม่ตรง/ยืนยันไม่ได้ ({actual})"
+                )
+                return False
+        except psutil.NoSuchProcess:
             pass
-    except Exception:
-        pass
-    finally:
-        _active_browser_instance = None
+        except Exception as exc:
+            print(
+                f"🔒 [System] ตรวจสอบ PID {pid} ไม่ได้; คง Browser reference ไว้: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+
+    if not _terminate_chrome_for_profile(profile_path):
+        return False
+
+    _active_browser_instance = None
+    return True
+
 
 async def cleanup_profile():
+    """Remove the current profile only after all matching Chrome processes exit."""
     global _current_profile_path
-    if _current_profile_path and os.path.exists(_current_profile_path):
-        # 1. พักนานขึ้นเล็กน้อยหลังการสั่งปิด เพื่อให้ OS ปล่อย Handle
-        await asyncio.sleep(3) 
-        
-        # 2. ใช้การ Retry ลบ (กรณีติด Lock ของ OS)
-        deleted_success = False
-        for i in range(5): 
-            try:
-                shutil.rmtree(_current_profile_path, ignore_errors=False)
-                print(f"🧹 [System] ลบ Profile สำเร็จ: {_current_profile_path}")
-                deleted_success = True
-                break
-            except Exception as e:
-                print(f"⚠️ ลบ Profile ไม่ได้ (Retry {i+1}/5): {e}")
-                await asyncio.sleep(2) # รออีกนิดแล้วลองใหม่
-        
-        # 3. กรณีลองครบทุกรอบแล้วยังลบไม่ได้ (เช่น โดนล็อกถาวรโดยโพรเซสผี) 
-        # ให้เคลียร์ชื่อโฟลเดอร์ทิ้งเพื่อบังคับสร้างโฟลเดอร์ใหม่รอบหน้า (กันโปรแกรมพัง)
-        if not deleted_success:
-            print(f"❌ [System] ไม่สามารถลบโฟลเดอร์โปรไฟล์เก่าได้ {_current_profile_path} จะทำการข้ามไปใช้เส้นทางใหม่")
 
+    profile_path = _current_profile_path
+    if not profile_path:
+        return True
+
+    if not os.path.exists(profile_path):
         _current_profile_path = None
+        return True
+
+    # Also catches orphan Chrome processes left by an earlier Python process.
+    if not _terminate_chrome_for_profile(profile_path):
+        print(
+            f"🔒 [System] เก็บ Profile ไว้ก่อน เพราะยังยืนยันการปิด Chrome ไม่ได้: "
+            f"{profile_path}"
+        )
+        return False
+
+    await asyncio.sleep(0.5)
+
+    for attempt in range(3):
+        try:
+            if os.path.exists(profile_path):
+                shutil.rmtree(profile_path, ignore_errors=False)
+            if os.path.exists(profile_path):
+                raise RuntimeError("โฟลเดอร์ยังคงอยู่หลัง rmtree")
+
+            print(f"🧹 [System] ลบ Profile สำเร็จ: {profile_path}")
+            _current_profile_path = None
+            return True
+        except Exception as exc:
+            print(
+                f"⚠️ [System] ลบ Profile ไม่สำเร็จ "
+                f"(Retry {attempt + 1}/3): {type(exc).__name__}: {exc}"
+            )
+            if attempt < 2:
+                await asyncio.sleep(1.0)
+
+    # Keep the path so the next launch can retry safely.
+    print(
+        f"🔒 [System] ไม่ล้าง current profile reference เพื่อป้องกันการเปิดทับ: "
+        f"{profile_path}"
+    )
+    return False
+
 
 def kill_xvfb():
     global _global_display
-    
-    # 1. ปิดตาม PID ของ Instance ที่เก็บไว้ (แม่นยำและปลอดภัยที่สุด)
-    if _global_display and hasattr(_global_display, 'pid') and _global_display.pid:
-        pid = _global_display.pid
-        try:
-            print(f"🖥️ [System] กำลังปิด Xvfb (PID: {pid})...")
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            print(f"⚠️ ไม่พบ Process ของ Xvfb (PID {pid}) อาจจะถูกปิดไปก่อนหน้านี้แล้ว")
-        except Exception as e:
-            print(f"⚠️ ไม่สามารถปิด Xvfb (PID {pid}): {e}")
-        finally:
-            _global_display = None
-            
-    # 2. ปิดเผื่อกรณีที่มี Display ค้างสะสมอยู่ หรือไม่มี PID อ้างอิงในระบบ
+
+    display = _global_display
+
+    if display is None:
+        return
+
+    pid = getattr(display, "pid", None)
+
     try:
-        if _global_display and hasattr(_global_display, 'stop'):
-            _global_display.stop()
-    except Exception:
-        pass
+        # ให้ pyvirtualdisplay จัดการปิด Instance ที่ตัวเองเปิดขึ้น
+        stop = getattr(display, "stop", None)
+
+        if callable(stop):
+            stop()
+            print(f"✅ [System] ปิด Xvfb Instance แล้ว (PID: {pid})")
+
+        elif pid:
+            # Fallback เฉพาะ PID ที่เราบันทึกไว้
+            os.kill(int(pid), signal.SIGTERM)
+            print(f"⚠️ [System] ส่ง SIGTERM ไปยัง Xvfb PID {pid}")
+
+    except ProcessLookupError:
+        print(f"ℹ️ [System] Xvfb PID {pid} ปิดไปแล้ว")
+
+    except Exception as e:
+        print(f"⚠️ [System] ปิด Xvfb ไม่สำเร็จ: {type(e).__name__}: {e}")
+
+        # ลอง fallback เฉพาะเมื่อยืนยันตัว Process ได้
+        if pid:
+            try:
+                import psutil
+
+                proc = psutil.Process(int(pid))
+
+                if (
+                    proc.name().lower() == "xvfb"
+                    and proc.ppid() == os.getpid()
+                ):
+                    proc.kill()
+
+            except Exception as fallback_error:
+                print(
+                    f"⚠️ [System] Xvfb fallback ล้มเหลว: "
+                    f"{fallback_error}"
+                )
+
     finally:
         _global_display = None
-
-    # 3. กวาดล้าง Process Xvfb ที่อาจตกค้างในระบบทั้งหมด
-    try:
-        os.system("pkill -9 -f Xvfb")
-    except Exception:
-        pass
 
 async def load_cookies_to_browser(tab, site_cfg):
     auth_path = get_auth_file(site_cfg['name'])
@@ -1193,7 +1937,7 @@ class QbitNode:
             print(f"⚠️ [{self.name}] qBittorrent Refresh Error: {e}")
             return False
 
-    def add(self, content, site_name="Universal", size=None, n_cfg=None, save_path=None, skip_checking=False, tags="AutoPilot"):
+    def add(self, content, site_name="Universal", size=None, n_cfg=None, save_path=None, skip_checking=False, tags="AutoPilot", paused=False, cross_seed=False):
         """
         เพิ่ม Torrent เข้า qBittorrent รองรับทั้ง Normal Grab และ Cross-Seed Mode
     
@@ -1207,7 +1951,7 @@ class QbitNode:
             files = {"torrents": ("f.torrent", content, "application/x-bittorrent")}
         
             data = {
-                "paused": "false",
+                "paused": "true" if paused else "false",
                 "firstLastPiecePrio": "true" if not skip_checking else "false",
                 "sequentialDownload": "false",
                 "category": site_name,
@@ -1215,13 +1959,38 @@ class QbitNode:
                 "autoTMM": "false"  # ปิด TMM เพื่อให้บังคับใช้ savepath ที่ส่งไปได้แม่นยำ
             }
 
+            if cross_seed:
+                current_tags = [
+                    part.strip()
+                    for part in str(data.get("tags") or "").split(",")
+                    if part.strip()
+                ]
+                normalized = {
+                    tag.replace("_", "-").replace(" ", "-").casefold()
+                    for tag in current_tags
+                }
+                if not normalized.intersection({"cross-seed", "crossseed"}):
+                    current_tags.append("Cross-Seed")
+                data["tags"] = ",".join(current_tags)
+
             # 🎯 เพิ่มพารามิเตอร์พิเศษสำหรับ Cross-Seed
             if save_path:
                 data["savepath"] = save_path
         
             if skip_checking:
                 data["skip_checking"] = "true"
-                data["tags"] = f"{tags},Cross-Seed" if tags else "Cross-Seed"
+                current_tags = [
+                    part.strip()
+                    for part in str(data.get("tags") or "").split(",")
+                    if part.strip()
+                ]
+                normalized = {
+                    tag.replace("_", "-").replace(" ", "-").casefold()
+                    for tag in current_tags
+                }
+                if not normalized.intersection({"cross-seed", "crossseed"}):
+                    current_tags.append("Cross-Seed")
+                data["tags"] = ",".join(current_tags)
 
             # ส่ง Request ไปยัง qBittorrent WebUI
             r = self._execute_request(
@@ -1253,7 +2022,9 @@ class QbitNode:
                         n_cfg=n_cfg, 
                         save_path=save_path, 
                         skip_checking=skip_checking,
-                        tags=tags
+                        tags=tags,
+                        paused=paused,
+                        cross_seed=cross_seed
                     )
         
             error_msg = r.text if r is not None else "No response"
@@ -1265,36 +2036,68 @@ class QbitNode:
             return False
 
     def get_all_torrents_info(self):
+        """
+        Return:
+            []   = API สำเร็จและไม่มี torrents
+            list = API สำเร็จและอ่าน inventory ได้ครบ
+            None = API / Network / JSON / Processing failure
+        """
         try:
-            # 1. ใช้ _execute_request แทน self.s.get เพื่อแก้ปัญหา RemoteDisconnected
             r = self._execute_request(
-                'GET', 
-                f"{self.url}/api/v2/torrents/info", 
-                params={'filter': 'all'}, 
-                auth=self.auth, 
-                verify=False, 
+                'GET',
+                f"{self.url}/api/v2/torrents/info",
+                params={'filter': 'all'},
+                auth=self.auth,
+                verify=False,
                 timeout=15
             )
 
-            # 2. ตรวจสอบสถานะการเชื่อมต่อ (ถ้า r เป็น None แสดงว่า Network มีปัญหา)
             if r is None or r.status_code != 200:
                 if r is not None and r.status_code in [401, 403]:
                     self.is_connected = False
-                return []
 
-            # 3. ประมวลผลข้อมูล JSON
+                print(
+                    f"⚠️ [{self.name}] Torrent inventory API failed: "
+                    f"{r.status_code if r is not None else 'No response'}"
+                )
+                return None
+
             try:
                 data = r.json()
-            except Exception:
-                return []
+            except Exception as json_error:
+                print(
+                    f"⚠️ [{self.name}] Invalid inventory JSON: "
+                    f"{json_error}"
+                )
+                return None
 
-            data.sort(key=lambda x: x.get('ratio', 0), reverse=True)
+            if not isinstance(data, list):
+                print(
+                    f"⚠️ [{self.name}] Invalid inventory payload type: "
+                    f"{type(data).__name__}"
+                )
+                return None
+
+            if any(not isinstance(t, dict) for t in data):
+                print(
+                    f"⚠️ [{self.name}] Invalid torrent entry in inventory"
+                )
+                return None
+
+            data.sort(
+                key=lambda x: x.get('ratio', 0),
+                reverse=True
+            )
 
             results = []
+
             for t in data:
-                size_bytes = t.get('total_size', t.get('size', 0))
-                
-                # แมปปิ้งข้อมูล
+                size_bytes = t.get(
+                    'total_size',
+                    t.get('size', 0)
+                )
+                size_bytes = int(size_bytes or 0)
+
                 results.append({
                     'hash': t.get('hash'),
                     'ratio': t.get('ratio', 0),
@@ -1312,37 +2115,205 @@ class QbitNode:
                     'is_rt_complete': t.get('progress', 0) >= 1.0,
                     'save_path': t.get('save_path', '')
                 })
+
             return results
-            
+
         except Exception as e:
-            print(f"⚠️ [{self.name}] Error in get_all_torrents_info: {e}")
-            return []
+            print(
+                f"⚠️ [{self.name}] Error in get_all_torrents_info: {e}"
+            )
+            return None
+
+    def get_torrent_file_manifest(self, t_hash):
+        """Read relative file paths and sizes through qBittorrent API."""
+        clean_hash = str(t_hash or "").strip().lower()
+
+        if len(clean_hash) not in (40, 64):
+            return None
+        if any(ch not in "0123456789abcdef" for ch in clean_hash):
+            return None
+
+        if not self.is_connected and not self.login():
+            return None
+
+        try:
+            r = self._execute_request(
+                "GET",
+                f"{self.url}/api/v2/torrents/files",
+                params={"hash": clean_hash},
+                auth=self.auth,
+                verify=False,
+                timeout=15,
+            )
+
+            if r is None or r.status_code != 200:
+                print(
+                    f"⚠️ [{self.name}] File manifest API failure: "
+                    f"{r.status_code if r is not None else 'no response'}"
+                )
+                return None
+
+            payload = r.json()
+            if not isinstance(payload, list) or not payload:
+                return None
+
+            result = []
+            for item in payload:
+                if not isinstance(item, dict):
+                    return None
+
+                file_path = str(item.get("name") or "").replace("\\", "/")
+                try:
+                    size_bytes = int(item.get("size"))
+                except (TypeError, ValueError, OverflowError):
+                    return None
+
+                if not file_path or size_bytes < 0:
+                    return None
+
+                result.append({
+                    "path": file_path,
+                    "size_bytes": size_bytes,
+                })
+
+            return result
+
+        except Exception as e:
+            print(f"⚠️ [{self.name}] File manifest error: {e}")
+            return None
 
     def get_torrent_by_hash(self, t_hash):
+        """
+        Return:
+            dict  = Torrent found
+            False = Inventory succeeded; hash not found
+            None  = Inventory failure / invalid data
+        """
+        target_hash = str(t_hash or "").strip().lower()
+
+        if (
+            len(target_hash) not in (40, 64)
+            or any(ch not in "0123456789abcdef" for ch in target_hash)
+        ):
+            return None
+
         all_torrents = self.get_all_torrents_info()
-        for t in all_torrents:
-            if t['hash'].lower() == t_hash.lower():
-                return t
-        return None
+
+        if not isinstance(all_torrents, (list, tuple)):
+            return None
+
+        for torrent in all_torrents:
+            if not isinstance(torrent, dict):
+                return None
+
+            current_hash = str(
+                torrent.get("hash") or ""
+            ).strip().lower()
+
+            if (
+                len(current_hash) not in (40, 64)
+                or any(
+                    ch not in "0123456789abcdef"
+                    for ch in current_hash
+                )
+            ):
+                return None
+
+            if current_hash == target_hash:
+                return torrent
+
+        return False
 
     def is_torrent_exists(self, t_hash):
-        if not self.is_connected and not self.login(): 
-            return False
-            
-        try:
-            # 🛠️ แปลง t_hash เป็นตัวพิมพ์เล็กเสมอ เพื่อความปลอดภัยและความเข้ากันได้กับ qBittorrent API
-            clean_hash = t_hash.lower() if t_hash else ""
+        """
+        Return:
+            True  = Torrent exists
+            False = API succeeded; Torrent does not exist
+            None  = Login / API / Network / JSON failure
+        """
+        clean_hash = str(t_hash or "").strip().lower()
 
-            # ใช้ _execute_request เพื่อให้ผ่านด่าน Nginx และใช้ adapter ที่ถูกต้อง
+        if (
+            len(clean_hash) not in (40, 64)
+            or any(ch not in "0123456789abcdef" for ch in clean_hash)
+        ):
+            return None
+
+        try:
+            if not self.is_connected:
+                if not self.login():
+                    print(
+                        f"⚠️ [{self.name}] Hash check login failed"
+                    )
+                    return None
+
             r = self._execute_request(
-                'GET', 
-                f"{self.url}/api/v2/torrents/info", 
-                params={'hashes': clean_hash}, 
+                "GET",
+                f"{self.url}/api/v2/torrents/info",
+                params={"hashes": clean_hash},
                 timeout=10
             )
-            return r is not None and r.status_code == 200 and len(r.json()) > 0
-        except Exception: 
+
+            if r is None:
+                print(
+                    f"⚠️ [{self.name}] Hash check: no HTTP response"
+                )
+                return None
+
+            if r.status_code in (401, 403):
+                self.is_connected = False
+
+            if r.status_code != 200:
+                print(
+                    f"⚠️ [{self.name}] Hash check HTTP "
+                    f"{r.status_code}"
+                )
+                return None
+
+            try:
+                payload = r.json()
+            except Exception as json_error:
+                print(
+                    f"⚠️ [{self.name}] Hash check JSON error: "
+                    f"{json_error}"
+                )
+                return None
+
+            if not isinstance(payload, list):
+                print(
+                    f"⚠️ [{self.name}] Hash check invalid payload"
+                )
+                return None
+
+            for item in payload:
+                if not isinstance(item, dict):
+                    return None
+
+                current_hash = str(
+                    item.get("hash") or ""
+                ).strip().lower()
+
+                if (
+                    len(current_hash) not in (40, 64)
+                    or any(
+                        ch not in "0123456789abcdef"
+                        for ch in current_hash
+                    )
+                ):
+                    return None
+
+                if current_hash != clean_hash:
+                    return None
+
+                return True
+
             return False
+
+        except Exception as e:
+            print(
+                f"⚠️ [{self.name}] Hash check exception: {e}"
+            )
+            return None
 
     def delete_torrent(self, hash_str):
         if not self.is_connected and not self.login(): 
@@ -1380,11 +2351,13 @@ class QbitNode:
         except Exception:
             return 0.0
             
-    
+
+
     def get_active_downloads(self):
         """ดึง torrent ที่กำลังดาวน์โหลดหรือตรวจสอบจาก qBittorrent"""
         results = []
         seen_hashes = set()
+        successful_filters = 0
 
         for filter_type in ("downloading", "checking"):
             try:
@@ -1396,25 +2369,43 @@ class QbitNode:
                 )
 
                 if r is None:
+                    print(
+                        f"⚠️ [{self.name}] {filter_type}: "
+                        "ไม่มี HTTP response"
+                    )
                     continue
 
                 if r.status_code in (401, 403):
                     self.is_connected = False
+                    print(
+                        f"⚠️ [{self.name}] {filter_type}: "
+                        f"HTTP {r.status_code}"
+                    )
                     continue
 
                 if r.status_code != 200:
                     print(
-                        f"⚠️ [{self.name}] "
-                        f"torrents/info HTTP {r.status_code}"
+                        f"⚠️ [{self.name}] {filter_type}: "
+                        f"HTTP {r.status_code}"
                     )
                     continue
 
-                for t in r.json():
-                    torrent_hash = (t.get("hash") or "").lower()
+                torrents = r.json()
+                if not isinstance(torrents, list):
+                    print(
+                        f"⚠️ [{self.name}] {filter_type}: "
+                        "API response ไม่ใช่ list"
+                    )
+                    continue
 
-                    # ป้องกันการนับซ้ำ หาก torrent ปรากฏในทั้งสองผลลัพธ์
+                successful_filters += 1
+
+                for t in torrents:
+                    torrent_hash = str(t.get("hash") or "").lower()
+
                     if not torrent_hash or torrent_hash in seen_hashes:
                         continue
+
                     seen_hashes.add(torrent_hash)
 
                     results.append({
@@ -1422,12 +2413,13 @@ class QbitNode:
                         "name": t.get("name", ""),
                         "size_bytes": int(t.get("size") or 0),
                         "state": t.get("state", ""),
-                        "dlspeed": int(t.get("dlspeed") or 0),
+                        "dlspeed": max(0, int(t.get("dlspeed") or 0)),
                         "progress": float(t.get("progress") or 0),
                         "last_activity": int(
                             t.get("last_activity") or 0
                         ),
                         "amount_left": int(t.get("amount_left") or 0),
+                        "filter_type": filter_type,
                     })
 
             except Exception as e:
@@ -1436,7 +2428,26 @@ class QbitNode:
                     f"get_active_downloads ({filter_type}): {e}"
                 )
 
+        # แยกสถานะ API ล้มเหลวออกจากกรณีไม่มี torrent
+        self.last_active_downloads_ok = successful_filters > 0
+
+        checking_count = sum(
+            1 for t in results if t["filter_type"] == "checking"
+        )
+        downloading_count = sum(
+            1 for t in results if t["filter_type"] == "downloading"
+        )
+
+        print(
+            f"[TORRENT AUDIT] [{self.name}] "
+            f"api_filters_ok={successful_filters}/2 "
+            f"downloading={downloading_count} "
+            f"checking={checking_count} "
+            f"total={len(results)}"
+        )
+
         return results
+
 
     def _sweeper_force_start(self):
         """ระบบกวาดงานค้างอัตโนมัติ"""
@@ -1452,7 +2463,34 @@ class QbitNode:
             
             if r is not None and r.status_code == 200:
                 torrents = r.json()
-                hashes_to_resume = [t['hash'] for t in torrents if t.get('state') in ['pausedUP', 'pausedDL', 'queuedUP', 'queuedDL']]
+                def _has_cross_seed_marker(t):
+                    tags = {
+                        part.strip().replace("_", "-").replace(" ", "-").casefold()
+                        for part in str(t.get("tags") or "").split(",")
+                        if part.strip()
+                    }
+                    category = (
+                        str(t.get("category") or "")
+                        .strip()
+                        .replace("_", "-")
+                        .replace(" ", "-")
+                        .casefold()
+                    )
+                    return bool(
+                        tags.intersection({"cross-seed", "crossseed"})
+                        or category in {"cross-seed", "crossseed"}
+                    )
+
+                hashes_to_resume = []
+                for t in torrents:
+                    if t.get("state") not in [
+                        "pausedUP", "pausedDL", "queuedUP", "queuedDL"
+                    ]:
+                        continue
+                    torrent_hash = str(t.get("hash") or "").strip()
+                    if torrent_hash and not _has_cross_seed_marker(t):
+                        hashes_to_resume.append(torrent_hash)
+
                 
                 if hashes_to_resume:
                     # 2. สั่ง Resume ผ่าน _execute_request
@@ -1636,867 +2674,264 @@ class QbitNode:
         except Exception:
             return {}
 
-class RtorrentNode:
-    def __init__(self, cfg):
-        self.name, self.url = cfg["name"], cfg["url"].rstrip("/")
-        self.user, self.pw = cfg["rt_user"], cfg["rt_pass"]
-        self.quota_gb = cfg.get("quota_gb", 0)
-        
-        # สร้าง Session ไว้ใช้ยาวๆ ลด Overhead การสร้าง Connection ใหม่
-        self.s = requests.Session() 
-        
-        self.auth = HTTPBasicAuth(self.user, self.pw)
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36',
-            'Content-Type': 'text/xml'
-        }
-        self.free_gb = 0
-        self.jobs = 0
-        self.is_connected = False
-        self.stat_msg = "Active/Total: 0/0"
 
-    def login(self):
+def _bencode_value_end(data, pos):
+    """คืนตำแหน่ง byte ถัดจากค่า bencode หนึ่งค่า"""
+    if pos >= len(data):
+        raise ValueError("Unexpected end of bencode")
+
+    token = data[pos]
+
+    if token == ord("i"):
+        end = data.find(b"e", pos + 1)
+        if end < 0:
+            raise ValueError("Unterminated bencode integer")
+        return end + 1
+
+    if token in (ord("l"), ord("d")):
+        is_dict = token == ord("d")
+        pos += 1
+
+        while True:
+            if pos >= len(data):
+                raise ValueError("Unterminated bencode container")
+            if data[pos] == ord("e"):
+                return pos + 1
+
+            pos = _bencode_value_end(data, pos)
+            if is_dict:
+                pos = _bencode_value_end(data, pos)
+
+    if ord("0") <= token <= ord("9"):
+        colon = data.find(b":", pos)
+        if colon < 0:
+            raise ValueError("Invalid bencode byte string")
+        length_text = data[pos:colon]
+        if not length_text or not length_text.isdigit():
+            raise ValueError("Invalid byte string length")
+        end = colon + 1 + int(length_text)
+        if end > len(data):
+            raise ValueError("Truncated bencode byte string")
+        return end
+
+    raise ValueError(f"Invalid bencode token at offset {pos}")
+
+
+
+def _decode_bencode_value(data, offset=0):
+    """Decode one bencode value, returning (value, next_offset)."""
+    if offset >= len(data):
+        raise ValueError("Unexpected end of bencode")
+
+    token = data[offset]
+
+    if token == ord("i"):
+        end = data.find(b"e", offset + 1)
+        if end < 0:
+            raise ValueError("Unterminated integer")
         try:
-            # 1. ยิงทดสอบด้วยรหัสที่มีอยู่ (เริ่มต้นด้วย BasicAuth)
-            r = self.s.post(
-                self.url, 
-                data='<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName></methodCall>', 
-                auth=self.auth, 
-                headers=self.headers,
-                timeout=10,
-                verify=False
+            return int(data[offset + 1:end]), end + 1
+        except ValueError as exc:
+            raise ValueError("Invalid bencode integer") from exc
+
+    if token == ord("l"):
+        items = []
+        pos = offset + 1
+        while True:
+            if pos >= len(data):
+                raise ValueError("Unterminated list")
+            if data[pos] == ord("e"):
+                return items, pos + 1
+            value, pos = _decode_bencode_value(data, pos)
+            items.append(value)
+
+    if token == ord("d"):
+        result = {}
+        pos = offset + 1
+        while True:
+            if pos >= len(data):
+                raise ValueError("Unterminated dictionary")
+            if data[pos] == ord("e"):
+                return result, pos + 1
+
+            key, pos = _decode_bencode_value(data, pos)
+            if not isinstance(key, bytes):
+                raise ValueError("Bencode dictionary key must be bytes")
+            if key in result:
+                raise ValueError("Duplicate Bencode dictionary key")
+
+            value, pos = _decode_bencode_value(data, pos)
+            result[key] = value
+
+    if ord("0") <= token <= ord("9"):
+        colon = data.find(b":", offset)
+        if colon < 0:
+            raise ValueError("Invalid byte-string length")
+        raw_length = data[offset:colon]
+        if not raw_length.isdigit():
+            raise ValueError("Invalid byte-string length")
+
+        end = colon + 1 + int(raw_length)
+        if end > len(data):
+            raise ValueError("Truncated byte string")
+        return data[colon + 1:end], end
+
+    raise ValueError(f"Invalid bencode token at offset {offset}")
+
+
+def _torrent_text(value):
+    if not isinstance(value, bytes):
+        raise ValueError("Expected a bencode byte string")
+    return value.decode("utf-8", errors="surrogateescape")
+
+
+def _extract_torrent_manifest(content):
+    """Extract v1 info hash, root name and per-file path/size."""
+    data = bytes(content)
+    decoded, end = _decode_bencode_value(data, 0)
+
+    if end != len(data):
+        raise ValueError("Unexpected trailing data after torrent metainfo")
+    if not isinstance(decoded, dict):
+        raise ValueError("Torrent metainfo is not a dictionary")
+
+    info = decoded.get(b"info")
+    if not isinstance(info, dict):
+        raise ValueError("Missing info dictionary")
+
+    name_raw = info.get(b"name.utf-8", info.get(b"name"))
+    root_name = _torrent_text(name_raw)
+
+    if (
+        not root_name
+        or root_name in {".", ".."}
+        or "/" in root_name
+        or "\\" in root_name
+    ):
+        raise ValueError("Invalid torrent root name")
+
+    files = []
+
+    if b"files" in info:
+        entries = info.get(b"files")
+        if not isinstance(entries, list) or not entries:
+            raise ValueError("Invalid multi-file manifest")
+
+        seen_paths = set()
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError("Invalid file entry")
+
+            path_parts = entry.get(
+                b"path.utf-8",
+                entry.get(b"path"),
             )
-            
-            # 2. กรณี 401 Unauthorized
-            if r.status_code == 401:
-                auth_header = r.headers.get('WWW-Authenticate', '').lower()
-                if 'digest' in auth_header:
-                    print(f"🔄 [{self.name}] Switching to Digest Auth...")
-                    self.auth = HTTPDigestAuth(self.user, self.pw)
-                    r = self.s.post(
-                        self.url, 
-                        data='<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName></methodCall>', 
-                        auth=self.auth, 
-                        headers=self.headers,
-                        timeout=10,
-                        verify=False
-                    )
-                else:
-                    print(f"❌ [{self.name}] Login failed: 401 Unauthorized (Basic Auth)")
-            
-            # 3. ตัดสินผลการเชื่อมต่อ
-            if r.status_code == 200:
-                self.is_connected = True
-                print(f"✅ [{self.name}] Login successful!")
-                return True
-            elif r.status_code == 403:
-                print(f"❌ [{self.name}] Login failed: 403 Forbidden (Check permissions/IP whitelist)")
-            else:
-                print(f"⚠️ [{self.name}] Login failed with status: {r.status_code}")
-                
-            self.is_connected = False
-            return False
-                
-        except requests.exceptions.Timeout:
-            print(f"⏳ [{self.name}] Login failed: Request Timed Out")
-        except requests.exceptions.ConnectionError as e:
-            print(f"❌ [{self.name}] Login failed: Connection Error ({e})")
-        except Exception as e:
-            print(f"❌ [{self.name}] Login Exception: {e}")
-            
-        self.is_connected = False
-        return False
+            size = entry.get(b"length")
 
-    def refresh_status(self):
-        if not self.is_connected:
-            return False
+            if not isinstance(path_parts, list) or not path_parts:
+                raise ValueError("Missing file path")
+            if not isinstance(size, int) or size < 0:
+                raise ValueError("Invalid file size")
 
-        try:
-            # 1. ยิง XML-RPC ดึงข้อมูล (d.is_active=, d.size_bytes=, d.bytes_done=, d.hash=)
-            xml = (
-                '<?xml version="1.0"?>'
-                '<methodCall>'
-                '<methodName>d.multicall2</methodName>'
-                '<params>'
-                '<param><value><string></string></value></param>'
-                '<param><value><string>main</string></value></param>'
-                '<param><value><string>d.is_active=</string></value></param>'
-                '<param><value><string>d.size_bytes=</string></value></param>'
-                '<param><value><string>d.bytes_done=</string></value></param>'
-                '<param><value><string>d.hash=</string></value></param>'
-                '</params>'
-                '</methodCall>'
-            )
+            parts = [_torrent_text(part) for part in path_parts]
 
-            r = None
-            for attempt in range(3):
-                try:
-                    r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=10, verify=False)
-                    break
-                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-                    if attempt < 2:
-                        time.sleep(1.0)
-                    else:
-                        print(f"⚠️ [{self.name}] rTorrent connection timed out after 3 retries")
-                        return False
+            if any(
+                not part
+                or part in {".", ".."}
+                or "/" in part
+                or "\\" in part
+                for part in parts
+            ):
+                raise ValueError("Unsafe file path component")
 
-            if r is None:
-                return False
+            relative_path = "/".join(parts)
+            if relative_path in seen_paths:
+                raise ValueError("Duplicate file path in torrent")
+            seen_paths.add(relative_path)
 
-            if r.status_code in [401, 403]:
-                print(f"🔄 [{self.name}] Session expired, attempting re-login...")
-                if self.login():
-                    return False
-                return False
+            files.append({
+                "path": relative_path,
+                "size_bytes": size,
+            })
 
-            if r.status_code != 200:
-                print(f"⚠️ [{self.name}] XML-RPC returned HTTP {r.status_code}")
-                return False
+        multi_file = True
 
-            soup = BeautifulSoup(r.text, "xml")
+    else:
+        size = info.get(b"length")
+        if not isinstance(size, int) or size < 0:
+            raise ValueError("Invalid single-file length")
 
-            active = 0
-            total_count = 0
-            used_bytes = 0
+        files.append({
+            "path": root_name,
+            "size_bytes": size,
+        })
+        multi_file = False
 
-            # หาโหนดข้อมูล
-            torrent_nodes = soup.find_all("data")
-            if len(torrent_nodes) > 1:
-                for node in torrent_nodes[1:]:
-                    items = node.find_all("value", recursive=False)
-                    if len(items) >= 4:
-                        try:
-                            is_active = int(items[0].get_text().strip())
-                            bytes_done = int(items[2].get_text().strip())
+    tracker_urls = set()
 
-                            if is_active == 1:
-                                active += 1
-                            total_count += 1
-                            used_bytes += bytes_done
-                        except ValueError:
-                            pass
-
-            used_gb = used_bytes / (1024**3)
-            safety_buffer = 15.0
-
-            # 2. ดึง Disk Free space
-            xml_disk = '<?xml version="1.0"?><methodCall><methodName>network.disk_free_4gb</methodName></methodCall>'
-            real_free_gb = 0.0
-
-            try:
-                r_free = self.s.post(self.url, data=xml_disk, auth=self.auth, headers=self.headers, timeout=10, verify=False)
-                if r_free and r_free.status_code == 200:
-                    free_soup = BeautifulSoup(r_free.text, "xml")
-                    free_node = free_soup.find(["i8", "int", "i4", "value"])
-                    if free_node:
-                        real_free_gb = (int(free_node.get_text().strip()) * 4096) / (1024**3)
-            except Exception as disk_err:
-                print(f"⚠️ [{self.name}] Disk free check warning: {disk_err}")
-
-            # 3. คำนวณพื้นที่ Quota & Display Free
-            quota_free_gb = max(0.0, self.quota_gb - used_gb) if self.quota_gb > 0 else float('inf')
-
-            if self.quota_gb > 0:
-                display_free = min(quota_free_gb, real_free_gb)
-            else:
-                display_free = real_free_gb
-
-            self.free_gb = max(0.0, display_free - safety_buffer)
-
-            # 4. แสดงผลลัพธ์
-            if self.quota_gb > 0:
-                self.stat_msg = (
-                    f"FREE(Q): {quota_free_gb:.1f}GB | FREE(D): {real_free_gb:.1f}GB | "
-                    f"Total: {total_count} | Used: {used_gb:.1f}G / {self.quota_gb:.0f}G | "
-                    f"Safe: {self.free_gb:.1f}G"
-                )
-            else:
-                self.stat_msg = f"FREE: {display_free:.1f}GB | Total: {total_count} | Used: {used_gb:.1f}G | Safe: {self.free_gb:.1f}G"
-
-            return True
-
-        except Exception as e:
-            print(f"⚠️ [{self.name}] rTorrent Refresh Status Error: {e}")
-            return False
-
-    def get_all_torrents_info(self):
-        try:
-            # ⚡ เพิ่ม <param><value><string>d.directory=</string></value></param> เข้าไป
-            xml = '''<?xml version="1.0"?>
-            <methodCall>
-            <methodName>d.multicall2</methodName>
-            <params>
-                <param><value><string></string></value></param>
-                <param><value><string>main</string></value></param>
-                <param><value><string>d.hash=</string></value></param>
-                <param><value><string>d.ratio=</string></value></param>
-                <param><value><string>d.complete=</string></value></param>
-                <param><value><string>d.name=</string></value></param>
-                <param><value><string>d.size_bytes=</string></value></param>
-                <param><value><string>d.left_bytes=</string></value></param>
-                <param><value><string>d.timestamp.finished=</string></value></param>
-                <param><value><string>d.state=</string></value></param>
-                <param><value><string>d.up.rate=</string></value></param>
-                <param><value><string>d.peers_leeching=</string></value></param>
-                <param><value><string>d.creation_date=</string></value></param>
-                <param><value><string>d.directory=</string></value></param>
-            </params>
-            </methodCall>'''
-
-            # ... (โค้ดเชื่อมต่อและประมวลผล XML ปกติ) ...
-            req_headers = getattr(self, 'headers', {}).copy()
-            if "Connection" not in req_headers: 
-                req_headers["Connection"] = "close"
-
-            r = self.s.post(self.url, data=xml, auth=self.auth, headers=req_headers, timeout=20, verify=False)
-            if r.status_code != 200: 
-                print(f"❌ rTorrent API Error: Status Code {r.status_code}")
-                return []
-            
-            root = ET.fromstring(r.text)
-            data = root.findall(".//value/array/data/value/array/data")
-            
-            if not data:
-                print(f"⚠️ rTorrent return empty data list")
-                return []
-
-            results = []
-            for item in data:
-                values = item.findall("./value")
-                if len(values) < 9: continue 
-
-                def safe_get_text(val_node):
-                    if val_node is None: return ""
-                    for tag in ["./string", "./i4", "./int"]:
-                        target = val_node.find(tag)
-                        if target is not None and target.text is not None:
-                            return target.text.strip()
-                    return val_node.text.strip() if val_node.text else ""
-
-                t_hash = safe_get_text(values[0]).lower()
-                if not t_hash:
-                    continue
-                    
-                t_ratio_str = safe_get_text(values[1])
-                t_complete_str = safe_get_text(values[2])
-                t_name = safe_get_text(values[3])
-                t_size_str = safe_get_text(values[4])
-                t_left_str = safe_get_text(values[5])
-                t_ts_finished_str = safe_get_text(values[6])
-                t_state_str = safe_get_text(values[7]) if len(values) > 7 else "1"
-                t_ts_created_str = safe_get_text(values[8])
-                t_up_rate_str = safe_get_text(values[9]) 
-                t_leechers_str = safe_get_text(values[10])
-                
-                # 📂 ดึงค่า Directory ตามตำแหน่งดัชนี (ลำดับที่ 11 หรือค่าท้ายสุดที่เพิ่มเข้ามา)
-                t_directory = safe_get_text(values[11]) if len(values) > 11 else ""
-
-                is_complete_flag = (t_complete_str == "1")
-                left_bytes = int(t_left_str) if t_left_str.isdigit() else 0
-
-                try:
-                    ratio_val = int(t_ratio_str) / 1000.0 if t_ratio_str.isdigit() else 0.0
-                    if ratio_val < 0: ratio_val = 0.0
-                    size_bytes = int(t_size_str) if str(t_size_str).isdigit() else 0
-                    ts_finished = int(t_ts_finished_str) if t_ts_finished_str.isdigit() else 0
-                    ts_init = int(t_ts_created_str) if t_ts_created_str.isdigit() else 0
-                    
-                    if ts_init == 0:
-                        ts_init = int(time.time())
-                except Exception:
-                    ratio_val = 0.0
-                    size_bytes = 0
-
-                mapped_state = "seeding" if is_complete_flag else "downloading"
-                if t_state_str == "0": mapped_state = "paused"
-
-                results.append({
-                    'hash': t_hash,
-                    'ratio': ratio_val,
-                    'name': t_name,
-                    'size': size_bytes / (1024**3),
-                    'size_bytes': size_bytes,
-                    'amount_left': left_bytes,
-                    'progress': 1.0 if is_complete_flag else 0.0,
-                    'state': mapped_state,
-                    'added_on': ts_finished,
-                    'ts_finished': ts_finished,
-                    'ts_init': ts_init,
-                    'up_speed': int(t_up_rate_str) if t_up_rate_str.isdigit() else 0,
-                    'leechers': int(t_leechers_str) if t_leechers_str.isdigit() else 0,
-                    'is_rt_complete': is_complete_flag,
-                    'save_path': t_directory  # 👈 เพิ่มฟิลด์ save_path ตรงนี้เพื่อให้ส่งออกไปใช้งานต่อได้
-                })
-            
-            results.sort(key=lambda x: x.get('ratio', 0), reverse=True)
-            return results
-
-        except Exception as e:
-            print(f"❌ rTorrent Fetch Info Error: {e}")
-            return []
-
-    def get_torrent_by_hash(self, t_hash):
-        all_torrents = self.get_all_torrents_info()
-        for t in all_torrents:
-            if t['hash'].lower() == t_hash.lower():
-                return t
-        return None
-
-    def is_torrent_exists(self, t_hash):
-        if not self.is_connected: self.login()
-        try:
-            # ใช้ XML-RPC ตรวจสอบชื่อไฟล์หรือ hash (ในที่นี้ใช้ hash ซึ่งแม่นยำที่สุด)
-            xml = f'<?xml version="1.0"?><methodCall><methodName>d.name</methodName><params><param><value><string>{t_hash.upper()}</string></value></param></params></methodCall>'
-            r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=10, verify=False)
-            # ถ้า rTorrent คืนค่าสำเร็จ (ไม่ error) แสดงว่ามีไฟล์อยู่
-            return r.status_code == 200 and "<fault>" not in r.text
-        except: return False
-
-    def get_downloading_size(self):
-        try:
-            auth_url = self.url.replace("://", f"://{self.user}:{self.pw}@")
-            proxy = xmlrpc.client.ServerProxy(auth_url)
-            # ดึง size และ completed เฉพาะตัวที่ยังโหลดไม่เสร็จ (view 'started')
-            response = proxy.d.multicall2("", "started", "d.size_bytes=", "d.completed_bytes=")
-        
-            total_remaining = sum(int(t[0]) - int(t[1]) for t in response)
-            return total_remaining / (1024**3)
-        except:
-            return 0.0
-                    
-    def get_active_downloads(self):
-        """ดึงรายการที่กำลังโหลด โดยเปลี่ยนไปใช้ view 'main' เพื่อเลี่ยง Error 503"""
-        try:
-            # ผสม Auth ลงใน URL
-            auth_url = self.url.replace("://", f"://{self.user}:{self.pw}@")
-            proxy = xmlrpc.client.ServerProxy(auth_url)
-
-            # ดึงจาก view "main" ซึ่งเป็นมาตรฐานของ rTorrent ทุกเวอร์ชั่น
-            token = ""
-            # เพิ่ม d.get_complete= เพื่อเช็คว่าตัวไหนยังโหลดไม่เสร็จ
-            params = ("main", "d.hash=", "d.size_bytes=", "d.complete=")
-            response = proxy.d.multicall2(token, *params)
-
-            results = []
-            for t in response:
-                # d.complete == 0 หมายถึงกำลังดาวน์โหลด (หรือยังโหลดไม่เสร็จ)
-                if int(t[2]) == 0:
-                    results.append({
-                        'hash': t[0],
-                        'size_bytes': int(t[1]),
-                        'state': 'downloading'
-                    })
-            return results
-        except Exception as e:
-            # หากเกิด Error ให้พยายาม Login ใหม่ในรอบหน้า
-            self.is_connected = False
-            print(f"❌ [{self.name}] rTorrent Error: {e}")
-            return []
-
-    def _xml_escape(self, data):
-        """ใช้ Library มาตรฐานเพื่อความชัวร์"""
-        if not isinstance(data, str):
-            data = str(data)
-        # เพิ่มการลบอักขระควบคุม (ASCII 0-31) ที่อาจทำให้ XML พัง
-        data = "".join(ch for ch in data if ord(ch) >= 32 or ch in "\n\r\t")
-        return escape(data, {'"': '&quot;', "'": '&apos;'})
-    
-    def safe_xml_escape(self, data):
-        try:
-            return self._xml_escape(data)
-        except Exception:
-            return str(data).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-    def add(self, content, site_name="Universal", size=None, n_cfg=None, save_path=None, skip_checking=False):
-        """
-        เมธอดหลักสำหรับส่งไฟล์ Torrent เข้า rTorrent
-        :param save_path: Path โฟลเดอร์ปลายทางสำหรับ Cross-Seed
-        :param skip_checking: หากเป็น True จะข้ามการ Recheck Hash
-        """
-        if len(content) < 1000:
-            print(f"❌ [{self.name}] Torrent file is too small or invalid.")
-            return False
-
-        info_hash = None
-        try:
-            info_start = content.find(b'4:infod')
-            if info_start != -1:
-                # ใช้ SHA1 Hash แกะ Info Hash จาก Raw Torrent Bytes
-                pos = content.rfind(b'e') # ตำแหน่งจบของ Bencode Dict (ตามตรรกะเดิมของคุณ)
-                info_data = content[info_start + 2:info_start + 7] # ปรับใช้ Logic แกะ Bencode เดิมของคุณให้สมบูรณ์
-                info_hash = hashlib.sha1(info_data).hexdigest().lower()
-        except Exception as e:
-            print(f"⚠️ [{self.name}] Hash extraction failed: {e}")
-
-        return self._add_fallback_clean(
-            content=content,
-            site_name=site_name,
-            info_hash=info_hash,
-            save_path=save_path,
-            skip_checking=skip_checking
+    announce = decoded.get(b"announce")
+    if isinstance(announce, bytes):
+        tracker_urls.add(
+            announce.decode("utf-8", errors="surrogateescape").strip()
         )
 
-    def _add_fallback_clean(self, content, site_name, info_hash=None, save_path=None, skip_checking=False):
-        safe_site = self.safe_xml_escape(site_name)
-
-        # 1. กรณีงานมีอยู่แล้วใน Client
-        if info_hash and self._verify_torrent_in_client(info_hash):
-            print(f"ℹ️ [{self.name}] Torrent already exists -> บังคับติดป้ายค่ายเว็บและสับสวิตช์เริ่มงานซ้ำทันที...")
-            self._force_start_torrent(info_hash, safe_site)
-            return True
-        
-        encoded_content = base64.b64encode(content).decode('ascii')
-    
-        # 2. สร้าง Command Injection Array ตามโหมดการทำงาน
-        commands = [
-            f"d.custom1.set={safe_site}"  # ฝัง Label ประจำค่าย
-        ]
-
-        # 🎯 เพิ่มสวิตช์คำสั่งพิเศษกรณี Cross-Seed Mode
-        if save_path:
-            safe_path = self.safe_xml_escape(save_path)
-            commands.append(f'd.directory.set="{safe_path}"')
-    
-        if skip_checking:
-            # ข้าม Hash Check + ตั้ง Flag งานให้พร้อม Seed
-            commands.append("d.check_hash.set=0")
-
-        # ประกอบคำสั่ง XML-RPC Parameters
-        command_params = "".join([f'<param><value><string>{cmd}</string></value></param>' for cmd in commands])
-
-        xml_payload = (
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<methodCall>'
-            '<methodName>load.raw_start</methodName>'
-            '<params>'
-            '<param><value><string></string></value></param>'
-            f'<param><value><base64>{encoded_content}</base64></value></param>'
-            f'{command_params}'
-            '</params>'
-            '</methodCall>'
-        ).encode('utf-8')
-    
-        r = None
-    
-        # 3. ยิง HTTP POST ไปยัง XML-RPC Endpoint
-        for attempt in range(3):
-            try:
-                r = self.s.post(self.url, data=xml_payload, auth=self.auth, headers=self.headers, timeout=15, verify=False)
-                break  
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
-                if attempt < 2:
-                    print(f"🔄 [{self.name}] Network Timeout/Error ({net_err}) กำลังลองใหม่อีกครั้ง... (รอบที่ {attempt+1}/2)")
-                    time.sleep(1.5)  
-                else:
-                    print(f"❌ [{self.name}] Exception during upload หลังพยายามครบ 3 รอบ: {net_err}")
-                    return False
-            except Exception as e:
-                print(f"❌ [{self.name}] Fatal Exception during upload: {e}")
-                return False
-    
-        try:
-            if r is None or r.status_code != 200 or "fault" in r.text.lower():
-                print(f"⚠️ [{self.name}] Load failed: {r.text[:50] if r else 'No Response'}")
-                return False
-
-            print(f"✅ [{self.name}] ส่งไฟล์เข้า rTorrent สำเร็จ (Cross-Seed: {skip_checking}) -> ตรวจสอบสถานะระบบ...")
-        
-            # 4. วนลูปตรวจสอบว่างานเข้าระบบแล้วหรือยัง
-            found = False
-            for i in range(25):  
-                time.sleep(0.4)
-                if info_hash and self._verify_torrent_in_client(info_hash):
-                    found = True
-                    break
-        
-            # 5. สั่งสตาร์ทย้ำ และยิงชุดคำสั่งปรับสถานะซ้ำกรณีดิสก์ดีเลย์
-            if info_hash:
-                if not found:
-                    print(f"⚠️ [{self.name}] Detection Delay: บอทตรวจไม่เจอในตารางหลักทันที กำลังเจาะทะลวงระบบแชร์...")
-            
-                self._force_start_torrent(info_hash, safe_site)
-            
-                if not found:
-                    time.sleep(1.5)
-                    print(f"🔄 [{self.name}] Burst-Emphasize: กำลังยิงชุดคำสั่งจัดการย้ำรอบที่ 2...")
-                    self._force_start_torrent(info_hash, safe_site)
-
-            return True
-
-        except Exception as e:
-            print(f"❌ [{self.name}] Exception during response parsing: {e}")
-            return False
-
-    def _force_start_torrent(self, info_hash, safe_site=None):
-        """[SUPER UPGRADED]: ชุดคอมโบสั่งติดป้ายค่ายเว็บ + บังคับรัน + ดึงเพียร์ จบในที่เดียวแบบนิ่งสนิท"""
-        if not info_hash: return
-        target_hash = info_hash.strip().lower()
-        
-        # ปรับขยับเอาคำสั่งยัดทาสก์และเปิดเปิดดึงนำร่อง
-        sequence = ['view.add_task', 'd.open', 'd.custom1.set', 'd.start', 'd.tracker_announce']
-        
-        for method in sequence:
-            try:
-                if method == 'd.custom1.set' and not safe_site:
-                    continue
-                    
-                if method == 'view.add_task':
-                    xml_cmd = (
-                        f'<?xml version="1.0"?><methodCall><methodName>view.add_task</methodName>'
-                        f'<params><param><value><string>main</string></value></param>'
-                        f'<param><value><string>{target_hash}</string></value></param></params></methodCall>'
+    announce_list = decoded.get(b"announce-list", [])
+    if isinstance(announce_list, list):
+        for group in announce_list:
+            entries = group if isinstance(group, list) else [group]
+            for entry in entries:
+                if isinstance(entry, bytes):
+                    tracker_urls.add(
+                        entry.decode(
+                            "utf-8", errors="surrogateescape"
+                        ).strip()
                     )
-                elif method == 'd.custom1.set':
-                    xml_cmd = (
-                        f'<?xml version="1.0"?><methodCall><methodName>d.custom1.set</methodName>'
-                        f'<params><param><value><string>{target_hash}</string></value></param>'
-                        f'<param><value><string>{safe_site}</string></value></param></params></methodCall>'
-                    )
-                else:
-                    xml_cmd = (
-                        '<?xml version="1.0" encoding="UTF-8"?>'
-                        '<methodCall><methodName>{}</methodName>'
-                        '<params><param><value><string>{}</string></value></param></params>'
-                        '</methodCall>'
-                    ).format(method, target_hash)
 
-                req_headers = {**getattr(self, 'headers', {}), 'Content-Type': 'text/xml'}
-                self.s.post(self.url, data=xml_cmd.encode('utf-8'), auth=self.auth, headers=req_headers, timeout=5, verify=False)
-                time.sleep(0.1)
-            except Exception as e:
-                print(f"⚠️ [{self.name}] _force_start ({method}) failed: {e}")
+    tracker_urls = sorted(
+        url for url in tracker_urls
+        if url.startswith(("http://", "https://", "udp://"))
+    )
 
-    def _verify_torrent_in_client(self, info_hash):
-        """[UPGRADED]: เช็กการมีอยู่จริงของงานผ่าน XML-RPC เดี่ยว (d.name) เบาเครื่องและแม่นยำ 100%"""
-        if not info_hash: return False
-        target_hash = info_hash.strip().lower() 
-    
-        xml_check = (
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<methodCall>'
-            '<methodName>d.name</methodName>'
-            '<params>'
-            f'<param><value><string>{target_hash}</string></value></param>' 
-            '</params>'
-            '</methodCall>'
-        ).encode('utf-8')
-    
-        try:
-            req_headers = {**getattr(self, 'headers', {}), 'Content-Type': 'text/xml; charset=utf-8'}
-            r = self.s.post(self.url, data=xml_check, auth=self.auth, headers=req_headers, timeout=6, verify=False)
-            
-            if r.status_code == 200 and "fault" not in r.text.lower():
-                if "value" in r.text.lower() and len(r.text) > 80:
-                    return True
-        except Exception as e:
-            print(f"⚠️ [{self.name}] _verify_torrent_in_client เกิดข้อผิดพลาดเน็ตเวิร์ก: {e}")
-            
-        return False
+    return {
+        "info_hash": _extract_torrent_info_hash(data),
+        "root_name": root_name,
+        "multi_file": multi_file,
+        "files": files,
+        "total_size_bytes": sum(f["size_bytes"] for f in files),
+        "announce_urls": tracker_urls,
+    }
 
-    def _sweeper_force_start(self):
-        """ระบบกวาดงานค้างอัตโนมัติ"""
-        # d.multicall2 จะกวาดงานที่ status = stopped ทั้งหมดในครั้งเดียว
-        # d.is_active=0 หมายถึงกวาดเฉพาะงานที่หยุดทำงานอยู่ (Stopped)
-        xml_sweep = (
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<methodCall><methodName>d.multicall2</methodName>'
-            '<params>'
-            '<param><value><string></string></value></param>' # target: all
-            '<param><value><string>main</string></value></param>' # view: main
-            '<param><value><string>d.is_active=0</string></value></param>' # condition: inactive
-            '<param><value><string>d.open=</string></value></param>'       # command: open
-            '<param><value><string>d.start=</string></value></param>'      # command: start
-            '<param><value><string>d.resume=</string></value></param>'    # command: resume
-            '</params></methodCall>'
-        ).encode('utf-8')
-        
-        try:
-            self.s.post(self.url, data=xml_sweep, auth=self.auth, headers=self.headers, timeout=5, verify=False)
-        except:
-            pass
-            
-    def delete_torrent(self, t_hash):
-        """Hard Delete: หยุดและลบข้อมูลในคำสั่งเดียว (Atomic Operation)"""
-        #สิ่งที่ต้องเพิ่มใน .rtorrent.rc
-        #ให้เพิ่มบรรทัดนี้ไว้ก่อนบรรทัด # -- END HERE --:
-        #method.set_key = event.download.erased, delete_tied, "execute={rm,-rf,--,$d.base_path=}"
-        try:
-            # รวม d.stop และ d.erase เข้าเป็นก้อนเดียว
-            xml = f'''<?xml version="1.0"?>
-            <methodCall>
-              <methodName>system.multicall</methodName>
-              <params>
-                <param><value><array><data>
-                  <value><struct>
-                    <member><name>methodName</name><value><string>d.stop</string></value></member>
-                    <member><name>params</name><value><array><data><value><string>{t_hash}</string></value></data></array></value></member>
-                  </struct></value>
-                  <value><struct>
-                    <member><name>methodName</name><value><string>d.erase</string></value></member>
-                    <member><name>params</name><value><array><data><value><string>{t_hash}</string></value></data></array></value></member>
-                  </struct></value>
-                </data></array></value></param>
-              </params>
-            </methodCall>'''
+def _extract_torrent_info_hash(content):
+    """SHA-1 of the exact raw bencoded info dictionary."""
+    data = bytes(content)
+    decoded, total_end = _decode_bencode_value(data, 0)
 
-            r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, verify=False, timeout=10)
-            return r.status_code == 200
-        except Exception as e:
-            print(f"❌ [{self.name}] Delete Error: {e}")
-            return False
+    if total_end != len(data):
+        raise ValueError("Unexpected trailing bytes in torrent metainfo")
+    if not isinstance(decoded, dict):
+        raise ValueError("Torrent metainfo is not a dictionary")
+    if not isinstance(decoded.get(b"info"), dict):
+        raise ValueError("Torrent has no valid info dictionary")
 
-    def _execute_multicall(self, calls):
-        """ตัวกลางส่งคำสั่งแบบ Batch (system.multicall)"""
-        # สร้างส่วนของ array ของคำสั่ง
-        data_parts = []
-        for call in calls:
-            data_parts.append(f'''
-                <value><struct>
-                    <member><name>methodName</name><value><string>{call['methodName']}</string></value></member>
-                    <member><name>params</name><value><array><data>
-                        <value><string>{call['params'][0]}</string></value>
-                    </data></array></value></member>
-                </struct></value>''')
-        
-        xml = f'''<?xml version="1.0"?>
-        <methodCall>
-            <methodName>system.multicall</methodName>
-            <params><param><value><array><data>{"".join(data_parts)}</data></array></value></param></params>
-        </methodCall>'''
-        
-        try:
-            r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, verify=False, timeout=10)
-            return r.status_code == 200
-        except Exception as e:
-            print(f"❌ [{self.name}] Batch Operation Error: {e}")
-            return False
+    pos = 1
+    while pos < len(data):
+        if data[pos] == ord("e"):
+            break
 
-    def stop_torrent(self, target_hashes):
-        """สั่ง Stop งานหลายตัวพร้อมกันผ่าน system.multicall"""
-        if not target_hashes: return False
-        
-        # สร้างรายการคำสั่ง stop สำหรับทุก hash
-        calls = []
-        for t_hash in target_hashes:
-            calls.append({
-                "methodName": "d.stop",
-                "params": [t_hash]
-            })
-        
-        return self._execute_multicall(calls)
+        key, value_start = _decode_bencode_value(data, pos)
+        if not isinstance(key, bytes):
+            raise ValueError("Top-level Bencode key is not bytes")
 
-    def reannounce_torrent(self, target_hashes):
-        """สั่ง Re-announce งานเฉพาะกลุ่มผ่าน system.multicall"""
-        if not target_hashes: return False
-        
-        calls = []
-        for t_hash in target_hashes:
-            calls.append({
-                "methodName": "d.tracker_announce",
-                "params": [t_hash]
-            })
-            
-        return self._execute_multicall(calls)
+        _, value_end = _decode_bencode_value(data, value_start)
 
-    def reannounce_all(self):
-        if not self.is_connected and not self.login(): return False
-        try:
-            # ใช้ multicall2 สั่ง d.tracker_announce ทุกตัวในหน้าหลัก (main) พร้อมกัน
-            xml = (
-                '<?xml version="1.0"?>'
-                '<methodCall>'
-                '<methodName>d.multicall2</methodName>'
-                '<params>'
-                '<param><value><string></string></value></param>'
-                '<param><value><string>main</string></value></param>'
-                '<param><value><string>d.tracker_announce=</string></value></param>'
-                '</params>'
-                '</methodCall>'
-            )
-            self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=15, verify=False)
-            return True
-        except: return False
+        if key == b"info":
+            return hashlib.sha1(data[value_start:value_end]).hexdigest().lower()
 
-    async def sync_to_mapping(self, web_data_list=None, mapper_func=None):
-        """
-        ดึงข้อมูลทอร์เรนต์ทั้งหมดจาก rTorrent แล้วจับคู่กับข้อมูลเว็บเพื่ออัปเดตลง JSON Mapping (Async)
-        """
-        if not self.is_connected and not self.login():
-            return False
+        pos = value_end
 
-        mapping = {}
-        try:
-            xml = (
-                '<?xml version="1.0"?>'
-                '<methodCall>'
-                '<methodName>d.multicall2</methodName>'
-                '<params>'
-                '<param><value><string></string></value></param>'
-                '<param><value><string>main</string></value></param>'
-                '<param><value><string>d.hash=</string></value></param>'
-                '<param><value><string>d.name=</string></value></param>'
-                '<param><value><string>d.size_bytes=</string></value></param>'
-                '<param><value><string>d.completed_bytes=</string></value></param>'
-                '<param><value><string>d.up.total=</string></value></param>'
-                '<param><value><string>d.down.total=</string></value></param>'
-                '<param><value><string>d.custom1=</string></value></param>'
-                '<param><value><string>d.is_open=</string></value></param>'
-                '<param><value><string>d.is_active=</string></value></param>'
-                '<param><value><string>d.state=</string></value></param>'
-                '<param><value><string>d.directory=</string></value></param>'  # 👈 1. เพิ่ม d.directory= ตรงนี้
-                '</params>'
-                '</methodCall>'
-            )
+    raise ValueError("Torrent has no raw info dictionary")
 
-            req_headers = {**getattr(self, 'headers', {}), 'Connection': 'close'}
-            r = self.s.post(self.url, data=xml, auth=self.auth, headers=req_headers, timeout=20, verify=False)
-            
-            if r.status_code in [401, 403]:
-                if self.login():
-                    r = self.s.post(self.url, data=xml, auth=self.auth, headers=req_headers, timeout=20, verify=False)
-
-            if r.status_code != 200:
-                print(f"❌ [{self.name}] sync_to_mapping Error: Status Code {r.status_code}")
-                return False
-
-            root = ET.fromstring(r.text)
-            data = root.findall(".//value/array/data/value/array/data")
-            if not data:
-                return False
-
-            for item in data:
-                values = item.findall("./value")
-                if len(values) < 11:  # 👈 2. ขยับเงื่อนไขเช็คความยาวตามจำนวนพารามิเตอร์ที่เพิ่มขึ้น (0-10 รวมเป็น 11 ตัว)
-                    continue
-
-                def safe_get_text(val_node):
-                    if val_node is None: return ""
-                    for tag in ["./string", "./i4", "./int", "./i8"]:
-                        target = val_node.find(tag)
-                        if target is not None and target.text is not None:
-                            return target.text.strip()
-                    return val_node.text.strip() if val_node.text else ""
-
-                t_hash = safe_get_text(values[0]).upper()
-                if not t_hash:
-                    continue
-
-                try:
-                    size_bytes = int(safe_get_text(values[2])) if safe_get_text(values[2]).lstrip('-').isdigit() else 0
-                    completed_bytes = int(safe_get_text(values[3])) if safe_get_text(values[3]).lstrip('-').isdigit() else 0
-                    up_total = int(safe_get_text(values[4])) if safe_get_text(values[4]).lstrip('-').isdigit() else 0
-                    down_total = int(safe_get_text(values[5])) if safe_get_text(values[5]).lstrip('-').isdigit() else 0
-                    is_open = int(safe_get_text(values[7])) == 1 if safe_get_text(values[7]).lstrip('-').isdigit() else False
-                    is_active = int(safe_get_text(values[8])) == 1 if safe_get_text(values[8]).lstrip('-').isdigit() else False
-                except Exception:
-                    size_bytes, completed_bytes, up_total, down_total = 0, 0, 0, 0
-                    is_open, is_active = False, False
-
-                ratio = (up_total / size_bytes) if size_bytes > 0 else 0.0
-
-                mapping[t_hash] = {
-                    "hash": t_hash,
-                    "name": safe_get_text(values[1]),
-                    "size_bytes": size_bytes,
-                    "completed_bytes": completed_bytes,
-                    "up_total": up_total,
-                    "down_total": down_total,
-                    "ratio": round(ratio, 4),
-                    "label": safe_get_text(values[6]),
-                    "is_open": is_open,
-                    "is_active": is_active,
-                    "state": safe_get_text(values[9]),
-                    "save_path": safe_get_text(values[10])  # 👈 3. ดึงค่า Directory มาเก็บไว้ใน mapping
-                }
-
-        except Exception as e:
-            print(f"❌ [{self.name}] Exception during sync_to_mapping: {e}")
-            return False
-
-        if not mapping:
-            return False
-
-        save_func = mapper_func if mapper_func else add_or_update_torrent
-
-        synced_count = 0
-        for t_hash, rt_t in mapping.items():
-            client_data = {
-                "client_type": "rtorrent",
-                "hash": rt_t['hash'],
-                "name": rt_t['name'],
-                "size_bytes": rt_t['size_bytes'],
-                "state": rt_t['state'],
-                "ratio": rt_t['ratio'],
-                "up_total": rt_t['up_total'],
-                "down_total": rt_t['down_total']
-            }
-            
-            node_data = {
-                "seedbox_host": self.name,
-                "label": rt_t['label'],
-                "is_active": rt_t['is_active'],
-                "save_path": rt_t.get('save_path', '')
-            }
-            
-            # ส่ง web_data เป็น {} ไปก่อน
-            await save_func(client_data=client_data, web_data={}, node_data=node_data)
-            synced_count += 1
-            
-        if synced_count > 0:
-            print(f"🔄 [{self.name}] ซิงค์ข้อมูล rTorrent เข้า Mapping เรียบร้อยแล้ว ({synced_count} รายการ)")
-        return True
-
-    def get_stats_by_site(self):
-        if not self.is_connected: 
-            self.login()
-            
-        try:
-            
-            # 1. สร้าง Proxy เชื่อมต่อหลังบ้าน
-            auth_url = self.url.replace("://", f"://{self.user}:{self.pw}@")
-            proxy = xmlrpc.client.ServerProxy(auth_url)
-
-            # 2. 🛡️ [ULTIMATE CORE FIX]: เปลี่ยนเป็นคำสั่ง Standard rTorrent API สายตรงทั้งหมด 100%
-            # d.custom1=           (ดึง Label ชื่อเว็บ)
-            # d.up.total=          (ดึงยอดอัปโหลดรวมหน่วย Bytes)
-            # d.up.rate=           (ดึงความเร็วอัปโหลดปัจจุบัน Bytes/s) <- แก้ไขจาก d.get_up_rate=
-            # d.down.total=        (ดึงยอดดาวน์โหลดรวมหน่วย Bytes)
-            response = proxy.d.multicall2("", "main", "d.custom1=", "d.up.total=", "d.up.rate=", "d.down.total=")
-
-            site_stats = {}
-            for t in response:
-                # ล้างชื่อ Site และปรับเป็นตัวพิมพ์ใหญ่ทั้งหมด (Upper Case)
-                raw_site = t[0] if t[0] else "Uncategorized"
-                site = unquote(raw_site).strip().upper()
-                
-                # แมตช์ชื่อคีย์หลักให้ตรงกับระบบรายงานผล
-                if "BEARBIT" in site: site = "BEARBIT"
-                if "TORRENTDD" in site: site = "TORRENTDD"
-            
-                total_up = int(t[1])
-                up_speed = int(t[2])  # รับค่าจาก d.up.rate มาคำนวณสปีดปัจจุบัน
-                total_dl = int(t[3])
-
-                if site not in site_stats:
-                    site_stats[site] = {
-                        'total_up_bytes': 0, 
-                        'total_dl_bytes': 0,      
-                        'current_speed_bytes': 0, 
-                        'count': 0
-                    }
-        
-                site_stats[site]['total_up_bytes'] += total_up
-                site_stats[site]['total_dl_bytes'] += total_dl
-                site_stats[site]['current_speed_bytes'] += up_speed
-                site_stats[site]['count'] += 1
-            
-            return site_stats
-        except Exception as e:
-            self.is_connected = False
-            print(f"⚠️ [{self.name}] rTorrent Stats Error: {e}")
-            return {}
-
-# ========================= UPDATE TRACKER =========================
 
 def update_trackers(node):
     """ สั่งให้ Node อัปเดตข้อมูลไปยัง Tracker """
@@ -2537,9 +2972,26 @@ class NodeCleaner:
 
     def __init__(self, node_obj, node_clean_cfg, global_clean_cfg):
         self.node = node_obj
-        self.node_cfg = node_clean_cfg or {}
+        raw_cfg = (
+            node_clean_cfg
+            if isinstance(node_clean_cfg, dict)
+            else {}
+        )
+        self.node_cfg = raw_cfg
+
+        nested = raw_cfg.get("clean_settings")
+        if isinstance(nested, dict):
+            self.clean_settings = nested
+            self.node_enable = raw_cfg.get(
+                "enable", raw_cfg.get("ENABLE")
+            )
+        else:
+            # Some call sites pass clean_settings directly.
+            self.clean_settings = raw_cfg
+            self.node_enable = None
+
         self.global_cfg = global_clean_cfg or {}
-        self.site_key = getattr(self.node, 'site_key', 'UNKNOWN')
+        self.site_key = getattr(self.node, "site_key", "UNKNOWN")
         self._db_cache = None
 
     @classmethod
@@ -2581,37 +3033,90 @@ class NodeCleaner:
             cls._PROTECTED_CACHE_STORAGE.remove(h)
 
     def _update_db_status(self, t_hash, new_status):
-        # โหลด DB ตาม site_key ปัจจุบัน (Unified DB)
-        db = load_db(self.site_key)
-        if not db:
+        target = str(t_hash or "").strip().lower()
+        if not target:
+            print("⚠️ [DB Sync] ปฏิเสธการอัปเดต: hash ว่าง")
             return
-            
-        updated = False
-        for data in db.values():
-            if data.get("hash", "").lower() == t_hash.lower():
-                data["status"] = new_status
-                data["deleted_at"] = get_now().strftime("%Y-%m-%d %H:%M")
-                updated = True
-                break
-        
-        if updated:
-            save_db(self.site_key, db)
-            # อัปเดต Cache แบบ Active ทันทีโดยไม่ต้องเคลียร์ทิ้ง
-            NodeCleaner.update_protected_cache_item(t_hash, new_status)
-            print(f"🚀 [Cache] Active Sync: อัปเดต {t_hash} สถานะเป็น {new_status}")
+
+        matches = []
+        for db_name, db in load_all_db().items():
+            if not isinstance(db, dict):
+                continue
+
+            for key, record in db.items():
+                if not isinstance(record, dict):
+                    continue
+
+                record_hash = str(record.get("hash") or "").strip().lower()
+                key_hash = str(key or "").strip().lower()
+
+                if target == record_hash or target == key_hash:
+                    matches.append((db_name, db, record))
+
+        # Fail closed: ไม่อัปเดตหากไม่มี record หรือพบหลาย record
+        if len(matches) != 1:
+            print(
+                f"⚠️ [DB Sync] ไม่ได้อัปเดตสถานะ {target}: "
+                f"พบ matching records={len(matches)}; ต้องเป็น 1"
+            )
+            return
+
+        db_name, db, record = matches[0]
+        record["status"] = new_status
+        record["deleted_at"] = get_now().strftime("%Y-%m-%d %H:%M")
+
+        save_db(db_name, db)
+        NodeCleaner.update_protected_cache_item(target, new_status)
+
+        print(
+            f"🚀 [DB Sync] อัปเดต {target} "
+            f"ใน DB={db_name} เป็น {new_status}"
+        )
 
     def check_torrent_permission(self, t_hash):
-        protected_hashes = self.get_global_protected_set()
-        if t_hash.lower() in protected_hashes:
+        target = str(t_hash or "").strip().lower()
+        if not target:
+            return "UNKNOWN"
+
+        matches = []
+
+        # ใช้ DB ปัจจุบันโดยตรง ไม่พึ่ง Protected Cache ที่อาจล้าสมัย
+        for db_name, db in load_all_db().items():
+            if not isinstance(db, dict):
+                continue
+
+            for key, record in db.items():
+                if not isinstance(record, dict):
+                    continue
+
+                record_hash = str(record.get("hash") or "").strip().lower()
+                key_hash = str(key or "").strip().lower()
+
+                if target == record_hash or target == key_hash:
+                    status = str(record.get("status") or "").strip().upper()
+                    matches.append((db_name, str(key), status or "UNKNOWN"))
+
+        if not matches:
+            return "NOT_FOUND"
+
+        # หากพบสถานะ PROTECTED ที่ใดก็ตาม ต้องปฏิเสธการลบ
+        if any(status == "PROTECTED" for _, _, status in matches):
             return "PROTECTED"
-        
-        # ค้นหาเพิ่มเติมใน Unified DB ของ Site นี้โดยตรง
-        site_data = load_db(self.site_key)
-        for data in site_data.values():
-            if data.get("hash", "").lower() == t_hash.lower():
-                return str(data.get("status", "NOT_FOUND")).upper()
-    
-        return "NOT_FOUND"
+
+        # Hash เดียวกันปรากฏหลาย records: ไม่เดาว่า record ใดเป็นเจ้าของสถานะ
+        if len(matches) != 1:
+            print(
+                f"🔒 [GUARD] Ambiguous DB records for {target}: "
+                f"{len(matches)} matches; refusing deletion"
+            )
+            return "AMBIGUOUS"
+
+        db_name, record_key, status = matches[0]
+        print(
+            f"🔎 [Permission] hash={target} "
+            f"DB={db_name} key={record_key} status={status}"
+        )
+        return status
 
     def _get_node_free_gb(self):
         try:
@@ -2620,56 +3125,398 @@ class NodeCleaner:
         except Exception:
             return 100.0
 
-    def _hard_purge_sequence(self, t_hash):
-        """
-        ระบบล้างไฟล์แบบ Hard Purge: ตรวจสอบสิทธิ์ -> เตรียมตัว -> ลบจริง
-        รองรับทุกโหนดโดยไม่ต้องเช็ค node_type (อาศัย Polymorphism)
-        """
-        status = self.check_torrent_permission(t_hash)
+    def _purge_qbit_get_json(self, endpoint, params):
+        """Read-only qBittorrent API request with one auth retry."""
 
-        # 1. ตรวจสอบสถานะก่อนลบ
-        allowed_to_delete = ["COMPLETED", "NOT_FOUND"]
-    
-        if status not in allowed_to_delete:
-            print(f"🔒 [GUARD] ปฏิเสธการลบ: สถานะคือ {status} - {t_hash}")
-            return False
-        
-        if status == "NOT_FOUND":
-            print(f"⚠️ [GUARD] ล้างไฟล์ที่ไม่อยู่ใน DB (NOT_FOUND): {t_hash}")
+        node = self.node
+        requester = getattr(node, "_execute_request", None)
+        base_url = str(getattr(node, "url", "") or "").rstrip("/")
+
+        if not callable(requester) or not base_url:
+            return None, "QBIT_API_UNAVAILABLE"
+
+        def fetch():
+            return requester(
+                "GET",
+                f"{base_url}{endpoint}",
+                params=params,
+                timeout=12,
+            )
 
         try:
-            # 2. ขั้นตอนการเตรียมตัว (Sequence)
-            # เราใช้ self.node เรียก Method ตรงๆ โดยไม่ต้องเช็ค if node_type
-            # เพื่อให้โค้ดนี้ทำงานได้ ออบเจกต์ใน self.node ต้องมีเมธอดเหล่านี้เตรียมไว้
-            print(f"🔄 [PURGE] กำลังทำ Sequence ลบสำหรับ: {t_hash}")
-            
+            response = fetch()
+
+            if response is not None and response.status_code in (401, 403):
+                login = getattr(node, "login", None)
+
+                if callable(login) and login():
+                    response = fetch()
+
+            if response is None:
+                return None, "NO_RESPONSE"
+
+            if response.status_code != 200:
+                return None, f"HTTP_{response.status_code}"
+
+            try:
+                payload = response.json()
+            except Exception:
+                return None, "INVALID_JSON"
+
+            return payload, "OK"
+
+        except Exception as exc:
+            return None, f"API_EXCEPTION:{type(exc).__name__}"
+
+    def _check_purge_authorization(self, t_hash):
+        """
+        Phase A authorization.
+
+        - Requires one exact Mapping record.
+        - Requires a fresh complete qBittorrent inventory result.
+        - Requires recognized live tracker associations.
+        - BEARBIT remains blocked until Phase B freshness verification.
+        - Does not mutate Mapping, DB, trackers or torrents.
+        """
+
+        target = str(t_hash or "").strip().lower()
+
+        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", target):
+            return False, "INVALID_HASH", None, []
+
+        # 1. Verify live qBittorrent inventory.
+        inventory, error = self._purge_qbit_get_json(
+            "/api/v2/torrents/info",
+            {"hashes": target},
+        )
+
+        if not isinstance(inventory, list):
+            return False, f"INVENTORY_{error}", None, []
+
+        exact = [
+            item for item in inventory
+            if (
+                isinstance(item, dict)
+                and str(item.get("hash") or "").strip().lower() == target
+            )
+        ]
+
+        if len(exact) != 1:
+            return False, f"INVENTORY_MATCHES_{len(exact)}", None, []
+
+        live = exact[0]
+
+        try:
+            progress = float(live.get("progress", 0))
+            amount_left = float(live.get("amount_left", -1))
+        except (TypeError, ValueError, OverflowError):
+            return False, "INVALID_COMPLETION_METADATA", None, []
+
+        if not (0.999999 <= progress <= 1.000001):
+            return False, "DOWNLOAD_NOT_COMPLETE", live, []
+
+        if amount_left != 0:
+            return False, "AMOUNT_LEFT_NOT_ZERO", live, []
+
+        # 2. Read live Tracker associations.
+        tracker_rows, error = self._purge_qbit_get_json(
+            "/api/v2/torrents/trackers",
+            {"hash": target},
+        )
+
+        if not isinstance(tracker_rows, list) or not tracker_rows:
+            return False, f"TRACKER_API_{error}", live, []
+
+        aliases = globals().get("PURGE_TRACKER_HOST_ALIASES", {})
+        tracker_sites = set()
+        unknown_hosts = set()
+
+        for row in tracker_rows:
+            if not isinstance(row, dict):
+                return False, "INVALID_TRACKER_ROW", live, []
+
+            raw_url = str(row.get("url") or "").strip()
+
+            pseudo = re.fullmatch(
+                r"\*\*\s*\[(DHT|PEX|LSD)\]\s*\*\*",
+                raw_url,
+                flags=re.IGNORECASE,
+            )
+
+            if pseudo:
+                continue
+
+            try:
+                parsed = urlsplit(raw_url)
+                hostname = (parsed.hostname or "").lower().rstrip(".")
+                scheme = parsed.scheme.lower()
+            except Exception:
+                return False, "INVALID_TRACKER_URL", live, []
+
+            if not hostname or scheme not in {"http", "https", "udp"}:
+                return False, "UNCLASSIFIED_TRACKER_ROW", live, []
+
+            matched_site = None
+
+            for domain, site_name in aliases.items():
+                domain = str(domain).strip().lower().rstrip(".")
+
+                if (
+                    hostname == domain
+                    or hostname.endswith("." + domain)
+                ):
+                    matched_site = str(site_name).strip().upper()
+                    break
+
+            if not matched_site:
+                unknown_hosts.add(hostname)
+            else:
+                tracker_sites.add(matched_site)
+
+        if unknown_hosts:
+            return (
+                False,
+                "UNKNOWN_TRACKER_HOST:" + ",".join(sorted(unknown_hosts)),
+                live,
+                sorted(tracker_sites),
+            )
+
+        if not tracker_sites:
+            return False, "NO_RECOGNIZED_SITE_TRACKER", live, []
+
+        # 3. Read the exact Mapping record.
+        mapping_path = globals().get("MAPPING_FILE")
+
+        if not mapping_path or not os.path.isfile(mapping_path):
+            return False, "MAPPING_FILE_UNAVAILABLE", live, []
+
+        try:
+            with open(mapping_path, "r", encoding="utf-8") as handle:
+                mapping = json.load(handle)
+        except Exception:
+            return False, "MAPPING_READ_ERROR", live, []
+
+        if not isinstance(mapping, dict):
+            return False, "MAPPING_INVALID_ROOT", live, []
+
+        records = mapping.get("torrents")
+
+        if not isinstance(records, list):
+            return False, "MAPPING_INVALID_RECORDS", live, []
+
+        mapping_matches = []
+
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+
+            client_info = record.get("client_info")
+
+            if not isinstance(client_info, dict):
+                continue
+
+            record_hash = str(
+                client_info.get("hash") or ""
+            ).strip().lower()
+
+            if record_hash == target:
+                mapping_matches.append(record)
+
+        if len(mapping_matches) != 1:
+            return (
+                False,
+                f"MAPPING_MATCHES_{len(mapping_matches)}",
+                live,
+                sorted(tracker_sites),
+            )
+
+        record = mapping_matches[0]
+
+        # 4. Validate verified source and known_sites.
+        source_verified = record.get("source_site_verified") is True
+        source_site = ""
+        source_bearbit_hint = False
+
+        raw_source = str(record.get("source_site") or "").strip()
+
+        if source_verified:
+            source_site = _canonical_mapping_site(raw_source)
+
+            if not source_site:
+                return False, "VERIFIED_SOURCE_UNRECOGNIZED", live, sorted(tracker_sites)
+
+        elif raw_source.casefold() == "bearbit":
+            # An unverified BEARBIT label is a protection signal,
+            # never proof of source provenance.
+            source_bearbit_hint = True
+
+        raw_known = record.get("known_sites", [])
+
+        if raw_known is None:
+            raw_known = []
+
+        if not isinstance(raw_known, (list, tuple, set)):
+            return False, "INVALID_KNOWN_SITES", live, sorted(tracker_sites)
+
+        known_sites = set()
+
+        for value in raw_known:
+            canonical = _canonical_mapping_site(value)
+
+            if not canonical:
+                return False, "UNKNOWN_KNOWN_SITE", live, sorted(tracker_sites)
+
+            known_sites.add(canonical)
+
+        # 5. Strictly inspect the BEARBIT DB.
+        # A missing/corrupt DB cannot be interpreted as no obligation.
+        db_dir = globals().get("DB_DIR")
+
+        if not db_dir or not os.path.isdir(db_dir):
+            return False, "BEARBIT_DB_DIRECTORY_UNAVAILABLE", live, sorted(tracker_sites)
+
+        try:
+            db_files = [
+                os.path.join(db_dir, filename)
+                for filename in os.listdir(db_dir)
+                if filename.casefold() == "bearbit_link_db.json"
+            ]
+        except Exception:
+            return False, "BEARBIT_DB_DIRECTORY_READ_ERROR", live, sorted(tracker_sites)
+
+        if len(db_files) != 1:
+            return False, "BEARBIT_DB_FILE_MISSING_OR_AMBIGUOUS", live, sorted(tracker_sites)
+
+        try:
+            with open(db_files[0], "r", encoding="utf-8") as handle:
+                bearbit_db = json.load(handle)
+        except Exception:
+            return False, "BEARBIT_DB_READ_ERROR", live, sorted(tracker_sites)
+
+        if not isinstance(bearbit_db, dict):
+            return False, "BEARBIT_DB_INVALID", live, sorted(tracker_sites)
+
+        bearbit_matches = []
+
+        for key, item in bearbit_db.items():
+            if not isinstance(item, dict):
+                continue
+
+            key_hash = str(key or "").strip().lower()
+            item_hash = str(item.get("hash") or "").strip().lower()
+
+            if target == key_hash or target == item_hash:
+                bearbit_matches.append(item)
+
+        if len(bearbit_matches) > 1:
+            return False, "BEARBIT_DB_AMBIGUOUS", live, sorted(tracker_sites)
+
+        bearbit_related = (
+            "BEARBIT" in tracker_sites
+            or source_site == "BEARBIT"
+            or source_bearbit_hint
+            or "BEARBIT" in known_sites
+            or bool(bearbit_matches)
+        )
+
+        if bearbit_related:
+            if not bearbit_matches:
+                return False, "BEARBIT_RECORD_MISSING", live, sorted(tracker_sites)
+
+            # Phase A deliberately keeps all BEARBIT-associated torrents
+            # blocked until Phase B can prove a fresh successful H&R/Quest sync.
+            return (
+                False,
+                "BEARBIT_REQUIRES_PHASE_B_SYNC",
+                live,
+                sorted(tracker_sites),
+            )
+
+        # 6. General authorization for recognized non-BEARBIT sites.
+        general_sites = tracker_sites - {"BEARBIT"}
+
+        if not general_sites:
+            return False, "NO_GENERAL_TRACKER_ASSOCIATION", live, []
+
+        site_label = "+".join(sorted(general_sites))
+
+        return (
+            True,
+            f"GENERAL_ASSOCIATED:{site_label}",
+            live,
+            sorted(tracker_sites),
+        )
+
+    def _hard_purge_sequence(self, t_hash):
+        """Final fail-closed authorization gate. Phase A is Dry Run only."""
+
+        try:
+            allowed, reason, live, sites = (
+                self._check_purge_authorization(t_hash)
+            )
+        except Exception as exc:
+            print(
+                f"🔒 [GUARD] Authorization exception: "
+                f"{type(exc).__name__}; deletion refused."
+            )
+            return False
+
+        if not allowed:
+            print(
+                f"🔒 [GUARD] ปฏิเสธการลบ: {reason} - {t_hash}"
+            )
+            return False
+
+        site_label = ",".join(sites)
+
+        print(
+            f"🔎 [PURGE AUTH] ALLOWED "
+            f"| class={reason} "
+            f"| trackers={site_label} "
+            f"| progress={live.get('progress')} "
+            f"| amount_left={live.get('amount_left')}"
+        )
+
+        if globals().get("PURGE_AUTH_DRY_RUN", True) is True:
+            print(
+                f"🧪 [PURGE DRY-RUN] WOULD_ALLOW "
+                f"| {reason} | {t_hash} "
+                f"| No torrent mutation performed."
+            )
+            return False
+
+        try:
+            print(f"🔄 [PURGE] Starting deletion sequence: {t_hash}")
+
             self.node.reannounce_torrent(t_hash)
             self.node.stop_torrent(t_hash)
-            
-            # 3. ลบจริง
+
             success = self.node.delete_torrent(t_hash)
 
             if success:
                 self._update_db_status(t_hash, "DELETED")
                 print(f"✅ [PURGE] ลบสำเร็จ: {t_hash}")
                 return True
-            else:
-                print(f"❌ [PURGE] ลบผ่าน API ไม่สำเร็จ: {t_hash}")
-                return False
-                
-        except AttributeError as e:
-            # ดักกรณีที่ Node นั้นไม่มีเมธอดที่เรียกใช้ (เผื่อลืม Implement)
-            print(f"⚠️ [NODE ERROR] Node นี้ไม่มีฟังก์ชันที่จำเป็น: {e}")
+
+            print(f"❌ [PURGE] Delete API failed: {t_hash}")
             return False
-        except Exception as e:
-            print(f"⚠️ [{self.node.name}] ผิดพลาดในขั้นตอน Hard Purge: {e}")
+
+        except Exception as exc:
+            print(
+                f"⚠️ [PURGE] Sequence failed: "
+                f"{type(exc).__name__}"
+            )
             return False
 
     def process(self, force_emergency=False):
         # 1. เช็คสถานะการเปิดใช้งาน
-        node_enable = self.node_cfg.get('enable', self.node_cfg.get('ENABLE', None))
+        node_enable = self.node_enable
         global_enable = self.global_cfg.get('enable', self.global_cfg.get('ENABLE', False))
-        is_enabled = bool(node_enable) if node_enable is True else bool(global_enable)
+        # Global is the master switch.
+        # An explicit per-node clean_settings.enable=False must disable Cleaner.
+        is_enabled = bool(global_enable) and (
+            node_enable is None or bool(node_enable)
+        )
 
         print(f"⚙️ [Cleaner Engine] Node: {self.node.name} | Status: {'ACTIVE' if is_enabled else 'DISABLED'}")
 
@@ -2684,8 +3531,23 @@ class NodeCleaner:
         if force_emergency or (current_free < 10.0):
             print(f"🚨 [{self.node.name}] สถานะวิกฤต: พื้นที่เหลือ {current_free:.2f} GB")
             # ใช้ self.smart_reclaim_process หากคุณย้ายมันเข้ามาเป็น Method แล้ว
-            self.smart_reclaim_process(required_gb=10.0, is_emergency=True)
-            print(f"✅ [{self.node.name}] กู้คืนพื้นที่เสร็จสิ้น")
+            reclaim_ready = self.smart_reclaim_process(
+                required_gb=10.0,
+                is_emergency=True
+            )
+
+            if reclaim_ready:
+                print(
+                    f"✅ [{self.node.name}] "
+                    "ยืนยันพื้นที่ว่างผ่านเป้าหมายแล้ว"
+                )
+            else:
+                print(
+                    f"⚠️ [{self.node.name}] "
+                    "ยังไม่สามารถยืนยันพื้นที่ตามเป้าหมายได้ "
+                    "(Dry Run / Guard / API / Insufficient Space)"
+                )
+
             return
 
         # 3. โหมด Idle Cleanup (ยุบรวมเหลือเมธอดเดียว)
@@ -2722,7 +3584,7 @@ class NodeCleaner:
 
     def _should_remove(self, ratio, age_hours, up_speed, leechers):
         def get_cfg_value(key, default):
-            clean_sets = self.node_cfg.get('clean_settings', {})
+            clean_sets = self.clean_settings
             if clean_sets and clean_sets.get('enable', False) is True:
                 if key in clean_sets: return clean_sets[key]
                 if key.upper() in clean_sets: return clean_sets[key.upper()]
@@ -2825,12 +3687,37 @@ class NodeCleaner:
                 return True
 
             raw_torrents = self.node.get_all_torrents_info()
-            if not raw_torrents:
+
+            # None = inventory API failure; fail closed.
+            if raw_torrents is None:
+                print(
+                    f"⚠️ [{self.node.name}] Reclaim aborted: "
+                    "inventory API verification failed"
+                )
                 return False
+
+            # Empty inventory is a valid API response.
+            if not raw_torrents:
+                if not self.node.refresh_status():
+                    print(
+                        f"⚠️ [{self.node.name}] "
+                        "Cannot verify final free space"
+                    )
+                    return False
+
+                final_free = self._get_node_free_gb()
+                space_ready = final_free >= target_free
+
+                print(
+                    f"📊 [RECLAIM RETURN AUDIT] "
+                    f"free={final_free:.2f}GB "
+                    f"target={target_free:.2f}GB "
+                    f"ready={space_ready}"
+                )
+                return space_ready
 
             # คัดกรองงานที่ลบได้
             scannable_torrents = []
-            leeching_backups = []
             current_ts = time.time()
 
             for t in raw_torrents:
@@ -2846,7 +3733,17 @@ class NodeCleaner:
                 # 2. ดึงค่าสถานะไฟล์
                 t_size_gb = t.get('size_bytes', 0) / (1024**3)
                 t_ratio = t.get('ratio', 0.0)
-                is_completed = (t.get('progress', 0) >= 0.99) or (t.get('amount_left', 1) == 0)
+                try:
+                    progress_value = float(t.get('progress', 0))
+                    amount_left_value = float(t.get('amount_left', -1))
+                except (TypeError, ValueError, OverflowError):
+                    progress_value = 0.0
+                    amount_left_value = -1.0
+
+                is_completed = (
+                    progress_value >= 0.999999
+                    and amount_left_value == 0
+                )
     
                 # ดึงค่าความนิ่ง
                 upspeed = float(t.get('up_speed', 0))
@@ -2878,13 +3775,7 @@ class NodeCleaner:
                     if can_remove_completed:
                         scannable_torrents.append(t)
             
-                elif t_size_gb >= 2.0 and 'allocating' not in str(t.get('state', '')).lower():
-                    leeching_backups.append(t)
 
-            # กรณีฉุกเฉิน ยอมลบงานที่กำลังโหลดอยู่ (กรณีไม่มีงานเสร็จให้ลบ)
-            if not scannable_torrents and is_emergency and leeching_backups:
-                leeching_backups.sort(key=lambda x: -x['_calculated_size_gb'])
-                scannable_torrents = leeching_backups[:2]
 
             # 3. ให้คะแนนความคุ้มค่า (Scoring) เพื่อจัดลำดับการลบ
             def get_priority_score(t):
@@ -2898,12 +3789,44 @@ class NodeCleaner:
             # เลือกเป้าหมาย
             targets = scannable_torrents[:15 if is_emergency else 6]
             
-            # 4. ดำเนินการลบ
+            # 4. Authorization / Dry-Run / Purge
             for t in targets:
-                print(f"🗑️ [PURGE] Removing: {t.get('name', 'Unknown')} | Size: {t['_calculated_size_gb']:.2f}GB | Ratio: {t['_calculated_ratio']:.2f}")
+                print(
+                    f"🔎 [PURGE CANDIDATE] "
+                    f"{t.get('name', 'Unknown')} "
+                    f"| Size: {t['_calculated_size_gb']:.2f}GB "
+                    f"| Ratio: {t['_calculated_ratio']:.2f}"
+                )
                 self._hard_purge_sequence(t['hash'])
 
-            return True
+            # RECLAIM_RETURN_AUDIT_V1
+            # Never report success based on attempted candidates.
+            # Refresh node status and verify actual available space.
+            if not self.node.refresh_status():
+                print(
+                    f"⚠️ [{self.node.name}] "
+                    "Reclaim result unverifiable: status refresh failed"
+                )
+                return False
+
+            final_free = self._get_node_free_gb()
+            space_ready = final_free >= target_free
+
+            print(
+                f"📊 [RECLAIM RETURN AUDIT] "
+                f"free={final_free:.2f}GB "
+                f"target={target_free:.2f}GB "
+                f"ready={space_ready} "
+                f"dry_run={globals().get('PURGE_AUTH_DRY_RUN', True)}"
+            )
+
+            if not space_ready:
+                print(
+                    f"⚠️ [{self.node.name}] "
+                    "Reclaim did not reach required free-space target"
+                )
+
+            return space_ready
             
         except Exception as e:
             print(f"❌ [SMART RECLAIM] Error: {str(e)}")
@@ -4374,9 +5297,53 @@ async def sync_hr_with_web(site_key, page, base_url, ctx):
                 finally:
                     if new_tab: await new_tab.close()
     
-            # ตรวจสอบความซ้ำซ้อน
+            # ตรวจสอบความซ้ำซ้อนแบบ tri-state
             hash_val = tid_info.get("hash")
-            if any(node_obj.is_torrent_exists(hash_val) for node_obj, _ in ctx.active_nodes):
+            hash_exists = False
+            hash_check_failed = not bool(ctx.active_nodes)
+
+            for node_obj, _ in ctx.active_nodes:
+                exists_method = getattr(
+                    node_obj, "is_torrent_exists", None
+                )
+
+                if not callable(exists_method):
+                    hash_check_failed = True
+                    continue
+
+                try:
+                    exists = exists_method(hash_val)
+                except Exception as check_error:
+                    exists = None
+                    print(
+                        f"⚠️ [HR Protection] "
+                        f"[{getattr(node_obj, 'name', 'Unknown')}] "
+                        f"{check_error}"
+                    )
+
+                if exists is None or type(exists) is not bool:
+                    hash_check_failed = True
+                    print(
+                        f"⚠️ [HR Protection] "
+                        f"[{getattr(node_obj, 'name', 'Unknown')}] "
+                        "ตรวจสอบ Hash ไม่สำเร็จ"
+                    )
+                    continue
+
+                if exists is True:
+                    hash_exists = True
+                    break
+
+            if hash_check_failed and not hash_exists:
+                print(
+                    f"🛑 [HR Protection] ID={torrent_id} "
+                    "ยังยืนยัน Hash ไม่ได้ "
+                    "คงสถานะเดิมและข้ามรอบนี้"
+                )
+                await async_save_db(site_key, db)
+                continue
+
+            if hash_exists:
                 tid_info.update({"status": "PROTECTED"})
                 await async_save_db(site_key, db)
                 continue
@@ -4396,11 +5363,28 @@ async def sync_hr_with_web(site_key, page, base_url, ctx):
                 ctx.seen_ids, ctx.global_clean, force_download=(hr_status in ['danger', 'warning'])
             )
     
-            if success:
-                tid_info.update({"status": "PROTECTED", "retry_count": 0})
+            if success is True:
+                tid_info.update({
+                    "status": "PROTECTED",
+                    "retry_count": 0
+                })
+
+            elif success is None:
+                # Preserve previous status and retry counter.
+                print(
+                    f"⚠️ [HR Protection] ID={torrent_id} "
+                    "ตรวจสอบ Node ไม่ครบ "
+                    "ยังไม่เปลี่ยนเป็น ERROR"
+                )
+                await async_save_db(site_key, db)
+                continue
+
             else:
-                tid_info.update({"status": "ERROR", "retry_count": tid_info.get("retry_count", 0) + 1})
-            
+                tid_info.update({
+                    "status": "ERROR",
+                    "retry_count": tid_info.get("retry_count", 0) + 1
+                })
+
             await async_save_db(site_key, db)
     else:
         print(f"✨ [{site_key}] ข้าม H&R เนื่องจากสถานะปกติหรือ VIP")
@@ -4514,9 +5498,58 @@ async def sync_seed_quest_with_web(site_key, page, base_url, ctx):
 
         hash_val = tid_info.get("hash")
         is_box_active = False
-        if hash_val and hash_val != "UNKNOWN":
-            if any(node_obj.is_torrent_exists(hash_val) for node_obj, _ in ctx.active_nodes):
-                is_box_active = True
+
+        box_check_failed = (
+            not hash_val
+            or hash_val == "UNKNOWN"
+            or not bool(ctx.active_nodes)
+        )
+
+        if not box_check_failed:
+            for node_obj, _ in ctx.active_nodes:
+                exists_method = getattr(
+                    node_obj, "is_torrent_exists", None
+                )
+
+                if not callable(exists_method):
+                    box_check_failed = True
+                    continue
+
+                try:
+                    exists = exists_method(hash_val)
+                except Exception as check_error:
+                    exists = None
+                    print(
+                        f"⚠️ [Seed Quest] "
+                        f"[{getattr(node_obj, 'name', 'Unknown')}] "
+                        f"{check_error}"
+                    )
+
+                if exists is None or type(exists) is not bool:
+                    box_check_failed = True
+                    print(
+                        f"⚠️ [Seed Quest] "
+                        f"[{getattr(node_obj, 'name', 'Unknown')}] "
+                        "ตรวจสอบ Hash ไม่สำเร็จ"
+                    )
+                    continue
+
+                if exists is True:
+                    is_box_active = True
+                    break
+
+        if box_check_failed and not is_box_active:
+            stats.setdefault("unverified", 0)
+            stats["unverified"] += 1
+
+            print(
+                f"⚠️ [Seed Quest] ID={torrent_id} "
+                "ไม่สามารถยืนยันสถานะ Node ได้ "
+                "ไม่นับเป็น Inactive"
+            )
+
+            await async_save_db(site_key, db)
+            continue
 
         if is_box_active:
             stats["active"] += 1
@@ -4529,7 +5562,7 @@ async def sync_seed_quest_with_web(site_key, page, base_url, ctx):
 
     completed_count = await perform_quest_cleanup(site_key, db, current_ids_on_web)
     
-    summary_msg = f"🎯 <b>SEED QUEST SYNC: {site_key}</b>\n📋 Total Active: `{stats['total']}`\n🟢 Active Box: `{stats['active']}`\n🔴 Inactive Box: `{stats['inactive']}`\n🔍 Scanned Hash: `{stats['scanned']}`\n✅ Completed Cleaned: `{completed_count}`"
+    summary_msg = f"🎯 <b>SEED QUEST SYNC: {site_key}</b>\n📋 Total Active: `{stats['total']}`\n🟢 Active Box: `{stats['active']}`\n🔴 Inactive Box: `{stats['inactive']}`\n⚪ Unverified Box: `{stats.get('unverified', 0)}`\n🔍 Scanned Hash: `{stats['scanned']}`\n✅ Completed Cleaned: `{completed_count}`"
     await send_notify(summary_msg)
     print(f"📧 [{site_key}] สรุปผล Seed Quest เรียบร้อย: {stats}")
 
@@ -4722,26 +5755,76 @@ async def trigger_download_if_needed(t_id, t_name, t_size_gb, details_url, downl
             else:
                 print(f"❌ ไม่สามารถดาวน์โหลดไฟล์ {t_id} ได้ แม้จะลองกู้คืนแล้ว")
                 seen_ids.add(t_id) # Blacklist ไว้ไม่ให้วนลูปซ้ำ
-                return
+                return False
 
         # 4. ตรวจสอบ Hash และจัดการ Node
         t_hash = extract_info_hash(raw_data_bytes)
         if not t_hash:
-            return
+            return False
 
         if download_ready:
             is_already_in_node = False
             target_node_name = ""
+            inventory_check_failed = not bool(active_nodes)
+
+            if not active_nodes:
+                print(
+                    "⚠️ [Duplicate Check] ไม่มี Active Node "
+                    "จึงไม่สามารถยืนยัน Hash ได้"
+                )
+
             for node_obj, _ in active_nodes:
-                if node_obj.is_torrent_exists(t_hash):
+                exists_method = getattr(
+                    node_obj, "is_torrent_exists", None
+                )
+
+                if not callable(exists_method):
+                    inventory_check_failed = True
+                    print(
+                        f"⚠️ [{getattr(node_obj, 'name', 'Unknown')}] "
+                        "ไม่มี Hash verification method"
+                    )
+                    continue
+
+                try:
+                    exists = exists_method(t_hash)
+                except Exception as check_error:
+                    exists = None
+                    print(
+                        f"⚠️ [{getattr(node_obj, 'name', 'Unknown')}] "
+                        f"Hash check exception: {check_error}"
+                    )
+
+                if exists is None or type(exists) is not bool:
+                    inventory_check_failed = True
+                    print(
+                        f"⚠️ [{getattr(node_obj, 'name', 'Unknown')}] "
+                        "Hash verification failed"
+                    )
+                    continue
+
+                if exists is True:
                     is_already_in_node = True
-                    target_node_name = node_obj.name
+                    target_node_name = getattr(
+                        node_obj, "name", "Unknown"
+                    )
                     break
-        
+
             if is_already_in_node:
-                print(f" ❌ ข้าม: ตรวจพบ Hash [...{t_hash[-5:]}] วิ่งอยู่ใน {target_node_name}")
+                print(
+                    f"❌ ข้าม: ตรวจพบ Hash [...{t_hash[-5:]}] "
+                    f"วิ่งอยู่ใน {target_node_name}"
+                )
                 seen_hashes.add(t_hash)
-                download_ready = False
+                seen_ids.add(t_id)
+                return True
+
+            if inventory_check_failed:
+                print(
+                    f"🛑 [Duplicate Check] Hash={t_hash[:12]} "
+                    "ตรวจสอบไม่ครบทุก Node จึงยกเลิก Add"
+                )
+                return None
 
         # จัดการส่งเข้า Node
         if download_ready:
@@ -4776,17 +5859,60 @@ async def trigger_download_if_needed(t_id, t_name, t_size_gb, details_url, downl
                     if effective_free < (t_size_gb + 5.0): # ยอมลด Buffer ลงนิดหน่อยในกรณีจำเป็น
                         continue
 
-                # ตรวจสอบซ้ำว่ามีใน Node นี้ไหมก่อน Add
-                torrent_info = node_obj.get_torrent_by_hash(t_hash)
-                
-                if torrent_info:
-                    # ถ้าเจอแล้ว ให้จัดการสถานะและจบการทำงาน
-                    if torrent_info.get('status') in ['paused', 'stopped', 'error']:
+                # Verify immediately before Add.
+                # dict  = found
+                # False = confirmed not found
+                # None  = verification failure; abort Add
+
+                try:
+                    torrent_info = node_obj.get_torrent_by_hash(t_hash)
+                except Exception as lookup_error:
+                    print(
+                        f"🛑 [{node_obj.name}] Hash lookup exception: "
+                        f"{lookup_error} | ยกเลิก Add"
+                    )
+                    return None
+
+                if torrent_info is None:
+                    print(
+                        f"🛑 [{node_obj.name}] Hash inventory "
+                        "ตรวจสอบไม่ได้ | ยกเลิก Add"
+                    )
+                    return None
+
+                if isinstance(torrent_info, dict):
+                    torrent_state = str(
+                        torrent_info.get('state') or ''
+                    ).strip().lower()
+
+                    if torrent_state in {
+                        'paused',
+                        'stopped',
+                        'error',
+                        'pauseddl',
+                        'pausedup',
+                        'stoppeddl',
+                        'stoppedup',
+                    }:
                         node_obj.resume_torrent(t_hash)
-                    print(f"ℹ️ ไฟล์ {t_hash[:8]} มีอยู่แล้วใน {node_obj.name}")
-                    return True 
-                
-                # ถ้าไม่เจอ ให้ Add ใหม่
+
+                    print(
+                        f"ℹ️ ไฟล์ {t_hash[:8]} "
+                        f"มีอยู่แล้วใน {node_obj.name}"
+                    )
+                    seen_hashes.add(t_hash)
+                    seen_ids.add(t_id)
+                    return True
+
+                if torrent_info is not False:
+                    print(
+                        f"🛑 [{node_obj.name}] Hash lookup "
+                        "คืนค่าที่ไม่ถูกต้อง | ยกเลิก Add"
+                    )
+                    return None
+
+                # Add permitted only after confirmed Not Found.
+
                 result = safe_add_torrent(node_obj, raw_data_bytes, site)
                 if result:
                     print(f"✅ [Success] {node_obj.name} | {t_name[:30]}")
@@ -5281,8 +6407,21 @@ def get_node_dynamic_cap(node, disk_type):
     reduction_factor = {'NVME': 15, 'SSD': 10, 'HYBRID': 7, 'HDD': 5}.get(disk_type, 5)
     latency_cap = int(base / (1 + (proxy_wait / reduction_factor)))
 
+    print(
+        f"[CAP AUDIT] [{node.name}] "
+        f"disk={disk_type} "
+        f"latency_cap={latency_cap} "
+        f"space_factor={space_factor} "
+        f"free={node.free_gb:.1f}GB "
+        f"quota={node.quota_gb}GB "
+        f"free_pct={free_percent:.1f}% "
+        f"pending={pending_gb:.1f}GB "
+        f"proxy_wait={proxy_wait:.2f} "
+        f"final_cap={max(3, int(latency_cap * space_factor))}"
+    )
     # ปรับจังหวะสุดท้าย: การันตีขั้นต่ำ 3 งานเสมอสำหรับ Node ที่ยังไม่ตาย
     return max(3, int(latency_cap * space_factor)), proxy_wait
+
 
 def get_node_current_weight(node):
     active_torrents = node.get_active_downloads()
@@ -5553,9 +6692,1106 @@ async def safe_timeout(coro, timeout_sec):
         # ถ้าเป็นเวอร์ชันเก่า ใช้ wait_for
         return await asyncio.wait_for(coro, timeout=timeout_sec)
 
-# =========================================================================
-# MAIN SCRAPER & CROSS-SEED SEARCH FUNCTION (NODRIVER)
-# =========================================================================
+
+def build_search_url(
+    site_name,
+    search_keyword,
+    selected_cats=None,
+    subcat2=None,
+    incldead=1,
+    freeload=False,
+    bonus_upload=False,
+    searchin=0,
+    sortby=0,
+    quality_options=None,
+    target_path=None,
+):
+    """Build verified GET search URLs for BearBit, BITSUSE and DEDBIT."""
+    from urllib.parse import urlencode, urlsplit
+    import re as _re
+
+    site_key = str(site_name or "").strip().lower()
+
+    is_bearbit = any(name in site_key for name in ("bearbit", "siambit"))
+    is_bitsuse = "bitsuse" in site_key
+    is_dedbit = "dedbit" in site_key
+
+    if not (is_bearbit or is_bitsuse or is_dedbit):
+        print(
+            f"⚠️ [{site_name}] ยังไม่มี Search URL builder "
+            "สำหรับเว็บไซต์นี้"
+        )
+        return None
+
+    keyword = str(search_keyword or "").strip()
+    keyword = _re.sub(
+        r"\.(?:mp4|mkv|avi|mov|wmv|m4v|mpg|mpeg|ts|m2ts|webm|flv|iso|zip|rar|7z)$",
+        "",
+        keyword,
+        flags=_re.IGNORECASE,
+    )
+    keyword = _re.sub(r"\s+", " ", keyword).strip()
+
+    if not keyword:
+        return None
+
+    if is_bearbit:
+        default_path = "viewno18sbx.php"
+        allowed_paths = {"viewno18sbx.php", "viewbrsb.php"}
+        allowed_categories = (
+            {
+                901, 902, 903, 904, 905, 906,
+                907, 908, 910, 911, 912,
+            }
+            if "viewbrsb.php" in str(target_path or "")
+            else {
+                1, 75, 10, 9, 110, 7, 40, 16,
+                3, 70, 100, 85, 105, 8, 56, 19,
+                20, 55, 21, 2, 130, 60, 90, 91,
+                92, 89, 93, 4, 50, 18, 17, 11,
+                5, 54, 51, 52, 57, 53,
+            }
+        )
+    elif is_bitsuse:
+        default_path = "bs_browse.php"
+        allowed_paths = {"bs_browse.php"}
+        # Confirmed by the live BITSUSE browse form.
+        allowed_categories = {180, 181, 182, 183, 184}
+    else:
+        default_path = "browse.php"
+        allowed_paths = {"browse.php"}
+        # Confirmed by the live DEDBIT browse form.
+        allowed_categories = {
+            4, 7, 12, 13, 16, 18, 21, 22,
+            35, 41, 53, 61, 62, 72,
+        }
+
+    requested_path = str(target_path or default_path).strip()
+    path_name = urlsplit(requested_path).path.rsplit("/", 1)[-1]
+
+    if path_name not in allowed_paths:
+        print(
+            f"⚠️ [{site_name}] Search path ไม่รองรับ: "
+            f"{requested_path}"
+        )
+        return None
+
+    if selected_cats is None:
+        selected_cats = []
+    elif isinstance(selected_cats, (str, int)):
+        selected_cats = [selected_cats]
+
+    params = [("search", keyword)]
+
+    if is_bearbit:
+        try:
+            searchin_value = int(searchin)
+        except (TypeError, ValueError):
+            searchin_value = 0
+        if searchin_value not in (0, 1, 2):
+            searchin_value = 0
+
+        try:
+            sortby_value = int(sortby)
+        except (TypeError, ValueError):
+            sortby_value = 0
+        if sortby_value not in range(14):
+            sortby_value = 0
+
+        params.extend([
+            ("searchin", str(searchin_value)),
+            ("sortby", str(sortby_value)),
+        ])
+
+        if path_name == "viewno18sbx.php":
+            try:
+                incldead_value = int(incldead)
+            except (TypeError, ValueError):
+                incldead_value = 1
+            if incldead_value not in (0, 1, 2):
+                incldead_value = 1
+            params.append(("incldead", str(incldead_value)))
+
+    else:
+        # Both live browse forms expose GET controls named search,
+        # incldead and freeload.
+        try:
+            incldead_value = int(incldead)
+        except (TypeError, ValueError):
+            incldead_value = 1
+        if incldead_value not in (0, 1, 2):
+            incldead_value = 1
+
+        params.append(("incldead", str(incldead_value)))
+
+        # HTML checkboxes should be omitted when not checked.
+        if freeload:
+            params.append(("freeload", "1"))
+
+    seen_categories = set()
+    for category in selected_cats:
+        try:
+            category_id = int(str(category).strip().lstrip("c"))
+        except (TypeError, ValueError):
+            continue
+
+        if (
+            category_id in allowed_categories
+            and category_id not in seen_categories
+        ):
+            params.append((f"c{category_id}", "1"))
+            seen_categories.add(category_id)
+
+    return f"{path_name}?{urlencode(params)}"
+
+
+def build_cross_seed_targets(
+    mapping_data,
+    max_targets=10,
+    active_hashes=None,
+    source_inventory=None,
+):
+    """
+    Build targets exclusively from completed live inventory.
+
+    source_site:
+        Trusted only when explicitly verified, or when a legacy
+        site_name is corroborated by a matching configured details URL.
+
+    known_sites:
+        Historical observations from mapping and per-site hash history.
+        Never used as source provenance.
+    """
+    if (
+        not isinstance(source_inventory, dict)
+        or not source_inventory
+    ):
+        print(
+            "⚠️ [Cross-Seed Targets] No completed source inventory; "
+            "failing closed."
+        )
+        return []
+
+    if not isinstance(mapping_data, dict):
+        return []
+
+    torrents = mapping_data.get("torrents", [])
+    if not isinstance(torrents, list):
+        return []
+
+    # --------------------------------------------------------
+    # Load per-site seen hash files once for this build.
+    # This is observation history, not source verification.
+    # --------------------------------------------------------
+
+    site_history = {}
+    configured_sites = []
+
+    cfg = globals().get("CFG", {})
+    site_configs = (
+        cfg.get("SITE", [])
+        if isinstance(cfg, dict)
+        else []
+    )
+
+    for site_cfg in site_configs:
+        if not isinstance(site_cfg, dict):
+            continue
+
+        canonical = _canonical_mapping_site(
+            site_cfg.get("name")
+        )
+
+        if canonical and canonical not in configured_sites:
+            configured_sites.append(canonical)
+
+    history_dir = Path(BASE_DIR) / "history"
+
+    for site_name in configured_sites:
+        history_path = (
+            history_dir / f"hash_seen_{site_name.upper()}.txt"
+        )
+
+        history = set()
+
+        try:
+            if history_path.is_file():
+                with history_path.open(
+                    "r",
+                    encoding="utf-8"
+                ) as f:
+                    history = {
+                        line.strip().lower()
+                        for line in f
+                        if line.strip()
+                    }
+        except OSError as history_error:
+            print(
+                f"⚠️ [Cross-Seed History] "
+                f"{site_name}: {history_error}"
+            )
+
+        site_history[site_name] = history
+
+    # --------------------------------------------------------
+    # Configured details URL -> canonical site resolver.
+    # --------------------------------------------------------
+
+    def site_from_details_url(value):
+        try:
+            host = urllib.parse.urlsplit(
+                str(value or "")
+            ).hostname
+
+            host = str(host or "").casefold().rstrip(".")
+
+            if not host:
+                return ""
+
+            for site_cfg in site_configs:
+                if not isinstance(site_cfg, dict):
+                    continue
+
+                name = _canonical_mapping_site(
+                    site_cfg.get("name")
+                )
+
+                base_host = urllib.parse.urlsplit(
+                    str(site_cfg.get("base_url") or "")
+                ).hostname
+
+                base_host = str(
+                    base_host or ""
+                ).casefold().rstrip(".")
+
+                if (
+                    name
+                    and base_host
+                    and (
+                        host == base_host
+                        or host.endswith("." + base_host)
+                    )
+                ):
+                    return name
+
+        except Exception:
+            return ""
+
+        return ""
+
+    active_hashes = (
+        {
+            str(h).strip().upper()
+            for h in active_hashes
+            if h
+        }
+        if active_hashes is not None
+        else None
+    )
+
+    targets = []
+    seen = set()
+
+    for record in torrents:
+        if not isinstance(record, dict):
+            continue
+
+        client_info = record.get("client_info") or {}
+        if not isinstance(client_info, dict):
+            continue
+
+        source_hash = str(
+            client_info.get("hash")
+            or record.get("hash")
+            or ""
+        ).strip().upper()
+
+        if not source_hash or source_hash in seen:
+            continue
+
+        if (
+            active_hashes is not None
+            and source_hash not in active_hashes
+        ):
+            continue
+
+        inventory = source_inventory.get(source_hash)
+        if not isinstance(inventory, dict):
+            continue
+
+        source_node = inventory.get("node")
+        source_cfg = inventory.get("n_cfg") or {}
+        source_torrent = inventory.get("torrent") or {}
+
+        if (
+            source_node is None
+            or not isinstance(source_torrent, dict)
+        ):
+            continue
+
+        try:
+            mapped_size = int(
+                client_info.get("size_bytes") or 0
+            )
+            actual_size = int(
+                source_torrent.get("size_bytes") or 0
+            )
+            amount_left = int(
+                source_torrent.get("amount_left", -1)
+            )
+            progress = float(
+                source_torrent.get("progress", 0.0)
+            )
+        except (TypeError, ValueError, OverflowError):
+            continue
+
+        save_path = str(
+            source_torrent.get("save_path") or ""
+        ).strip()
+
+        if actual_size <= 0 or mapped_size != actual_size:
+            continue
+
+        if amount_left != 0 or progress < 0.999999:
+            continue
+
+        if not save_path:
+            continue
+
+        keyword = str(
+            record.get("release_name")
+            or client_info.get("name")
+            or source_torrent.get("name")
+            or ""
+        ).strip()
+
+        if not keyword:
+            continue
+
+        # ----------------------------------------------------
+        # Verified source provenance.
+        # ----------------------------------------------------
+
+        source_site_verified = (
+            record.get("source_site_verified") is True
+        )
+
+        source_site = (
+            _canonical_mapping_site(
+                record.get("source_site")
+            )
+            if source_site_verified
+            else ""
+        )
+
+        # Conservative legacy recovery:
+        # site_name is trusted only if details_url's hostname
+        # independently confirms that exact configured site.
+        if not source_site:
+            legacy_site = _canonical_mapping_site(
+                record.get("site_name")
+            )
+
+            details_site = site_from_details_url(
+                record.get("details_url")
+            )
+
+            if legacy_site and details_site == legacy_site:
+                source_site = legacy_site
+                source_site_verified = True
+
+        if not source_site:
+            source_site = "Unknown"
+            source_site_verified = False
+
+        # ----------------------------------------------------
+        # Known sites = stored observations + history matches.
+        # Hash history never establishes source provenance.
+        # ----------------------------------------------------
+
+        known_sites = []
+        raw_known = record.get("known_sites", [])
+
+        if isinstance(raw_known, (list, tuple, set)):
+            for value in raw_known:
+                canonical = _canonical_mapping_site(value)
+
+                if canonical and canonical not in known_sites:
+                    known_sites.append(canonical)
+
+        source_hash_lower = source_hash.lower()
+
+        for site_name, history in site_history.items():
+            if (
+                source_hash_lower in history
+                and site_name not in known_sites
+            ):
+                known_sites.append(site_name)
+
+        if (
+            source_site_verified
+            and source_site != "Unknown"
+            and source_site not in known_sites
+        ):
+            known_sites.append(source_site)
+
+        source_node_name = str(
+            getattr(source_node, "name", "Unknown Node")
+        )
+
+        targets.append({
+            "keyword": keyword,
+            "target_size_bytes": actual_size,
+            "source_hash": source_hash,
+            "source_site": source_site,
+            "source_site_verified": source_site_verified,
+            "known_sites": known_sites,
+            "source_details_url": record.get("details_url", ""),
+            "source_torrent_name": str(
+                source_torrent.get("name") or keyword
+            ),
+            "source_size_bytes": actual_size,
+            "source_save_path": save_path,
+            "source_node": source_node,
+            "source_node_config": source_cfg,
+            "source_node_name": source_node_name,
+        })
+
+        seen.add(source_hash)
+
+        if len(targets) >= max(0, int(max_targets)):
+            break
+
+    print(
+        f"🎯 [Cross-Seed Targets] "
+        f"{len(targets)} completed source(s) verified from live inventory"
+    )
+    return targets
+
+
+async def _read_cross_seed_filelist(browser_tab, site, torrent_id, details_url):
+    """Read a tracker's visible File List using its already-authenticated tab.
+
+    This is a metadata cross-check only. It does not change torrent state.
+    Expected list sizes are treated as rounded display values (decimal/binary
+    units are both considered when the site labels units ambiguously).
+    """
+    from urllib.parse import urlsplit, urlunsplit, urlencode
+
+    torrent_id = str(torrent_id or "").strip()
+    if not re.fullmatch(r"\d+", torrent_id):
+        raise ValueError("Invalid numeric tracker torrent ID for file list")
+    if browser_tab is None:
+        raise ValueError("Authenticated browser tab unavailable for file list")
+
+    parsed = urlsplit(str(details_url or ""))
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("Invalid candidate details URL")
+
+    site_key = re.sub(r"[^a-z0-9]+", "", str(site or "").casefold())
+    if "bearbit" in site_key or "bearbit" in parsed.netloc.casefold():
+        path = "/details1.php"
+        params = {"id": torrent_id, "numfile": "1"}
+    elif "bitsuse" in site_key or "bitsuse" in parsed.netloc.casefold():
+        path = "/filelist.php"
+        params = {"id": torrent_id, "div": "1", "width": "800", "height": "450"}
+    elif "dedbit" in site_key or "dedbit" in parsed.netloc.casefold():
+        path = "/filelist.php"
+        params = {"id": torrent_id, "div": "1", "width": "800", "height": "450"}
+    else:
+        raise ValueError(f"No File List URL rule for tracker {site!r}")
+
+    filelist_url = urlunsplit((
+        parsed.scheme, parsed.netloc, path, urlencode(params), ""
+    ))
+    await browser_tab.get(filelist_url)
+    await asyncio.sleep(0.5)
+    html = await browser_tab.get_content()
+    if not isinstance(html, str) or not html.strip():
+        raise ValueError("File List page returned empty HTML")
+
+    soup = BeautifulSoup(html, "html.parser")
+    page_title = soup.title.get_text(" ", strip=True) if soup.title else ""
+
+    size_pattern = re.compile(
+        r"^\s*(?P<number>[\d,]+(?:\.\d+)?)\s*"
+        r"(?P<unit>bytes?|[kmgt]i?b)\s*(?P<name>.+?)\s*$",
+        re.IGNORECASE,
+    )
+
+    def parse_list_entry(text_value):
+        text_value = re.sub(r"\s+", " ", str(text_value or "")).strip()
+        match = size_pattern.match(text_value)
+        if not match:
+            return None
+        name = match.group("name").strip(" \t\r\n•·")
+        if not name:
+            return None
+
+        number_text = match.group("number").replace(",", "")
+        number = float(number_text)
+        unit = match.group("unit").casefold()
+        decimal_places = len(number_text.partition(".")[2])
+        if unit.startswith("byte") or unit == "b":
+            powers = [1]
+        else:
+            prefix = unit[0]
+            exponent = {"k": 1, "m": 2, "g": 3, "t": 4}.get(prefix)
+            if exponent is None:
+                return None
+            # kB/MB/GB labels are ambiguous across trackers; retain both
+            # plausible interpretations and verify with the .torrent bytes.
+            powers = [1024 ** exponent, 1000 ** exponent]
+            if "i" in unit:
+                powers = [1024 ** exponent]
+
+        estimates = []
+        for factor in dict.fromkeys(powers):
+            estimate = number * factor
+            half_unit = 0.5 * (10 ** (-decimal_places)) * factor
+            estimates.append({
+                "bytes": int(round(estimate)),
+                "tolerance_bytes": max(1, int(half_unit + 0.999999)),
+            })
+        return {
+            "name": name,
+            "display_size": f"{match.group('number')} {match.group('unit')}",
+            "size_estimates": estimates,
+        }
+
+    # First handle explicit Path / Size table rows (BearBit).
+    # Size conversion continues to use the existing parse_list_entry().
+    entries = []
+    table_size_pattern = re.compile(
+        r"^\s*[\d,]+(?:\.\d+)?\s*(?:bytes?|[kmgt]i?b)\s*$",
+        re.IGNORECASE,
+    )
+    header_words = {"path", "file", "files", "filename", "name", "size"}
+
+    for row in soup.find_all("tr"):
+        cells = row.find_all(["td", "th"], recursive=False)
+        if len(cells) < 2:
+            continue
+
+        values = [
+            re.sub(r"\s+", " ", cell.get_text(" ", strip=True)).strip()
+            for cell in cells
+        ]
+        size_cells = [
+            (idx, value)
+            for idx, value in enumerate(values)
+            if table_size_pattern.fullmatch(value)
+        ]
+
+        # Do not guess when a row has zero or multiple size cells.
+        if len(size_cells) != 1:
+            continue
+
+        size_idx, size_text = size_cells[0]
+        names = [
+            value
+            for idx, value in enumerate(values)
+            if idx != size_idx
+            and value
+            and value.casefold() not in header_words
+        ]
+
+        # Only accept an unambiguous filename/size row.
+        if len(names) != 1:
+            continue
+
+        parsed_entry = parse_list_entry(f"{size_text} {names[0]}")
+        if parsed_entry is not None:
+            entries.append(parsed_entry)
+
+    # Fall back to bullet-list parsing.
+    if not entries:
+        list_texts = [
+            node.get_text(" ", strip=True)
+            for node in soup.find_all("li")
+        ]
+        entries = [
+            parsed_entry
+            for text_value in list_texts
+            if (
+                parsed_entry := parse_list_entry(text_value)
+            ) is not None
+        ]
+
+    # Last visible-data fallback: parse plain-text lines.
+    if not entries:
+        lines = soup.get_text("\n", strip=True).splitlines()
+        entries = [
+            parsed_entry
+            for text_value in lines
+            if (
+                parsed_entry := parse_list_entry(text_value)
+            ) is not None
+        ]
+
+    if not entries:
+        lower_title = page_title.casefold()
+        if "login" in lower_title or "เข้าสู่ระบบ" in lower_title:
+            raise ValueError(
+                f"File List redirected to login page: {page_title!r}"
+            )
+
+        page_body = " ".join(
+            soup.get_text(" ", strip=True).split()
+        )
+
+        # Only this explicit marker enables the hidden-list fallback.
+        # An arbitrary parsing error must still fail closed.
+        if page_body == "ไม่เปิดเผย":
+            print(
+                f"⚠️ [Cross-Seed FileList Privacy] site={site!r} "
+                f"id={torrent_id!r}: explicit hidden marker; "
+                "visible File List unavailable; strict source/candidate "
+                "manifest comparison is required."
+            )
+            return {
+                "url": filelist_url,
+                "title": page_title,
+                "entries": [],
+                "visibility": "hidden",
+                "hidden_reason": "explicit_not_disclosed_marker",
+            }
+
+        _diag_counts = {
+            name: len(soup.find_all(name))
+            for name in ("table", "tr", "td", "li", "pre", "iframe")
+        }
+        _diag_rows = [
+            " ".join(tr.stripped_strings)[:220]
+            for tr in soup.find_all("tr")[:8]
+        ]
+        _diag_text = page_body[:400]
+        print(
+            f"⚠️ [Cross-Seed FileList Debug] site={site!r} "
+            f"id={torrent_id!r} title={page_title!r} "
+            f"html_len={len(html)} counts={_diag_counts!r} "
+            f"rows={_diag_rows!r} body={_diag_text!r}"
+        )
+        raise ValueError(
+            f"No parseable file rows on File List page "
+            f"(title={page_title!r})"
+        )
+
+    return {
+        "url": filelist_url,
+        "title": page_title,
+        "entries": entries,
+        "visibility": "visible",
+    }
+
+
+def _cross_seed_name_key(value):
+    """Conservative name normalizer; deliberately does not transliterate text."""
+    import unicodedata
+    value = str(value or "").replace("\\", "/").rsplit("/", 1)[-1]
+    value = unicodedata.normalize("NFKC", value).casefold()
+    return "".join(ch for ch in value if ch not in "\u200b\u200c\u200d\ufeff").strip()
+
+
+def _cross_seed_size_estimate_matches(filelist_entry, exact_size):
+    try:
+        exact_size = int(exact_size)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    for estimate in filelist_entry.get("size_estimates", []):
+        try:
+            expected = int(estimate["bytes"])
+            tolerance = int(estimate["tolerance_bytes"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if abs(exact_size - expected) <= tolerance + 2:
+            return True
+    return False
+
+
+def _verify_cross_seed_filelist(filelist_data, candidate_manifest):
+    """One-to-one comparison of web File List rows with .torrent manifest."""
+    entries = filelist_data.get("entries", []) if isinstance(filelist_data, dict) else []
+    files = candidate_manifest.get("files", []) if isinstance(candidate_manifest, dict) else []
+    if not entries or not files:
+        return {"ok": False, "error": "Empty web File List or torrent manifest"}
+    if len(entries) != len(files):
+        return {
+            "ok": False,
+            "error": f"File List count {len(entries)} != torrent manifest count {len(files)}",
+        }
+
+    unused = set(range(len(files)))
+    matches = []
+    for entry in entries:
+        web_name = _cross_seed_name_key(entry.get("name"))
+        size_match = lambda idx: _cross_seed_size_estimate_matches(
+            entry, files[idx].get("size_bytes")
+        )
+        same_name = [idx for idx in unused
+                     if _cross_seed_name_key(files[idx].get("path")) == web_name]
+        if same_name:
+            valid = [idx for idx in same_name if size_match(idx)]
+            if len(valid) != 1:
+                return {
+                    "ok": False,
+                    "error": f"Web File List name matched but size was different/ambiguous: {entry.get('name')!r}",
+                }
+            chosen = valid[0]
+            method = "name_and_rounded_size"
+        else:
+            # A filename can be mangled by legacy encoding tools. Fall back
+            # only to a unique exact extension + displayed-size candidate.
+            web_ext = _cross_seed_name_key(entry.get("name")).rsplit(".", 1)[-1] if "." in web_name else ""
+            alternatives = []
+            for idx in unused:
+                candidate_path = str(files[idx].get("path") or "")
+                candidate_name = _cross_seed_name_key(candidate_path)
+                candidate_ext = candidate_name.rsplit(".", 1)[-1] if "." in candidate_name else ""
+                if web_ext == candidate_ext and size_match(idx):
+                    alternatives.append(idx)
+            if len(alternatives) != 1:
+                return {
+                    "ok": False,
+                    "error": f"Could not uniquely pair File List row by filename/rounded size: {entry.get('name')!r}",
+                }
+            chosen = alternatives[0]
+            method = "unique_extension_and_rounded_size"
+
+        unused.remove(chosen)
+        matches.append({
+            "web_name": entry.get("name"),
+            "torrent_path": files[chosen].get("path"),
+            "web_display_size": entry.get("display_size"),
+            "torrent_size_bytes": int(files[chosen].get("size_bytes") or 0),
+            "match_method": method,
+        })
+
+    return {
+        "ok": not unused,
+        "error": None if not unused else f"Unmatched torrent files: {len(unused)}",
+        "matched_count": len(matches),
+        "file_count": len(files),
+        "matches": matches,
+    }
+
+
+async def _preflight_cross_seed_candidate(
+    browser_tab,
+    cross_seed_target,
+    site,
+    torrent_id,
+    details_url,
+    download_url,
+):
+    """
+    Download candidate metadata and compare it with the live source manifest.
+    Never calls add, resume, recheck, delete or tracker mutation APIs.
+    """
+    tab = browser_tab
+    phase = "validate source metadata"
+
+    try:
+        source_node = cross_seed_target.get("source_node")
+        source_hash = str(
+            cross_seed_target.get("source_hash") or ""
+        ).strip().upper()
+        source_name = str(
+            cross_seed_target.get("source_torrent_name") or ""
+        )
+        source_size = int(
+            cross_seed_target.get("source_size_bytes") or 0
+        )
+        source_save_path = str(
+            cross_seed_target.get("source_save_path") or ""
+        ).strip()
+
+        if source_node is None:
+            raise ValueError("Missing source node")
+        if not re.fullmatch(r"[0-9A-F]{40}", source_hash):
+            raise ValueError("Unsupported or invalid source info hash")
+        if source_size <= 0 or not source_save_path:
+            raise ValueError("Missing source size or save path")
+        if not source_name:
+            raise ValueError("Missing source torrent name")
+        if not callable(
+            getattr(source_node, "get_torrent_file_manifest", None)
+        ):
+            raise ValueError("Source client has no manifest reader")
+        phase = "acquire existing site tab"
+        if tab is None:
+            raise ValueError("Existing authenticated site tab is unavailable")
+
+        # Reuse the authenticated search tab: do not create another CDP session.
+        phase = "download candidate torrent"
+        content = await download_torrent_smart(
+            tab, details_url, download_url
+        )
+
+        phase = "parse candidate torrent metainfo"
+
+        if not isinstance(content, (bytes, bytearray)) or len(content) < 10:
+            raise ValueError("Torrent download returned no usable bytes")
+
+        content = bytes(content)
+        candidate = _extract_torrent_manifest(content)
+
+        phase = "validate candidate hash and trackers"
+        candidate_hash = str(
+            candidate.get("info_hash") or ""
+        ).strip().upper()
+
+        if not re.fullmatch(r"[0-9A-F]{40}", candidate_hash):
+            raise ValueError("Candidate does not have a valid v1 info hash")
+        if not candidate.get("announce_urls"):
+            raise ValueError("Candidate contains no usable tracker URL")
+
+        # Verify the tracker-visible File List against the downloaded metainfo.
+        # A different torrent root name is not by itself a rejection reason.
+        phase = "read tracker file list"
+        site_filelist = await _read_cross_seed_filelist(
+            browser_tab=tab,
+            site=site,
+            torrent_id=torrent_id,
+            details_url=details_url,
+        )
+
+        filelist_hidden = (
+            site_filelist.get("visibility") == "hidden"
+            and not site_filelist.get("entries")
+        )
+
+        if filelist_hidden:
+            # This does NOT mean the web File List was verified.
+            # Strict source-vs-candidate manifest checks must succeed below.
+            filelist_check = {
+                "ok": None,
+                "verification": "skipped_explicit_hidden_marker",
+                "matched_count": 0,
+                "file_count": len(candidate.get("files") or []),
+                "matches": [],
+            }
+            print(
+                f"⚠️ [Cross-Seed File List] [{site}] ID={torrent_id}: "
+                "web list explicitly hidden; source/candidate manifest "
+                "equivalence required."
+            )
+        else:
+            phase = "compare tracker file list with candidate metainfo"
+            filelist_check = _verify_cross_seed_filelist(
+                site_filelist, candidate
+            )
+            if not filelist_check.get("ok"):
+                raise ValueError(
+                    "Tracker File List does not match candidate metainfo: "
+                    + str(
+                        filelist_check.get("error") or "unknown mismatch"
+                    )
+                )
+            print(
+                f"🧾 [Cross-Seed File List] [{site}] ID={torrent_id} "
+                f"verified={filelist_check.get('matched_count', 0)}/"
+                f"{filelist_check.get('file_count', 0)} files"
+            )
+
+        phase = "read source file manifest"
+        source_files = source_node.get_torrent_file_manifest(source_hash)
+        if not isinstance(source_files, list) or not source_files:
+            raise ValueError("Unable to read source file manifest")
+
+        def normalize_file_path(value):
+            value = str(value or "").replace("\\", "/")
+
+            if (
+                not value
+                or value.startswith("/")
+                or re.match(r"^[A-Za-z]:/", value)
+            ):
+                raise ValueError("Absolute or empty file path")
+
+            parts = [
+                part for part in value.split("/")
+                if part not in ("", ".")
+            ]
+
+            if not parts or any(part == ".." for part in parts):
+                raise ValueError("Unsafe relative path")
+
+            return "/".join(parts)
+
+        phase = "compare source files against candidate manifest"
+        source_pairs = []
+        for item in source_files:
+            source_pairs.append((
+                normalize_file_path(item.get("path")),
+                int(item.get("size_bytes")),
+            ))
+
+        candidate_pairs = []
+        for item in candidate.get("files", []):
+            candidate_pairs.append((
+                normalize_file_path(item.get("path")),
+                int(item.get("size_bytes")),
+            ))
+
+        if not source_pairs or not candidate_pairs:
+            raise ValueError("Empty source or candidate file manifest")
+
+        source_paths = [path for path, _ in source_pairs]
+        candidate_paths = [path for path, _ in candidate_pairs]
+        if len(set(source_paths)) != len(source_paths):
+            raise ValueError("Duplicate source paths")
+        if len(set(candidate_paths)) != len(candidate_paths):
+            raise ValueError("Duplicate candidate paths")
+
+        source_total = sum(size for _, size in source_pairs)
+        candidate_total = sum(size for _, size in candidate_pairs)
+        if source_total != source_size:
+            raise ValueError(
+                "Source manifest total differs from live torrent size"
+            )
+        if candidate_total <= 0:
+            raise ValueError("Candidate manifest total is not positive")
+
+        # Candidate torrents can contain additional cover/screenshot files.
+        # Map every source file to one unique candidate file by exact bytes,
+        # preferring normalized basename matches. Size-only mapping is allowed
+        # only when extension and size identify a single candidate uniquely.
+        unused = set(range(len(candidate_pairs)))
+        source_file_mapping = []
+        for source_path, source_file_size in source_pairs:
+            source_base = _cross_seed_name_key(source_path)
+            source_ext = source_base.rsplit(".", 1)[-1] if "." in source_base else ""
+            same_name = [
+                idx for idx in unused
+                if _cross_seed_name_key(candidate_pairs[idx][0]) == source_base
+            ]
+            exact = [
+                idx for idx in same_name
+                if candidate_pairs[idx][1] == source_file_size
+            ]
+
+            if same_name and not exact:
+                raise ValueError(
+                    f"Same-name file has different size: {source_path!r}"
+                )
+            if len(exact) == 1:
+                chosen = exact[0]
+                mapping_method = "basename_and_exact_size"
+            elif len(exact) > 1:
+                raise ValueError(
+                    f"Ambiguous duplicate candidate basename: {source_path!r}"
+                )
+            else:
+                alternatives = []
+                for idx in unused:
+                    candidate_path, candidate_size = candidate_pairs[idx]
+                    candidate_base = _cross_seed_name_key(candidate_path)
+                    candidate_ext = candidate_base.rsplit(".", 1)[-1] if "." in candidate_base else ""
+                    if candidate_size == source_file_size and candidate_ext == source_ext:
+                        alternatives.append(idx)
+                if len(alternatives) != 1:
+                    raise ValueError(
+                        "Source file could not be mapped uniquely to candidate "
+                        f"by exact size and extension: {source_path!r} "
+                        f"({source_file_size} bytes; choices={len(alternatives)})"
+                    )
+                chosen = alternatives[0]
+                mapping_method = "unique_extension_and_exact_size"
+
+            unused.remove(chosen)
+            source_file_mapping.append({
+                "source_path": source_path,
+                "source_size_bytes": source_file_size,
+                "candidate_path": candidate_pairs[chosen][0],
+                "candidate_size_bytes": candidate_pairs[chosen][1],
+                "match_method": mapping_method,
+            })
+
+        candidate_extra_files = [
+            {"path": candidate_pairs[idx][0], "size_bytes": candidate_pairs[idx][1]}
+            for idx in sorted(unused)
+        ]
+
+        if filelist_hidden and candidate_extra_files:
+            raise ValueError(
+                "Tracker File List is explicitly hidden; strict fallback "
+                "rejects candidate with "
+                f"{len(candidate_extra_files)} additional file(s)"
+            )
+
+        if candidate_hash == source_hash and candidate_extra_files:
+            raise ValueError(
+                "Same info hash unexpectedly produced an additional-file difference"
+            )
+
+        print(
+            f"🧩 [Cross-Seed File Mapping] [{site}] "
+            f"source_matched={len(source_file_mapping)}/{len(source_pairs)} | "
+            f"candidate_files={len(candidate_pairs)} | "
+            f"additional_candidate_files={len(candidate_extra_files)}"
+        )
+
+        action = (
+            "same_info_hash_requires_tracker_check"
+            if candidate_hash == source_hash
+            else "different_info_hash_requires_paused_add_and_recheck"
+        )
+
+        verification_label = (
+            "source_manifest_verified_filelist_hidden"
+            if filelist_hidden
+            else "filelist_manifest_verified"
+        )
+        print(
+            f"✅ [Cross-Seed Preflight] [{site}] ID={torrent_id} "
+            f"{verification_label} | files={len(candidate_pairs)} | "
+            f"hash={candidate_hash[:12]}... | action={action}"
+        )
+
+        return {
+            "ok": True,
+            "status": (
+                "source_manifest_verified_filelist_hidden_recheck_required"
+                if filelist_hidden
+                else "filelist_manifest_verified_recheck_required"
+            ),
+            "action": action,
+            "candidate_info_hash": candidate_hash,
+            "candidate_trackers": candidate["announce_urls"],
+            "candidate_manifest": candidate,
+            "filelist": {
+                "url": site_filelist.get("url"),
+                "title": site_filelist.get("title"),
+                "visibility": "hidden" if filelist_hidden else "visible",
+                "verification": (
+                    "strict_source_candidate_manifest_fallback"
+                    if filelist_hidden
+                    else "web_filelist_matches_candidate_manifest"
+                ),
+                "web_file_count": len(site_filelist.get("entries", [])),
+                "manifest_file_count": len(candidate_pairs),
+                "matched_count": filelist_check.get("matched_count", 0),
+                "matches": filelist_check.get("matches", []),
+            },
+            "source_file_mapping": source_file_mapping,
+            "candidate_extra_files": candidate_extra_files,
+            "candidate_total_size_bytes": candidate_total,
+            "source_total_size_bytes": source_total,
+            "content_verification": "NOT_VERIFIED_RECHECK_REQUIRED",
+            "torrent_content": content,
+        }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{phase}: {type(exc).__name__}: {exc}",
+        }
+
+    finally:
+        # The caller owns this tab. It remains available for the next search zone.
+        pass
+
 
 async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealth_args, global_clean=None, cross_seed_target=None):
     """
@@ -5575,6 +7811,73 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
             break
 
         site = site_cfg['name']
+
+        # Skip the source tracker/site entirely once the source site is known.
+        if cross_seed_target:
+            if isinstance(cross_seed_target, dict):
+                _cs_site_targets = [cross_seed_target]
+            elif isinstance(cross_seed_target, (list, tuple)):
+                _cs_site_targets = [
+                    item for item in cross_seed_target
+                    if isinstance(item, dict)
+                ]
+            else:
+                _cs_site_targets = []
+
+            def _cs_site_key(value):
+                return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+            _cs_current_site_key = _cs_site_key(site)
+            _cs_source_site_keys = [
+                _cs_site_key(item.get("source_site"))
+                if item.get("source_site_verified") is True
+                else ""
+                for item in _cs_site_targets
+            ]
+
+            if (
+                _cs_source_site_keys
+                and all(
+                    key not in ("", "unknown")
+                    and key == _cs_current_site_key
+                    for key in _cs_source_site_keys
+                )
+            ):
+                print(
+                    f"↩️ [Cross-Seed] [{site}] skipped: "
+                    "this is the verified source site."
+                )
+                continue
+
+            # Skip this site only when every target in the current
+            # batch is already recorded as known on this site.
+            _cs_known_site_sets = []
+
+            for item in _cs_site_targets:
+                raw_known = item.get("known_sites") or []
+
+                if not isinstance(raw_known, (list, tuple, set)):
+                    raw_known = []
+
+                _cs_known_site_sets.append({
+                    _cs_site_key(value)
+                    for value in raw_known
+                    if _cs_site_key(value)
+                })
+
+            if (
+                _cs_known_site_sets
+                and all(
+                    _cs_current_site_key in known_set
+                    for known_set in _cs_known_site_sets
+                )
+            ):
+                print(
+                    f"↩️ [Cross-Seed] [{site}] skipped: "
+                    "all current hashes are already known on this site."
+                )
+                continue
+
         current_site_seen_file = get_seen_file(site)
         seen_ids = load_data(current_site_seen_file)
         current_site_hash_file = get_hash_file(site)
@@ -5588,10 +7891,13 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
             is_browser_healthy = False
             if browser_instance is not None:
                 try:
-                    await browser_instance.target.get_targets()
+                    await browser_instance.update_targets()
                     is_browser_healthy = True
-                except Exception:
-                    print(f"⚠️ [{site}] Browser connection lost. Resetting...")
+                except Exception as e:
+                    print(
+                        f"⚠️ [{site}] Browser connection lost: "
+                        f"{type(e).__name__}: {e}. Resetting..."
+                    )
                     browser_instance = None
                     site_page = None
                     dl_session = None
@@ -5647,98 +7953,828 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                 except Exception as cookie_err:
                     print(f"⚠️ [{site}] Cookie sync issue: {cookie_err}")
 
-                ctx = BotContext(active_nodes, dl_session, seen_hashes, seen_ids, global_clean)
-                stats_data = await get_site_stats(site_page, site_cfg, ctx)
-                if stats_data and isinstance(stats_data, str):
-                    print(stats_data)
-                    asyncio.create_task(send_notify(stats_data))
+                if cross_seed_target:
+                    print(
+                        f"🛡️ [{site}] Cross-Seed search mode: "
+                        "skipping get_site_stats() and its maintenance actions."
+                    )
+                else:
+                    ctx = BotContext(
+                        active_nodes, dl_session, seen_hashes,
+                        seen_ids, global_clean
+                    )
+                    stats_data = await get_site_stats(
+                        site_page, site_cfg, ctx
+                    )
+                    if stats_data and isinstance(stats_data, str):
+                        print(stats_data)
+                        asyncio.create_task(send_notify(stats_data))
 
                 # -------------------------------------------------------------
-                # 3. TARGET SEARCH ZONES LOOP
+                # 3. TARGET SEARCH ZONES LOOP — PATCHED
                 # -------------------------------------------------------------
-                base_url = site_cfg.get('base_url', '').rstrip('/')
-                
+                from urllib.parse import urljoin, urlsplit
+
+                base_url = site_cfg.get("base_url", "").rstrip("/")
+
+                if not base_url:
+                    print(f"❌ [{site}] ไม่มี base_url ใน config")
+                    continue
+
+                #Normalize Cross-Seed input: รองรับ dict และ list[dict]
                 if cross_seed_target:
-                    search_kw = cross_seed_target.get('keyword', '')
-                    target_zones = [{
-                        'name': f"Cross-Seed Search [{search_kw}]",
-                        'search_params': {'search_keyword': search_kw}
-                    }]
+                    if isinstance(cross_seed_target, dict):
+                        cross_seed_targets = [cross_seed_target]
+                    elif isinstance(cross_seed_target, (list, tuple)):
+                        cross_seed_targets = [
+                            item for item in cross_seed_target
+                            if isinstance(item, dict)
+                        ]
+                    else:
+                        cross_seed_targets = []
+
+                    target_zones = []
+
+                    site_key = str(site or "").strip().lower()
+                    is_bearbit = any(
+                        name in site_key for name in ("bearbit", "siambit")
+                    )
+
+                    if is_bearbit:
+                        # ใช้โซนที่เปิดใช้งานใน config ปัจจุบัน
+                        configured_zones = [
+                            zone
+                            for zone in (site_cfg.get("target_urls") or [])
+                            if isinstance(zone, dict)
+                            and zone.get("enable", True)
+                            and str(zone.get("url") or "").strip()
+                        ]
+
+                        # Fallback หาก config ไม่มีรายการโซน
+                        if not configured_zones:
+                            configured_zones = [
+                                {
+                                    "name": "โซนปกติ (No 18+)",
+                                    "url": "viewno18sbx.php",
+                                    "enable": True,
+                                },
+                                {
+                                    "name": "โซนพิเศษ",
+                                    "url": "viewbrsb.php",
+                                    "enable": True,
+                                },
+                            ]
+
+                        # สร้าง Search target แยกตาม keyword และแต่ละโซน
+                        for item in cross_seed_targets:
+                            keyword = str(item.get("keyword") or "").strip()
+
+                            if not keyword:
+                                print(f"⚠️ [{site}] ข้าม Cross-Seed: keyword ว่าง")
+                                continue
+
+                            base_params = dict(item.get("search_params") or {})
+                            base_params.setdefault("search_keyword", keyword)
+
+                            for zone in configured_zones:
+                                zone_params = dict(base_params)
+
+                                # ใช้ URL ของโซนเป็นตัวกำหนด path สำหรับ Search
+                                zone_params["target_path"] = zone["url"]
+
+                                target_zones.append({
+                                    "name": (
+                                        f"Cross-Seed Search [{keyword}] "
+                                        f"— {zone.get('name', 'Zone')}"
+                                    ),
+                                    "search_params": zone_params,
+                                    "cross_seed_meta": item,
+                                })
+
+                    elif any(
+                        name in site_key for name in ("bitsuse", "dedbit")
+                    ):
+                        configured_zones = [
+                            zone
+                            for zone in (site_cfg.get("target_urls") or [])
+                            if isinstance(zone, dict)
+                            and zone.get("enable", True)
+                            and str(zone.get("url") or "").strip()
+                        ]
+
+                        if not configured_zones:
+                            fallback_path = (
+                                "bs_browse.php"
+                                if "bitsuse" in site_key
+                                else "browse.php"
+                            )
+                            configured_zones = [{
+                                "name": "Browse search",
+                                "url": fallback_path,
+                                "enable": True,
+                            }]
+
+                        for item in cross_seed_targets:
+                            keyword = str(item.get("keyword") or "").strip()
+                            if not keyword:
+                                print(
+                                    f"⚠️ [{site}] ข้าม Cross-Seed: keyword ว่าง"
+                                )
+                                continue
+
+                            base_params = dict(item.get("search_params") or {})
+                            base_params.setdefault("search_keyword", keyword)
+
+                            for zone in configured_zones:
+                                zone_params = dict(base_params)
+                                zone_params["target_path"] = zone["url"]
+
+                                target_zones.append({
+                                    "name": (
+                                        f"Cross-Seed Search [{keyword}] "
+                                        f"— {zone.get('name', 'Browse')}"
+                                    ),
+                                    "search_params": zone_params,
+                                    "cross_seed_meta": item,
+                                })
+
+                    else:
+                        # Tracker อื่นคง flow เดิมไว้
+                        for item in cross_seed_targets:
+                            keyword = str(item.get("keyword") or "").strip()
+
+                            if not keyword:
+                                print(f"⚠️ [{site}] ข้าม Cross-Seed: keyword ว่าง")
+                                continue
+
+                            params = dict(item.get("search_params") or {})
+                            params.setdefault("search_keyword", keyword)
+
+                            target_zones.append({
+                                "name": f"Cross-Seed Search [{keyword}]",
+                                "search_params": params,
+                                "cross_seed_meta": item,
+                            })
+
                 else:
-                    target_zones = site_cfg.get('target_urls', [])
+                    # Normal scan ไม่เปลี่ยนพฤติกรรมเดิม
+                    target_zones = site_cfg.get("target_urls", [])
 
                 for target_item in target_zones:
-                    if stop_event.is_set(): 
+                    if stop_event.is_set():
                         break
-                    
+
                     added_in_zone = []
                     full_nodes_in_zone = []
                     count_skip = 0
+                    cross_seed_matches_before_zone = (
+                        len(cross_seed_matches) if cross_seed_target else 0
+                    )
 
-                    site_page = await ensure_active_page(browser_instance, site_page, site_cfg)
-                    if not site_page:
-                        site_page = await browser_instance.get("about:blank", new_tab=True)
-
-                    if isinstance(target_item, dict):
-                        if not target_item.get('enable', True): 
-                            continue
-                        display_zone = target_item.get('name', "Zone")
-                        search_params = target_item.get('search_params', {})
-                        
-                        if 'url' in target_item and not search_params:
-                            raw_target_path = target_item.get('url')
-                        else:
-                            raw_target_path = build_search_url(
-                                site_name=site,
-                                search_keyword=search_params.get('search_keyword', ''),
-                                selected_cats=search_params.get('selected_cats', []),
-                                subcat2=search_params.get('subcat2', None),
-                                incldead=search_params.get('incldead', 1),
-                                freeload=search_params.get('freeload', False),
-                                bonus_upload=search_params.get('bonus_upload', False),
-                                searchin=search_params.get('searchin', 0),
-                                sortby=search_params.get('sortby', 0),
-                                quality_options=search_params.get('quality_options', {})
-                            )
-                    else:
-                        display_zone = "Zone"
-                        raw_target_path = str(target_item)
-
-                    target_url = raw_target_path if raw_target_path.startswith('http') else f"{base_url}/{raw_target_path.lstrip('/')}"
-
+                    # ---------------------------------------------------------
+                    # A. Resolve target URL
+                    # ---------------------------------------------------------
                     try:
-                        print(f"\n🌐 [{site}] Navigating Zone: [{display_zone}] -> {target_url}")
-                        await site_page.get(target_url)
-                        await asyncio.sleep(2.5)
+                        site_page = await ensure_active_page(
+                            browser_instance, site_page, site_cfg
+                        )
 
-                        page_source = await site_page.get_content()
-                        if not page_source: 
+                        if not site_page:
+                            site_page = await browser_instance.get(
+                                "about:blank", new_tab=True
+                            )
+
+                        if isinstance(target_item, dict):
+                            if not target_item.get("enable", True):
+                                continue
+
+                            display_zone = target_item.get("name", "Zone")
+                            search_params = target_item.get("search_params") or {}
+
+                            # URL ที่กำหนดโดยตรงใน config มีลำดับความสำคัญก่อน
+                            raw_target_path = target_item.get("url")
+
+                            if not raw_target_path and search_params:
+                                builder = globals().get("build_search_url")
+
+                                if not callable(builder):
+                                    print(
+                                        f"❌ [{site}] ไม่มี build_search_url() "
+                                        "ไม่สามารถสร้าง Search URL ได้"
+                                    )
+                                    continue
+
+                                raw_target_path = builder(
+                                    site_name=site,
+                                    search_keyword=search_params.get("search_keyword", ""),
+                                    selected_cats=search_params.get("selected_cats", []),
+                                    subcat2=search_params.get("subcat2"),
+                                    incldead=search_params.get("incldead", 1),
+                                    freeload=search_params.get("freeload", False),
+                                    bonus_upload=search_params.get("bonus_upload", False),
+                                    searchin=search_params.get("searchin", 0),
+                                    sortby=search_params.get("sortby", 0),
+                                    quality_options=search_params.get("quality_options", {}),
+                                    target_path=search_params.get("target_path"),
+                                )
+
+                            if not raw_target_path:
+                                print(
+                                    f"⚠️ [{site}] ข้าม [{display_zone}]: "
+                                    "ไม่ได้ URL หรือสร้าง Search URL ไม่สำเร็จ"
+                                )
+                                continue
+                        else:
+                            display_zone = "Zone"
+                            raw_target_path = str(target_item).strip()
+
+                        raw_target_path = str(raw_target_path).strip()
+
+                        if not raw_target_path:
+                            print(f"⚠️ [{site}] ข้าม [{display_zone}]: URL ว่าง")
                             continue
 
-                        soup = BeautifulSoup(page_source, "html.parser")
+                        target_url = urljoin(
+                            base_url + "/",
+                            raw_target_path
+                        )
 
-                        if is_cloudflare(soup):
-                            print(f"🛡 [{site}] Cloudflare detected. Waiting...")
-                            await asyncio.sleep(10)
+                        # ป้องกัน URL ผิด host จากข้อมูล config หรือ builder
+                        base_parts = urlsplit(base_url)
+                        target_parts = urlsplit(target_url)
+
+                        if (
+                            target_parts.scheme not in ("http", "https")
+                            or target_parts.netloc.lower() != base_parts.netloc.lower()
+                        ):
+                            print(
+                                f"❌ [{site}] URL ไม่ผ่านการตรวจสอบ: "
+                                f"{target_url}"
+                            )
                             continue
 
-                        if "ไม่สามารถเปิดลิงก์จากภายนอกได้" in soup.text:
-                            await site_page.get(f"{base_url}/index.php")
-                            await asyncio.sleep(1.5)
-                            await site_page.get(target_url)
-                            await asyncio.sleep(2.5)
-                            page_source = await site_page.get_content()
-                            soup = BeautifulSoup(page_source, "html.parser")
+                        # One-shot diagnostic: compare BEARBIT keyword variants.
+                        import os as _kw_os
+                        from urllib.parse import (
+                            parse_qsl as _kw_parse_qsl,
+                            urlencode as _kw_urlencode,
+                            urlunsplit as _kw_urlunsplit,
+                        )
+
+                        _kw_marker = _kw_os.path.join(
+                            _kw_os.path.dirname(_kw_os.path.abspath(__file__)),
+                            ".cross_seed_keyword_probe_done",
+                        )
+
+                        if (
+                            cross_seed_target
+                            and any(
+                                token in str(site or "").lower()
+                                for token in ("bearbit", "siambit")
+                            )
+                            and urlsplit(target_url).path.rsplit("/", 1)[-1]
+                                == "viewno18sbx.php"
+                            and not _kw_os.path.exists(_kw_marker)
+                        ):
+                            _kw_parts = urlsplit(target_url)
+                            _kw_pairs = _kw_parse_qsl(
+                                _kw_parts.query,
+                                keep_blank_values=True,
+                            )
+                            _kw_full = next(
+                                (
+                                    value for key, value in _kw_pairs
+                                    if key == "search"
+                                ),
+                                "",
+                            )
+                            _kw_no_ext = re.sub(
+                                r"\.(?:mp4|mkv|avi|mov|wmv|iso|zip|rar)$",
+                                "",
+                                _kw_full,
+                                flags=re.I,
+                            ).strip()
+                            _kw_code = _kw_no_ext.split()[0] if _kw_no_ext else ""
+
+                            _kw_queries = []
+                            for _kw_value in (
+                                _kw_full,
+                                _kw_no_ext,
+                                _kw_code,
+                            ):
+                                if _kw_value and _kw_value not in _kw_queries:
+                                    _kw_queries.append(_kw_value)
+
+                            print(
+                                f"[Cross-Seed Keyword Probe] "
+                                f"target={display_zone!r} "
+                                f"variants={_kw_queries!r}"
+                            )
+
+                            try:
+                                for _kw_value in _kw_queries:
+                                    _kw_new_pairs = [
+                                        (key, value)
+                                        for key, value in _kw_pairs
+                                        if key != "search"
+                                    ]
+                                    _kw_new_pairs.append(("search", _kw_value))
+
+                                    _kw_test_url = _kw_urlunsplit((
+                                        _kw_parts.scheme,
+                                        _kw_parts.netloc,
+                                        _kw_parts.path,
+                                        _kw_urlencode(_kw_new_pairs),
+                                        _kw_parts.fragment,
+                                    ))
+
+                                    try:
+                                        await site_page.get(_kw_test_url)
+                                        await asyncio.sleep(2.5)
+
+                                        _kw_html = await site_page.get_content() or ""
+                                        _kw_soup = BeautifulSoup(
+                                            _kw_html, "html.parser"
+                                        )
+                                        _kw_body = re.sub(
+                                            r"\s+",
+                                            " ",
+                                            _kw_soup.get_text(" ", strip=True),
+                                        )
+
+                                        _kw_detail_rx = re.compile(
+                                            r"(?:^|/)details(?:new)?\.php\?id=\d+(?:[&#]|$)",
+                                            re.I,
+                                        )
+                                        _kw_details = _kw_soup.find_all(
+                                            "a", href=_kw_detail_rx
+                                        )
+
+                                        _kw_non_profile_links = []
+                                        for _kw_a in _kw_soup.find_all(
+                                            "a", href=True
+                                        ):
+                                            _kw_href = str(
+                                                _kw_a.get("href", "")
+                                            )
+                                            if not re.search(
+                                                r"details|detail|download|torrent|topic|file",
+                                                _kw_href,
+                                                re.I,
+                                            ):
+                                                continue
+                                            if re.search(
+                                                r"userdetails|bookmarks|bonuslog",
+                                                _kw_href,
+                                                re.I,
+                                            ):
+                                                continue
+
+                                            _kw_non_profile_links.append((
+                                                _kw_href.split("?", 1)[0][:120],
+                                                _kw_a.get_text(" ", strip=True)[:60],
+                                            ))
+                                            if len(_kw_non_profile_links) >= 8:
+                                                break
+
+                                        _kw_no_result = []
+                                        for _kw_phrase in (
+                                            "ไม่พบ",
+                                            "ไม่มีรายการ",
+                                            "ไม่มีข้อมูล",
+                                            "No torrents found",
+                                        ):
+                                            _kw_pos = _kw_body.casefold().find(
+                                                _kw_phrase.casefold()
+                                            )
+                                            if _kw_pos >= 0:
+                                                _kw_no_result.append(
+                                                    _kw_body[
+                                                        max(0, _kw_pos - 100):
+                                                        _kw_pos + 180
+                                                    ]
+                                                )
+
+                                        _kw_title = (
+                                            _kw_soup.title.get_text(" ", strip=True)
+                                            if _kw_soup.title else "(no title)"
+                                        )
+
+                                        print(
+                                            f"[Cross-Seed Keyword Probe] "
+                                            f"query={_kw_value!r} "
+                                            f"title={_kw_title!r} "
+                                            f"html_chars={len(_kw_html)} "
+                                            f"details_links={len(_kw_details)} "
+                                            f"tr_count={len(_kw_soup.find_all('tr'))} "
+                                            f"no_result_context={_kw_no_result!r} "
+                                            f"other_links={_kw_non_profile_links!r}"
+                                        )
+
+                                    except Exception as _kw_exc:
+                                        print(
+                                            f"[Cross-Seed Keyword Probe] "
+                                            f"query={_kw_value!r} "
+                                            f"ERROR={type(_kw_exc).__name__}: "
+                                            f"{_kw_exc}"
+                                        )
+
+                            finally:
+                                try:
+                                    with open(
+                                        _kw_marker, "w", encoding="utf-8"
+                                    ) as _kw_file:
+                                        _kw_file.write(
+                                            f"Completed {datetime.now().isoformat()}\n"
+                                        )
+                                except OSError as _kw_marker_exc:
+                                    print(
+                                        "[Cross-Seed Keyword Probe] "
+                                        f"Marker write failed: {_kw_marker_exc}"
+                                    )
+
+                            print(
+                                "[Cross-Seed Keyword Probe] "
+                                "จบการทดสอบ จะกลับไป URL ค้นหาปกติ"
+                            )
+
+                        print(
+                            f"\n🌐 [{site}] Navigating Zone: "
+                            f"[{display_zone}] -> {target_url}"
+                        )
 
                     except Exception as e:
-                        print(f"❌ [{site}] Navigation Error: {e}")
+                        print(
+                            f"❌ [{site}] สร้าง Target URL ไม่สำเร็จ: "
+                            f"{type(e).__name__}: {e}"
+                        )
                         continue
+
+                    # ---------------------------------------------------------
+                    # B. Navigate + retry หน้าแจ้ง external link / Cloudflare
+                    # ---------------------------------------------------------
+                    try:
+                        page_source = ""
+
+                        for attempt in range(2):
+                            await site_page.get(target_url)
+                            await asyncio.sleep(2.5)
+
+                            page_source = await site_page.get_content() or ""
+                            soup = BeautifulSoup(page_source, "html.parser")
+
+                            if not page_source.strip():
+                                print(
+                                    f"⚠️ [{site}] HTML ว่าง "
+                                    f"(attempt {attempt + 1}/2)"
+                                )
+                                continue
+
+                            if is_cloudflare(soup):
+                                print(
+                                    f"🛡 [{site}] Cloudflare detected "
+                                    f"(attempt {attempt + 1}/2)"
+                                )
+
+                                if attempt == 0:
+                                    await asyncio.sleep(10)
+                                    continue
+
+                                print(
+                                    f"⚠️ [{site}] ยังติด Cloudflare "
+                                    "ข้ามโซนนี้"
+                                )
+                                break
+
+                            if "ไม่สามารถเปิดลิงก์จากภายนอกได้" in soup.get_text(
+                                " ", strip=True
+                            ):
+                                if attempt == 0:
+                                    await site_page.get(
+                                        urljoin(base_url + "/", "index.php")
+                                    )
+                                    await asyncio.sleep(1.5)
+                                    continue
+
+                                print(
+                                    f"⚠️ [{site}] ยังพบหน้าแจ้ง "
+                                    "ไม่สามารถเปิดลิงก์จากภายนอกได้"
+                                )
+                                break
+
+                            # ได้หน้าเว็บที่ไม่ตรงกับ error ที่รู้จัก
+                            # ให้ส่งต่อไปยังขั้นตอน parser เดิม
+                            break
+
+                        else:
+                            soup = BeautifulSoup("", "html.parser")
+
+                        if not page_source.strip():
+                            continue
+
+                        # ตรวจสถานะสุดท้ายหลัง retry ด้วย
+                        final_text = soup.get_text(" ", strip=True)
+
+                        if is_cloudflare(soup):
+                            continue
+
+                        if "ไม่สามารถเปิดลิงก์จากภายนอกได้" in final_text:
+                            continue
+
+                        # -----------------------------------------------------
+                        # สำคัญ:
+                        # ต่อจากตรงนี้ให้ใช้โค้ดเดิมในส่วน 4. PARSE RESULTS
+                        # และการตรวจ torrent / cross_seed_matches
+                        # โดยไม่สร้าง parser ชุดใหม่ซ้ำ
+                        # -----------------------------------------------------
+
+                    except Exception as e:
+                        print(
+                            f"❌ [{site}] Navigation Error "
+                            f"[{display_zone}]: {type(e).__name__}: {e}"
+                        )
+                        continue
+
+                    # ---------------------------------------------------------
+                    # BEARBIT Cross-Seed fallback search (fail-closed)
+                    # ใช้เมื่อคำค้นหาหลักไม่มี torrent detail links เท่านั้น
+                    # ส่งผลที่พบเข้า parser/preflight เดิม ไม่มีการเพิ่ม torrent ที่นี่
+                    # ---------------------------------------------------------
+                    try:
+                        from urllib.parse import (
+                            parse_qsl as _fb_parse_qsl,
+                            urlencode as _fb_urlencode,
+                            urlsplit as _fb_urlsplit,
+                            urlunsplit as _fb_urlunsplit,
+                        )
+
+                        _fb_site_key = str(site or "").strip().lower()
+                        _fb_path = _fb_urlsplit(target_url).path.rsplit(
+                            "/", 1
+                        )[-1]
+
+                        _fb_enabled = (
+                            bool(cross_seed_target)
+                            and any(
+                                token in _fb_site_key
+                                for token in ("bearbit", "siambit")
+                            )
+                            and _fb_path in {
+                                "viewno18sbx.php",
+                                "viewbrsb.php",
+                            }
+                        )
+
+                        _fb_detail_rx = re.compile(
+                            r"(?:^|/)(?:bs_)?details(?:new)?"
+                            r"\.php\?id=\d+(?:[&#]|$)",
+                            re.I,
+                        )
+
+                        _fb_existing_details = (
+                            soup.find_all("a", href=_fb_detail_rx)
+                            if soup else []
+                        )
+
+                        if _fb_enabled and not _fb_existing_details:
+                            _fb_parts = _fb_urlsplit(target_url)
+                            _fb_pairs = _fb_parse_qsl(
+                                _fb_parts.query,
+                                keep_blank_values=True,
+                            )
+                            _fb_original_search = next(
+                                (
+                                    value for key, value in _fb_pairs
+                                    if key == "search"
+                                ),
+                                "",
+                            ).strip()
+
+                            # รองรับรหัสนำหน้า เช่น CAD-031, MIDA-846,
+                            # GVG-954 โดยตัดส่วน suffix ที่ต่อด้วย _ หรือ [
+                            _fb_code_match = re.match(
+                                r"^\s*([A-Za-z]{2,12}-\d{2,6})"
+                                r"(?=$|[^A-Za-z0-9])",
+                                _fb_original_search,
+                                re.I,
+                            )
+                            _fb_fallbacks = []
+
+                            if _fb_code_match:
+                                _fb_code = _fb_code_match.group(1).strip()
+                                if (
+                                    _fb_code
+                                    and _fb_code.casefold()
+                                    != _fb_original_search.casefold()
+                                ):
+                                    _fb_fallbacks.append(_fb_code)
+
+                            if _fb_fallbacks:
+                                print(
+                                    "[Cross-Seed Fallback] "
+                                    f"[{site}] primary search has no detail "
+                                    f"links; trying {_fb_fallbacks!r} "
+                                    f"on {_fb_path}"
+                                )
+
+                            for _fb_keyword in _fb_fallbacks:
+                                _fb_new_pairs = [
+                                    (key, value)
+                                    for key, value in _fb_pairs
+                                    if key != "search"
+                                ]
+                                _fb_new_pairs.append(("search", _fb_keyword))
+
+                                _fb_test_url = _fb_urlunsplit((
+                                    _fb_parts.scheme,
+                                    _fb_parts.netloc,
+                                    _fb_parts.path,
+                                    _fb_urlencode(_fb_new_pairs),
+                                    _fb_parts.fragment,
+                                ))
+
+                                try:
+                                    await site_page.get(_fb_test_url)
+                                    await asyncio.sleep(2.5)
+
+                                    _fb_html = (
+                                        await site_page.get_content() or ""
+                                    )
+                                    if not _fb_html.strip():
+                                        print(
+                                            "[Cross-Seed Fallback] "
+                                            f"[{site}] keyword={_fb_keyword!r} "
+                                            "returned empty HTML"
+                                        )
+                                        continue
+
+                                    _fb_soup = BeautifulSoup(
+                                        _fb_html, "html.parser"
+                                    )
+
+                                    if is_cloudflare(_fb_soup):
+                                        print(
+                                            "[Cross-Seed Fallback] "
+                                            f"[{site}] Cloudflare detected; "
+                                            "rejecting fallback page"
+                                        )
+                                        continue
+
+                                    _fb_text = _fb_soup.get_text(
+                                        " ", strip=True
+                                    )
+                                    if (
+                                        "ไม่สามารถเปิดลิงก์จากภายนอกได้"
+                                        in _fb_text
+                                    ):
+                                        print(
+                                            "[Cross-Seed Fallback] "
+                                            f"[{site}] external-link error; "
+                                            "rejecting fallback page"
+                                        )
+                                        continue
+
+                                    _fb_found = _fb_soup.find_all(
+                                        "a", href=_fb_detail_rx
+                                    )
+                                    print(
+                                        "[Cross-Seed Fallback] "
+                                        f"[{site}] keyword={_fb_keyword!r} "
+                                        f"details_links={len(_fb_found)}"
+                                    )
+
+                                    # เปลี่ยนไปใช้ผล fallback เฉพาะเมื่อพบ
+                                    # detail links จริง แล้วใช้ parser เดิมต่อ
+                                    if _fb_found:
+                                        soup = _fb_soup
+                                        page_source = _fb_html
+                                        target_url = _fb_test_url
+                                        print(
+                                            "[Cross-Seed Fallback] "
+                                            f"[{site}] accepted fallback "
+                                            f"keyword={_fb_keyword!r}; "
+                                            "continuing with existing parser"
+                                        )
+                                        break
+
+                                except Exception as _fb_exc:
+                                    print(
+                                        "[Cross-Seed Fallback] "
+                                        f"[{site}] keyword={_fb_keyword!r} "
+                                        f"failed: {type(_fb_exc).__name__}: "
+                                        f"{_fb_exc}"
+                                    )
+                        elif _fb_enabled:
+                            print(
+                                "[Cross-Seed Fallback] "
+                                f"[{site}] primary search already has "
+                                f"{len(_fb_existing_details)} detail links; "
+                                "no fallback needed"
+                            )
+
+                    except Exception as _fb_outer_exc:
+                        # ความผิดพลาดใน fallback ต้องไม่ทำให้ parser
+                        # เดิมล้ม หรือยกเลิก fail-closed
+                        print(
+                            "[Cross-Seed Fallback] "
+                            f"[{site}] safely skipped: "
+                            f"{type(_fb_outer_exc).__name__}: "
+                            f"{_fb_outer_exc}"
+                        )
 
                     # ---------------------------------------------------------
                     # 4. ROW EXTRACT & PARSING
                     # ---------------------------------------------------------
-                    all_details = soup.find_all("a", href=re.compile(r"details(new)?\.php\?id=\d+"))
+                    all_details = soup.find_all("a", href=re.compile(r"(?:^|/)(?:bs_)?details(?:new)?\.php\?id=\d+(?:[&#]|$)", re.I))
+                    if not all_details:
+                        _cs_debug_count = 0
+                        for _cs_a in soup.find_all('a', href=True):
+                            _cs_href = str(_cs_a.get('href', ''))
+                            if not re.search(r'detail|torrent|download|view|browse|topic|file|show|id=', _cs_href, re.I):
+                                continue
+                            _cs_path = _cs_href.split('?', 1)[0].split('#', 1)[0][:160]
+                            _cs_query_match = re.search(r'[?&](id|tid|torrentid)=(\d+)(?:&|$)', _cs_href, re.I)
+                            if _cs_query_match:
+                                _cs_safe_href = _cs_path + '?' + _cs_query_match.group(1) + '=' + _cs_query_match.group(2)
+                            elif '?' in _cs_href:
+                                _cs_safe_href = _cs_path + '?[query-redacted]'
+                            else:
+                                _cs_safe_href = _cs_path
+                            _cs_text = _cs_a.get_text(' ', strip=True)[:70]
+                            _cs_debug_count += 1
+                            if _cs_debug_count <= 18:
+                                print(f"[Cross-Seed Link Inventory] href={_cs_safe_href!r} text={_cs_text!r}")
+                        print(f"[Cross-Seed Link Inventory] relevant_links={_cs_debug_count}")
+                        print(f"[Cross-Seed Form Inventory] forms={len(soup.find_all(chr(102)+chr(111)+chr(114)+chr(109)))}")
+                        for _cs_fi, _cs_form in enumerate(soup.find_all("form")[:10], 1):
+                            _cs_action = str(_cs_form.get("action", ""))[:160]
+                            _cs_method = str(_cs_form.get("method", "get")).lower()
+                            print(f"[Cross-Seed Form Inventory] form={_cs_fi} action={_cs_action!r} method={_cs_method!r}")
+                            _cs_shown = 0
+                            for _cs_el in _cs_form.find_all(["input", "select", "button", "textarea"]):
+                                _cs_name = str(_cs_el.get("name", ""))
+                                _cs_type = str(_cs_el.get("type", _cs_el.name)).lower()
+                                if re.search(r"pass|token|csrf|cookie|session|auth", _cs_name, re.I):
+                                    continue
+                                _cs_relevant = bool(re.search(r"search|keyword|sort|cat|subcat|incldead|freeload|bonus|quality|ajax", _cs_name, re.I)) or _cs_type in ("text", "search", "submit") or _cs_el.name in ("button", "textarea")
+                                if not _cs_relevant:
+                                    continue
+                                if _cs_shown >= 20:
+                                    break
+                                _cs_value = str(_cs_el.get("value", ""))[:100] if re.search(r"search|keyword|sort|cat|subcat|incldead|freeload|bonus|quality|ajax", _cs_name, re.I) else "(omitted)"
+                                _cs_checked = bool(_cs_el.has_attr("checked"))
+                                _cs_selected = [
+                                    str(o.get("value", ""))
+                                    for o in _cs_el.find_all("option")
+                                    if o.has_attr("selected")
+                                ] if _cs_el.name == "select" else []
+                                print(
+                                    f"[Cross-Seed Form Inventory] "
+                                    f"control tag={_cs_el.name} "
+                                    f"name={_cs_name!r} type={_cs_type!r} "
+                                    f"value={_cs_value!r} "
+                                    f"checked={_cs_checked} "
+                                    f"selected={_cs_selected!r}"
+                                )
+                                if _cs_el.name == "select":
+                                    _cs_opts = [(str(o.get("value", "")), o.get_text(" ", strip=True)[:40], bool(o.has_attr("selected"))) for o in _cs_el.find_all("option")[:15]]
+                                    print(f"[Cross-Seed Form Inventory] options name={_cs_name!r} values={_cs_opts!r}")
+                                _cs_shown += 1
+                        _cs_all_rows = soup.find_all('tr')
+                        for _cs_i, _cs_tr in enumerate(_cs_all_rows[-8:], start=max(1, len(_cs_all_rows) - 7)):
+                            _cs_row_text = _cs_tr.get_text(' ', strip=True)[:220]
+                            if _cs_row_text:
+                                print(f"[Cross-Seed Row Inventory] row={_cs_i} text={_cs_row_text!r}")
                     rows = []
+                    if cross_seed_target:
+                        page_title = soup.title.get_text(" ", strip=True) if soup.title else "(no title)"
+                        preview = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))[:180]
+                        tr_count = len(soup.find_all("tr"))
+                        print(
+                            f"🔎 [Cross-Seed Parse Debug] [{site}] html_chars={len(page_source)} "
+                            f"title={page_title!r} details_links={len(all_details)} "
+                            f"tr_count={tr_count} preview={preview!r}"
+                        )
+                    if cross_seed_target:
+                        for link_i, link in enumerate(all_details[:8], 1):
+                            ancestor_tags = []
+                            parent = link.parent
+                            for _ in range(5):
+                                if parent is None:
+                                    break
+                                classes = parent.get('class', [])
+                                if isinstance(classes, str):
+                                    classes = [classes]
+                                suffix = '.' + '.'.join(classes) if classes else ''
+                                ancestor_tags.append(f'{parent.name}{suffix}')
+                                parent = parent.parent
+                            link_href = link.get('href')
+                            link_text = link.get_text(' ', strip=True)[:100]
+                            print(
+                                f'🔎 [Cross-Seed Link Debug] [{site}] #{link_i} '
+                                f'href={link_href!r} text={link_text!r} '
+                                f'ancestors={ancestor_tags}'
+                            )
                     for a in all_details:
                         if stop_event.is_set(): 
                             break
@@ -5753,6 +8789,8 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                 continue
                             rows.append(parent_tr)
 
+                    if cross_seed_target:
+                        print(f"🔎 [Cross-Seed Parse Debug] [{site}] candidate_rows={len(rows)}")
                     for row in rows:
                         if stop_event.is_set(): 
                             break
@@ -5764,6 +8802,13 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                 'Referer': target_url
                             }
                             data = await extract_torrent_data(row, base_url, dl_session, extract_headers)
+                            if cross_seed_target:
+                                is_dict = isinstance(data, dict)
+                                extracted_id = bool(is_dict and data.get('id'))
+                                has_download = bool(is_dict and data.get('download_url'))
+                                size_value = data.get('size_str') if is_dict else None
+                                row_preview = row.get_text(" ", strip=True)[:140]
+                                print(f"🔎 [Cross-Seed Extract Debug] [{site}] type={type(data).__name__} id_ok={extracted_id} download_ok={has_download} size={size_value!r} row={row_preview!r}")
                             if not data or not data.get('id'): 
                                 continue
 
@@ -5786,14 +8831,176 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                             else:
                                 t_name = f"Torrent_ID_{t_id}"
                             
-                            t_size_gb = parse_size(data['size_str'])
-                            t_size_bytes = data.get('size_bytes') or int(round(t_size_gb * 1024 * 1024 * 1024))
+                            size_str = str(data.get("size_str") or "")
+                            t_size_gb = parse_size(size_str)
 
-                            # 🎯 CROSS-SEED MATCHING MODE
+                            # ใช้ขนาดจริงจาก extractor ก่อน ถ้ามี
+                            raw_size_bytes = data.get("size_bytes")
+
+                            try:
+                                exact_size_bytes = int(raw_size_bytes or 0)
+                            except (TypeError, ValueError, OverflowError):
+                                exact_size_bytes = 0
+
+                            if exact_size_bytes > 0:
+                                t_size_bytes = exact_size_bytes
+                                tolerance_bytes = 1024 * 1024
+                                size_source = "exact_bytes"
+
+                            else:
+                                # ไม่มีขนาดเป็นไบต์ จึงต้องคำนวณจากข้อความที่แสดงบนหน้าเว็บ
+                                t_size_bytes = int(round(t_size_gb * (1024 ** 3)))
+                                tolerance_bytes = 1024 * 1024
+                                size_source = "display_size"
+
+                                # ประมาณความคลาดเคลื่อนจากการปัดเศษตามความละเอียดที่แสดง
+                                size_match = re.search(
+                                    r"(\d+(?:[.,]\d+)?)\s*(TB|GB|MB|KB|B)\b",
+                                    size_str,
+                                    re.IGNORECASE,
+                                )
+
+                                if size_match:
+                                    number_text = size_match.group(1)
+                                    unit = size_match.group(2).upper()
+
+                                    if "." in number_text:
+                                        decimal_places = len(number_text.split(".", 1)[1])
+                                    elif "," in number_text:
+                                        decimal_places = len(number_text.split(",", 1)[1])
+                                    else:
+                                        decimal_places = 0
+
+                                    # parse_size() ของระบบใช้หน่วย GB โดย GB = 1
+                                    unit_factor_gb = {
+                                        "TB": 1024,
+                                        "GB": 1,
+                                        "MB": 1 / 1024,
+                                        "KB": 1 / (1024 ** 2),
+                                        "B": 1 / (1024 ** 3),
+                                    }
+
+                                    factor = unit_factor_gb.get(unit)
+
+                                    if factor is not None and decimal_places > 0:
+                                        rounding_tolerance = int(
+                                            0.5
+                                            * (10 ** (-decimal_places))
+                                            * factor
+                                            * (1024 ** 3)
+                                        )
+
+                                        # อนุญาตเฉพาะกรณีที่ความคลาดเคลื่อนอธิบายได้
+                                        # ด้วยการปัดเศษ และจำกัดไม่เกิน 8 MiB
+                                        if rounding_tolerance <= 8 * 1024 * 1024:
+                                            tolerance_bytes = max(
+                                                tolerance_bytes,
+                                                rounding_tolerance + 1,
+                                            )
+
+                            # CROSS-SEED MATCHING MODE
                             if cross_seed_target:
-                                target_bytes = cross_seed_target.get('target_size_bytes', 0)
-                                if target_bytes > 0 and abs(t_size_bytes - target_bytes) < (1024 * 1024):
-                                    print(f"🎯 [Cross-Seed Match!] [{site}] ID: {t_id} | {raw_title[:40]} | Size: {t_size_bytes} Bytes")
+                                source_site_key = re.sub(
+                                    r"[^a-z0-9]+",
+                                    "",
+                                    str(
+                                        cross_seed_target.get("source_site") or ""
+                                    ).casefold(),
+                                )
+
+                                candidate_site_key = re.sub(
+                                    r"[^a-z0-9]+",
+                                    "",
+                                    str(site or "").casefold(),
+                                )
+
+                                source_is_verified = (
+                                    cross_seed_target.get(
+                                        "source_site_verified"
+                                    ) is True
+                                )
+
+                                if (
+                                    source_is_verified
+                                    and source_site_key
+                                    and source_site_key != "unknown"
+                                    and source_site_key == candidate_site_key
+                                ):
+                                    print(
+                                        f"↩️ [Cross-Seed] [{site}] "
+                                        "verified source site; not a cross-seed target"
+                                    )
+                                    continue
+
+                                raw_known_sites = (
+                                    cross_seed_target.get("known_sites") or []
+                                )
+
+                                if not isinstance(
+                                    raw_known_sites,
+                                    (list, tuple, set)
+                                ):
+                                    raw_known_sites = []
+
+                                known_site_keys = {
+                                    re.sub(
+                                        r"[^a-z0-9]+",
+                                        "",
+                                        str(value or "").casefold()
+                                    )
+                                    for value in raw_known_sites
+                                }
+
+                                if (
+                                    candidate_site_key
+                                    and candidate_site_key in known_site_keys
+                                ):
+                                    print(
+                                        f"↩️ [Cross-Seed] [{site}] "
+                                        "hash already observed on this site"
+                                    )
+                                    continue
+
+                                try:
+                                    target_bytes = int(
+                                        cross_seed_target.get("target_size_bytes", 0) or 0
+                                    )
+                                except (TypeError, ValueError, OverflowError):
+                                    target_bytes = 0
+
+                                size_diff = abs(t_size_bytes - target_bytes)
+
+                                print(
+                                    f"🔎 [Cross-Seed Size Check] [{site}] ID={t_id} | "
+                                    f"size_str={size_str!r} | source={size_source} | "
+                                    f"web={t_size_bytes} | target={target_bytes} | "
+                                    f"diff={size_diff} bytes | tolerance={tolerance_bytes} bytes"
+                                )
+
+                                if (
+                                    target_bytes > 0
+                                    and size_diff <= tolerance_bytes
+                                ):
+                                    print(
+                                        f"🎯 [Cross-Seed Match!] [{site}] "
+                                        f"ID: {t_id} | {raw_title[:60]} | "
+                                        f"Size: {t_size_bytes} Bytes"
+                                    )
+
+                                    _cs_preflight = await _preflight_cross_seed_candidate(
+                                        browser_tab=site_page,
+                                        cross_seed_target=cross_seed_target,
+                                        site=site,
+                                        torrent_id=t_id,
+                                        details_url=details_url,
+                                        download_url=download_url,
+                                    )
+                                    if not _cs_preflight.get("ok"):
+                                        print(
+                                            f"⛔ [Cross-Seed Preflight Rejected] [{site}] "
+                                            f"ID={t_id}: {_cs_preflight.get('error', 'Unknown error')}"
+                                        )
+                                        continue
                                     cross_seed_matches.append({
                                         "torrent_id": t_id,
                                         "site_name": site,
@@ -5801,8 +9008,40 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                         "details_url": details_url,
                                         "download_url": download_url,
                                         "web_size_bytes": t_size_bytes,
-                                        "size_str": data.get('size_str', '')
+                                        "size_str": size_str,
+
+                                        # Keep exact source context for a later,
+                                        # verified add stage.
+                                        "source_hash": cross_seed_target.get("source_hash", ""),
+                                        "source_node": cross_seed_target.get("source_node"),
+                                        "source_node_config": cross_seed_target.get("source_node_config"),
+                                        "source_node_name": cross_seed_target.get("source_node_name", ""),
+                                        "source_save_path": cross_seed_target.get("source_save_path", ""),
+                                        "source_torrent_name": cross_seed_target.get("source_torrent_name", ""),
+                                        "source_size_bytes": cross_seed_target.get("source_size_bytes", 0),
+                                        "source_site": cross_seed_target.get("source_site", "Unknown"),
+                                        "source_site_verified": (
+                                            cross_seed_target.get("source_site_verified") is True
+                                        ),
+                                        "known_sites": list(
+                                            cross_seed_target.get("known_sites") or []
+                                        ),
+                                        "preflight_status": _cs_preflight.get("status"),
+                                        "preflight_action": _cs_preflight.get("action"),
+                                        "candidate_info_hash": _cs_preflight.get("candidate_info_hash"),
+                                        "candidate_trackers": _cs_preflight.get("candidate_trackers", []),
+                                        "candidate_manifest": _cs_preflight.get("candidate_manifest"),
+                                        "torrent_content": _cs_preflight.get("torrent_content"),
+                                        "candidate_filelist": _cs_preflight.get("filelist", {}),
+                                        "source_file_mapping": _cs_preflight.get("source_file_mapping", []),
+                                        "candidate_extra_files": _cs_preflight.get("candidate_extra_files", []),
                                     })
+                                else:
+                                    print(
+                                        f"❌ [Cross-Seed No Match] [{site}] "
+                                        f"ID={t_id} | ขนาดต่าง {size_diff} bytes"
+                                    )
+
                                 continue
 
                             # 🎯 NORMAL AUTO-GRAB MODE
@@ -5925,21 +9164,75 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                 is_duplicate = False
                                 target_node_name = ""
 
-                                # ตรวจสอบว่าแฮชซ้ำใน seen_hashes หรือมีอยู่อยู่แล้วใน Node
-                                if t_hash in seen_hashes:
-                                    is_duplicate = True
-                                    for node_obj, _ in active_nodes:
-                                        if hasattr(node_obj, 'is_torrent_exists') and node_obj.is_torrent_exists(t_hash):
-                                            target_node_name = node_obj.name
-                                            break
-                                else:
-                                    for node_obj, _ in active_nodes:
-                                        if hasattr(node_obj, 'is_torrent_exists') and node_obj.is_torrent_exists(t_hash):
-                                            is_duplicate = True
-                                            target_node_name = node_obj.name
-                                            break
+                                # Verify duplicate status using tri-state results.
+                                seen_hash_duplicate = t_hash in seen_hashes
+                                is_duplicate = seen_hash_duplicate
+                                target_node_name = ""
+                                inventory_check_failed = not bool(active_nodes)
 
-                                if is_duplicate:
+                                if not active_nodes:
+                                    print(
+                                        "⚠️ [Mapper] ไม่มี Active Node "
+                                        "สำหรับตรวจสอบ Duplicate"
+                                    )
+
+                                for node_obj, _ in active_nodes:
+                                    exists_method = getattr(
+                                        node_obj,
+                                        "is_torrent_exists",
+                                        None
+                                    )
+
+                                    if not callable(exists_method):
+                                        inventory_check_failed = True
+                                        print(
+                                            f"⚠️ [Mapper] "
+                                            f"[{getattr(node_obj, 'name', 'Unknown')}] "
+                                            "ไม่มี Hash verification method"
+                                        )
+                                        continue
+
+                                    try:
+                                        exists = exists_method(t_hash)
+                                    except Exception as check_error:
+                                        exists = None
+                                        print(
+                                            f"⚠️ [Mapper] "
+                                            f"[{getattr(node_obj, 'name', 'Unknown')}] "
+                                            f"{check_error}"
+                                        )
+
+                                    if (
+                                        exists is None
+                                        or type(exists) is not bool
+                                    ):
+                                        inventory_check_failed = True
+                                        continue
+
+                                    if exists is True:
+                                        is_duplicate = True
+                                        target_node_name = getattr(
+                                            node_obj,
+                                            "name",
+                                            "Unknown"
+                                        )
+                                        break
+
+                                # If no positive duplicate is located and
+                                # a Node cannot be verified, fail closed.
+                                if (
+                                    inventory_check_failed
+                                    and not target_node_name
+                                ):
+                                    print(
+                                        f"🛑 [Mapper] Hash={t_hash[:12]} "
+                                        "ตรวจสอบ Duplicate ไม่ครบ "
+                                        "ยกเลิกการ Add รอบนี้"
+                                    )
+                                    download_ready = False
+
+                                elif is_duplicate:
+
                                     effective_node_name = target_node_name
                                     if not effective_node_name and active_nodes:
                                         effective_node_name = active_nodes[0][0].name
@@ -5951,13 +9244,16 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
 
                                     # ซิงค์ข้อมูลลง Mapping
                                     if effective_node_name:
-                                        sync_data = dict(data)
-                                        sync_data.update({
-                                            'hash': t_hash, 'id': t_id, 'torrent_id': t_id,
-                                            'site': site, 'site_name': site, 'release_name': raw_title,
-                                            'web_size': data.get('size_str', ''),
-                                            'download_url': download_url, 'details_url': details_url
-                                        })
+                                        # This site only observed the hash.
+                                        # It is not necessarily the source tracker.
+                                        sync_data = {
+                                            "hash": t_hash,
+                                            "observed_site": site,
+                                            "observed_torrent_id": t_id,
+                                            "observed_details_url": details_url,
+                                            "observed_release_name": raw_title,
+                                            "observed_web_size": data.get("size_str", ""),
+                                        }
 
                                         synced = False
                                         for node_obj, _ in active_nodes:
@@ -5980,32 +9276,53 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                             # ---------------------------------------------------------
                             if download_ready:
                                 print(f"✅ [{site}] พร้อมส่งไฟล์เข้า Client (Hash: {t_hash})")
-                                
+
                                 # เรียงลำดับ Node ที่มีพื้นที่ว่างมากที่สุดขึ้นก่อน
                                 active_nodes.sort(key=lambda x: getattr(x[0], 'free_gb', 0), reverse=True)
                                 success_node = None
                                 task_weight = calculate_task_weight(t_size_gb) if 'calculate_task_weight' in globals() else 1.0
 
                                 for node_obj, n_cfg in active_nodes:
-                                    if stop_event.is_set(): 
+                                    if stop_event.is_set():
                                         break
-                                    
+
                                     node_name = getattr(node_obj, 'name', 'Unknown Node')
 
-                                    # 1. ตรวจสอบ Load (Weight)
+
+                                    # 1. ตรวจสอบ Load (Weight) พร้อมวิเคราะห์สาเหตุ
                                     d_type = n_cfg.get('disk_type', 'HDD') if isinstance(n_cfg, dict) else 'HDD'
+
                                     dynamic_max_cap = 100.0
+                                    proxy_wait = None
+
                                     if 'get_node_dynamic_cap' in globals():
-                                        dynamic_max_cap, _ = get_node_dynamic_cap(node_obj, d_type)
-                                    
+                                        dynamic_max_cap, proxy_wait = get_node_dynamic_cap(node_obj, d_type)
+
                                     current_load = 0.0
                                     if 'get_node_current_weight' in globals():
                                         current_load = round(get_node_current_weight(node_obj), 1)
 
-                                    if (current_load + task_weight) > dynamic_max_cap:
-                                        print(f"⚠️ [{node_name}] โหลดเกินกำหนด (Load: {current_load}/{dynamic_max_cap}) -> ข้าม")
+                                    projected_load = current_load + task_weight
+
+                                    print(
+                                        f"[LOAD AUDIT] [{node_name}] "
+                                        f"disk={d_type} "
+                                        f"load={current_load:.1f} "
+                                        f"task={task_weight:.1f} "
+                                        f"cap={dynamic_max_cap:.1f} "
+                                        f"projected={projected_load:.1f} "
+                                        f"proxy_wait={proxy_wait}"
+                                    )
+
+                                    if projected_load > dynamic_max_cap:
+                                        print(
+                                            f"⚠️ [{node_name}] โหลดเกินกำหนด "
+                                            f"(Load: {current_load:.1f} + Task: {task_weight:.1f} "
+                                            f"> Cap: {dynamic_max_cap:.1f}) -> ข้าม"
+                                        )
                                         continue
-                                    
+
+
                                     # 2. คำนวณพื้นที่ (Buffer)
                                     downloading_size = 0
                                     if hasattr(node_obj, 'get_downloading_size'):
@@ -6129,8 +9446,23 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                         summary_msg.append(condition_text)
                         summary_msg.append(f"🌐 Scanning: [{display_zone}] {target_url if 'target_url' in locals() else ''}\n")
 
-                        if not added_in_zone and not full_nodes_in_zone:
+                        if cross_seed_target:
+                            zone_match_count = (
+                                len(cross_seed_matches) - cross_seed_matches_before_zone
+                            )
+
+                            if zone_match_count:
+                                summary_msg.append(
+                                    f"🎯 พบ Cross-Seed Match: {zone_match_count} รายการ"
+                                )
+                            else:
+                                summary_msg.append(
+                                    "❌ ไม่พบ Cross-Seed ที่ตรงกันในโซนนี้"
+                                )
+
+                        elif not added_in_zone and not full_nodes_in_zone:
                             summary_msg.append("❌ ไม่มีไฟล์เข้าเงื่อนไข")
+
                         else:
                             if added_in_zone:
                                 summary_msg.append("✅ Added:")
@@ -6178,11 +9510,1272 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
     print("\n🏁 สแกนและประมวลผลทุกเว็บไซต์เสร็จสิ้น")
     return True
 
+
+
+def _cross_seed_tracker_url_key(value):
+    """Canonical comparison key; never use this to print sensitive URLs."""
+    from urllib.parse import urlsplit, parse_qsl
+
+    raw = str(value or "").strip()
+    if (
+        not raw
+        or "\r" in raw
+        or "\n" in raw
+        or any(ord(ch) < 32 for ch in raw)
+    ):
+        return None
+
+    try:
+        parsed = urlsplit(raw)
+        scheme = parsed.scheme.casefold()
+        host = (parsed.hostname or "").casefold()
+        port = parsed.port
+    except (ValueError, TypeError):
+        return None
+
+    if scheme not in {"http", "https", "udp"} or not host:
+        return None
+
+    query = tuple(sorted(
+        parse_qsl(parsed.query, keep_blank_values=True)
+    ))
+    return (
+        scheme, host, port, parsed.path or "/", query,
+        parsed.username or "", parsed.password or "",
+    )
+
+
+def run_opt_in_cross_seed_tracker_additions(matches, active_nodes):
+    """
+    Opt-in, same-info-hash tracker addition only.
+    Rechecks presence after POST. Never adds torrent data or resumes a torrent.
+    """
+    from urllib.parse import urlsplit
+
+    exec_cfg = CFG.get("CROSS_SEED_EXECUTION", {})
+    if (
+        not isinstance(exec_cfg, dict)
+        or exec_cfg.get("enable_tracker_add") is not True
+    ):
+        print(
+            "🔒 [Cross-Seed Execute] Tracker addition disabled; "
+            "read-only audit only."
+        )
+        return
+
+    allowed_preflight = {
+        "filelist_manifest_verified_recheck_required",
+        "source_manifest_verified_filelist_hidden_recheck_required",
+    }
+
+    active_node_ids = set()
+    for entry in active_nodes or []:
+        if isinstance(entry, (tuple, list)) and entry:
+            active_node_ids.add(id(entry[0]))
+
+    seen = set()
+
+    for item in matches or []:
+        if not isinstance(item, dict):
+            continue
+
+        candidate_hash = str(
+            item.get("candidate_info_hash") or ""
+        ).strip().upper()
+        source_hash = str(
+            item.get("source_hash") or ""
+        ).strip().upper()
+        site = str(item.get("site_name") or "Unknown")
+
+        if (
+            len(candidate_hash) != 40
+            or any(c not in "0123456789ABCDEF" for c in candidate_hash)
+        ):
+            print(f"⛔ [Cross-Seed Execute] Invalid candidate hash; site={site!r}")
+            continue
+
+        # Different hash requires a separate paused-add/recheck workflow.
+        if candidate_hash != source_hash:
+            continue
+
+        if item.get("preflight_status") not in allowed_preflight:
+            print(
+                f"⛔ [Cross-Seed Execute] Hash={candidate_hash[:12]} "
+                "preflight status not eligible; skipped."
+            )
+            continue
+
+        if item.get("candidate_extra_files"):
+            print(
+                f"⛔ [Cross-Seed Execute] Hash={candidate_hash[:12]} "
+                "has extra candidate files; skipped."
+            )
+            continue
+
+        node = item.get("source_node")
+        if (
+            node is None
+            or id(node) not in active_node_ids
+            or not callable(getattr(node, "_execute_request", None))
+            or not getattr(node, "url", None)
+        ):
+            print(
+                f"⛔ [Cross-Seed Execute] Hash={candidate_hash[:12]} "
+                "source node is not active; skipped."
+            )
+            continue
+
+        unique_key = (id(node), candidate_hash, site.casefold())
+        if unique_key in seen:
+            continue
+        seen.add(unique_key)
+
+        try:
+            source_size = int(item.get("source_size_bytes") or 0)
+            manifest = item.get("candidate_manifest") or {}
+            manifest_size = int(manifest.get("total_size_bytes") or 0)
+        except (TypeError, ValueError, OverflowError):
+            print(
+                f"⛔ [Cross-Seed Execute] Hash={candidate_hash[:12]} "
+                "invalid size metadata; skipped."
+            )
+            continue
+
+        if source_size <= 0 or manifest_size != source_size:
+            print(
+                f"⛔ [Cross-Seed Execute] Hash={candidate_hash[:12]} "
+                "candidate/source total size mismatch; skipped."
+            )
+            continue
+
+        # Accept only syntactically valid announce URLs; never log full URLs.
+        announce_urls = []
+        url_keys = set()
+        for value in item.get("candidate_trackers") or []:
+            url = str(value or "").strip()
+            key = _cross_seed_tracker_url_key(url)
+            if key is None or key in url_keys:
+                continue
+            announce_urls.append(url)
+            url_keys.add(key)
+
+        if not announce_urls:
+            print(
+                f"⛔ [Cross-Seed Execute] Hash={candidate_hash[:12]} "
+                "no valid announce URLs; skipped."
+            )
+            continue
+
+        def request_trackers():
+            response = node._execute_request(
+                "GET",
+                f"{node.url}/api/v2/torrents/trackers",
+                params={"hash": candidate_hash.lower()},
+                auth=getattr(node, "auth", None),
+                verify=False,
+                timeout=12,
+            )
+            if response is None or response.status_code != 200:
+                return None
+            try:
+                payload = response.json()
+            except Exception:
+                return None
+            return payload if isinstance(payload, list) else None
+
+        # Re-read live torrent metadata immediately before any write.
+        try:
+            response = node._execute_request(
+                "GET",
+                f"{node.url}/api/v2/torrents/info",
+                params={"hashes": candidate_hash.lower()},
+                auth=getattr(node, "auth", None),
+                verify=False,
+                timeout=12,
+            )
+            if response is None or response.status_code != 200:
+                print(
+                    f"⚠️ [Cross-Seed Execute] Hash={candidate_hash[:12]} "
+                    "live torrent read failed; no mutation."
+                )
+                continue
+
+            info_list = response.json()
+            if not isinstance(info_list, list):
+                print(
+                    f"⚠️ [Cross-Seed Execute] Hash={candidate_hash[:12]} "
+                    "invalid live torrent response; no mutation."
+                )
+                continue
+
+            exact = [
+                info for info in info_list
+                if str(info.get("hash") or "").strip().upper()
+                == candidate_hash
+            ]
+            if len(exact) != 1:
+                print(
+                    f"⚠️ [Cross-Seed Execute] Hash={candidate_hash[:12]} "
+                    f"expected one live torrent, got {len(exact)}; no mutation."
+                )
+                continue
+
+            info = exact[0]
+            try:
+                complete = (
+                    float(info.get("progress", 0)) >= 0.999999
+                    and int(info.get("amount_left", -1)) == 0
+                    and int(info.get("total_size", -1)) == source_size
+                )
+            except (TypeError, ValueError, OverflowError):
+                complete = False
+
+            if not complete:
+                print(
+                    f"⛔ [Cross-Seed Execute] Hash={candidate_hash[:12]} "
+                    "live torrent is incomplete or size changed; no mutation."
+                )
+                continue
+
+            current_trackers = request_trackers()
+            if current_trackers is None:
+                print(
+                    f"⚠️ [Cross-Seed Execute] Hash={candidate_hash[:12]} "
+                    "tracker read failed; no mutation."
+                )
+                continue
+
+            existing_keys = {
+                key
+                for row in current_trackers
+                if isinstance(row, dict)
+                for key in [_cross_seed_tracker_url_key(row.get("url"))]
+                if key is not None
+            }
+
+            missing_urls = [
+                url for url in announce_urls
+                if _cross_seed_tracker_url_key(url) not in existing_keys
+            ]
+
+            if not missing_urls:
+                print(
+                    f"✅ [Cross-Seed Execute] site={site!r} "
+                    f"hash={candidate_hash[:12]} node={node.name}: "
+                    "ALREADY_PRESENT; no tracker write needed."
+                )
+                continue
+
+            missing_hosts = sorted({
+                (urlsplit(url).hostname or "unknown").casefold()
+                for url in missing_urls
+            })
+
+            response = node._execute_request(
+                "POST",
+                f"{node.url}/api/v2/torrents/addTrackers",
+                data={
+                    "hash": candidate_hash.lower(),
+                    "urls": "\n".join(missing_urls),
+                },
+                headers={"Referer": node.url},
+                auth=getattr(node, "auth", None),
+                verify=False,
+                timeout=20,
+            )
+
+            if response is None or response.status_code != 200:
+                print(
+                    f"⚠️ [Cross-Seed Execute] site={site!r} "
+                    f"hash={candidate_hash[:12]} node={node.name}: "
+                    f"addTrackers HTTP "
+                    f"{response.status_code if response is not None else 'no response'}."
+                )
+                continue
+
+            # HTTP 200 alone is not treated as proof that all URLs were added.
+            confirmed = request_trackers()
+            if confirmed is None:
+                print(
+                    f"⚠️ [Cross-Seed Execute] hash={candidate_hash[:12]} "
+                    "POST returned 200 but verification read failed; "
+                    f"hosts={missing_hosts!r}."
+                )
+                continue
+
+            confirmed_keys = {
+                key
+                for row in confirmed
+                if isinstance(row, dict)
+                for key in [_cross_seed_tracker_url_key(row.get("url"))]
+                if key is not None
+            }
+            remaining = [
+                url for url in missing_urls
+                if _cross_seed_tracker_url_key(url) not in confirmed_keys
+            ]
+
+            if not remaining:
+                print(
+                    f"✅ [Cross-Seed Execute] site={site!r} "
+                    f"hash={candidate_hash[:12]} node={node.name}: "
+                    f"ADDED_AND_VERIFIED count={len(missing_urls)} "
+                    f"hosts={missing_hosts!r}."
+                )
+            else:
+                remaining_hosts = sorted({
+                    (urlsplit(url).hostname or "unknown").casefold()
+                    for url in remaining
+                })
+                print(
+                    f"⚠️ [Cross-Seed Execute] hash={candidate_hash[:12]} "
+                    "some trackers were not confirmed; "
+                    f"hosts={remaining_hosts!r}."
+                )
+
+        except Exception as exc:
+            # Avoid logging exception payloads which might contain tracker URLs.
+            print(
+                f"⚠️ [Cross-Seed Execute] hash={candidate_hash[:12]} "
+                f"inspection failed: {type(exc).__name__}; no further action."
+            )
+
+
+
+def run_opt_in_new_hash_cross_seed(matches, active_nodes):
+    """
+    Strict new-info-hash flow:
+    - disabled by default
+    - exact multi-file root/path/size match only
+    - add paused, request recheck, never resume automatically
+    - never delete source or candidate torrents
+    """
+    import posixpath
+
+    exec_cfg = CFG.get("CROSS_SEED_EXECUTION", {})
+    if (
+        not isinstance(exec_cfg, dict)
+        or exec_cfg.get("enable_new_hash_add") is not True
+    ):
+        print(
+            "🔒 [Cross-Seed New Hash] Disabled; "
+            "no new torrents added."
+        )
+        return
+
+    allowed_statuses = {
+        "filelist_manifest_verified_recheck_required",
+        "source_manifest_verified_filelist_hidden_recheck_required",
+    }
+
+    configured = [
+        item for item in CFG.get("NODES", [])
+        if isinstance(item, dict) and item.get("enable")
+    ]
+    if not configured:
+        print("⛔ [Cross-Seed New Hash] No enabled-node config; abort.")
+        return
+
+    # Fail closed if any enabled node cannot be inspected by this qBittorrent
+    # API handler. Do not infer global absence from a partial inventory.
+    if any(str(item.get("type", "qbit")).casefold() == "rtorrent"
+           for item in configured):
+        print(
+            "⛔ [Cross-Seed New Hash] An enabled rTorrent node exists; "
+            "cross-node duplicate check is unsupported. No additions."
+        )
+        return
+
+    active_by_name = {}
+    active_nodes_clean = []
+    for entry in active_nodes or []:
+        if not isinstance(entry, (tuple, list)) or len(entry) < 1:
+            continue
+        node = entry[0]
+        node_cfg = entry[1] if len(entry) > 1 and isinstance(entry[1], dict) else {}
+        if node is None:
+            continue
+        name = str(node_cfg.get("name") or getattr(node, "name", "")).strip()
+        if name:
+            active_by_name[name] = node
+        active_nodes_clean.append((node, node_cfg))
+
+    missing_nodes = [
+        str(item.get("name") or "")
+        for item in configured
+        if str(item.get("name") or "") not in active_by_name
+    ]
+    if missing_nodes:
+        print(
+            "⛔ [Cross-Seed New Hash] Cannot inspect all enabled nodes: "
+            f"{sorted(missing_nodes)!r}; no additions."
+        )
+        return
+
+    def normalize_abs(value):
+        value = str(value or "").strip()
+        if not value or not value.startswith("/"):
+            raise ValueError("Expected an absolute Linux path")
+        return posixpath.normpath(value)
+
+    def normalize_rel(value):
+        value = str(value or "").replace("\\", "/")
+        if not value or value.startswith("/") or "\x00" in value:
+            raise ValueError("Empty or absolute relative path")
+        if len(value) >= 2 and value[1] == ":":
+            raise ValueError("Drive-qualified relative path")
+        parts = [part for part in value.split("/") if part not in ("", ".")]
+        if not parts or any(part == ".." for part in parts):
+            raise ValueError("Unsafe relative path")
+        return "/".join(parts)
+
+    def read_hash_info(node, torrent_hash):
+        try:
+            response = node._execute_request(
+                "GET",
+                f"{node.url}/api/v2/torrents/info",
+                params={"hashes": torrent_hash.lower()},
+                auth=getattr(node, "auth", None),
+                verify=False,
+                timeout=12,
+            )
+            if response is None or response.status_code != 200:
+                return False, []
+            payload = response.json()
+            if not isinstance(payload, list):
+                return False, []
+            rows = [
+                item for item in payload
+                if isinstance(item, dict)
+                and str(item.get("hash") or "").strip().upper() == torrent_hash
+            ]
+            return True, rows
+        except Exception:
+            return False, []
+
+    seen_candidates = set()
+
+    for item in matches or []:
+        if not isinstance(item, dict):
+            continue
+
+        candidate_hash = str(
+            item.get("candidate_info_hash") or ""
+        ).strip().upper()
+        source_hash = str(item.get("source_hash") or "").strip().upper()
+        site = str(item.get("site_name") or "Unknown")
+        hash_prefix = candidate_hash[:12] if candidate_hash else "INVALID"
+
+        if (
+            len(candidate_hash) != 40
+            or any(c not in "0123456789ABCDEF" for c in candidate_hash)
+            or len(source_hash) != 40
+            or any(c not in "0123456789ABCDEF" for c in source_hash)
+        ):
+            print(f"⛔ [Cross-Seed New Hash] Invalid hash; site={site!r}")
+            continue
+
+        if candidate_hash == source_hash:
+            continue
+
+        if candidate_hash in seen_candidates:
+            continue
+        seen_candidates.add(candidate_hash)
+
+        if item.get("preflight_status") not in allowed_statuses:
+            print(
+                f"⛔ [Cross-Seed New Hash] hash={hash_prefix}: "
+                "preflight status not eligible; no addition."
+            )
+            continue
+
+        if item.get("content_verification") != "NOT_VERIFIED_RECHECK_REQUIRED":
+            print(
+                f"⛔ [Cross-Seed New Hash] hash={hash_prefix}: "
+                "unexpected verification state; no addition."
+            )
+            continue
+
+        node = item.get("source_node")
+        if (
+            node is None
+            or not any(active is node for active, _ in active_nodes_clean)
+            or not callable(getattr(node, "add", None))
+            or not callable(getattr(node, "get_torrent_file_manifest", None))
+        ):
+            print(
+                f"⛔ [Cross-Seed New Hash] hash={hash_prefix}: "
+                "source node is not active or lacks required methods."
+            )
+            continue
+
+        manifest = item.get("candidate_manifest")
+        if not isinstance(manifest, dict):
+            print(f"⛔ [Cross-Seed New Hash] hash={hash_prefix}: missing manifest.")
+            continue
+
+        if manifest.get("multi_file") is not True:
+            print(
+                f"⛔ [Cross-Seed New Hash] hash={hash_prefix}: "
+                "single-file layout is unsupported by the strict path gate."
+            )
+            continue
+
+        root_name = str(manifest.get("root_name") or "")
+        source_name = str(item.get("source_torrent_name") or "")
+        source_save_path = str(item.get("source_save_path") or "").strip()
+
+        try:
+            save_path_norm = normalize_abs(source_save_path)
+            expected_root = normalize_abs(
+                posixpath.join(save_path_norm, root_name)
+            )
+            source_size = int(item.get("source_size_bytes") or 0)
+            candidate_total = int(manifest.get("total_size_bytes") or 0)
+            files = manifest.get("files")
+            if not root_name or root_name in {".", ".."} or "/" in root_name or "\\" in root_name:
+                raise ValueError("Invalid torrent root name")
+            if root_name != source_name:
+                raise ValueError("Candidate root name differs from source torrent name")
+            if source_size <= 0 or candidate_total != source_size:
+                raise ValueError("Source/candidate total size mismatch")
+            if not isinstance(files, list) or not files:
+                raise ValueError("Empty candidate file manifest")
+            if item.get("candidate_extra_files"):
+                raise ValueError("Candidate contains additional files")
+            content = item.get("torrent_content")
+            if not isinstance(content, (bytes, bytearray)) or len(content) < 1000:
+                raise ValueError("Missing usable candidate torrent bytes")
+
+            candidate_pairs = []
+            for file_row in files:
+                if not isinstance(file_row, dict):
+                    raise ValueError("Invalid candidate file entry")
+                candidate_pairs.append((
+                    normalize_rel(file_row.get("path")),
+                    int(file_row.get("size_bytes")),
+                ))
+
+            candidate_paths = [path for path, _ in candidate_pairs]
+            if len(set(candidate_paths)) != len(candidate_paths):
+                raise ValueError("Duplicate candidate file paths")
+            if any(size < 0 for _, size in candidate_pairs):
+                raise ValueError("Negative candidate file size")
+            if sum(size for _, size in candidate_pairs) != source_size:
+                raise ValueError("Candidate file total does not match source size")
+
+        except (TypeError, ValueError, OverflowError) as exc:
+            print(
+                f"⛔ [Cross-Seed New Hash] hash={hash_prefix}: "
+                f"strict candidate validation failed ({exc}); no addition."
+            )
+            continue
+
+        # Read source live metadata immediately before any operation.
+        ok, source_rows = read_hash_info(node, source_hash)
+        if not ok or len(source_rows) != 1:
+            print(
+                f"⛔ [Cross-Seed New Hash] hash={hash_prefix}: "
+                "source live metadata unavailable or ambiguous."
+            )
+            continue
+
+        source_info = source_rows[0]
+        try:
+            source_live_complete = (
+                float(source_info.get("progress", 0)) >= 0.999999
+                and int(source_info.get("amount_left", -1)) == 0
+                and int(source_info.get("total_size", -1)) == source_size
+            )
+            live_save_path = normalize_abs(source_info.get("save_path"))
+            live_root_path = normalize_abs(source_info.get("root_path"))
+            live_name = str(source_info.get("name") or "")
+        except (TypeError, ValueError, OverflowError):
+            source_live_complete = False
+            live_save_path = ""
+            live_root_path = ""
+            live_name = ""
+
+        if not source_live_complete:
+            print(
+                f"⛔ [Cross-Seed New Hash] hash={hash_prefix}: "
+                "source is incomplete or live size changed."
+            )
+            continue
+        if live_save_path != save_path_norm or live_root_path != expected_root:
+            print(
+                f"⛔ [Cross-Seed New Hash] hash={hash_prefix}: "
+                "live source save/root path does not match expected layout."
+            )
+            continue
+        if live_name != source_name:
+            print(
+                f"⛔ [Cross-Seed New Hash] hash={hash_prefix}: "
+                "live source name changed."
+            )
+            continue
+
+        # Compare candidate paths/sizes to the live source manifest exactly.
+        try:
+            source_files = node.get_torrent_file_manifest(source_hash)
+            if not isinstance(source_files, list) or not source_files:
+                raise ValueError("Source file manifest unavailable")
+
+            source_pairs = []
+            for file_row in source_files:
+                if not isinstance(file_row, dict):
+                    raise ValueError("Invalid source file entry")
+                source_pairs.append((
+                    normalize_rel(file_row.get("path")),
+                    int(file_row.get("size_bytes")),
+                ))
+
+            if len(source_pairs) != len(candidate_pairs):
+                raise ValueError("Source/candidate file count differs")
+            if len({path for path, _ in source_pairs}) != len(source_pairs):
+                raise ValueError("Duplicate source paths")
+            if set(source_pairs) != set(candidate_pairs):
+                raise ValueError("Exact source/candidate path or size mismatch")
+            if sum(size for _, size in source_pairs) != source_size:
+                raise ValueError("Source manifest total differs from live size")
+
+        except (TypeError, ValueError, OverflowError) as exc:
+            print(
+                f"⛔ [Cross-Seed New Hash] hash={hash_prefix}: "
+                f"source/candidate manifest check failed ({exc}); no addition."
+            )
+            continue
+
+        # Search every enabled qBittorrent node before adding. An API failure
+        # is not evidence of absence.
+        present_elsewhere = False
+        inventory_incomplete = False
+        for active_node, _ in active_nodes_clean:
+            ok, rows = read_hash_info(active_node, candidate_hash)
+            if not ok:
+                inventory_incomplete = True
+                print(
+                    f"⚠️ [Cross-Seed New Hash] hash={hash_prefix}: "
+                    f"cannot inspect {getattr(active_node, 'name', 'unknown')}; no addition."
+                )
+                break
+            if rows:
+                present_elsewhere = True
+                print(
+                    f"⏭️ [Cross-Seed New Hash] hash={hash_prefix}: "
+                    f"already present on {getattr(active_node, 'name', 'unknown')}; no duplicate."
+                )
+                break
+
+        if inventory_incomplete or present_elsewhere:
+            continue
+
+        # The only mutation in this handler: add paused, with normal checking enabled.
+        try:
+            node_cfg = item.get("source_node_config")
+            if not isinstance(node_cfg, dict):
+                node_cfg = next(
+                    (
+                        cfg for active, cfg in active_nodes_clean
+                        if active is node
+                    ),
+                    {},
+                )
+
+            added = node.add(
+                content=bytes(content),
+                site_name=site,
+                size=source_size,
+                n_cfg=node_cfg,
+                save_path=save_path_norm,
+                skip_checking=False,
+                tags="AutoPilot,Cross-Seed",
+                paused=True,
+                cross_seed=True,
+            )
+
+            if not added:
+                print(
+                    f"⚠️ [Cross-Seed New Hash] hash={hash_prefix}: "
+                    "add API did not confirm success; no resume/delete attempted."
+                )
+                continue
+
+            ok, candidate_rows = read_hash_info(node, candidate_hash)
+            if not ok or len(candidate_rows) != 1:
+                print(
+                    f"⚠️ [Cross-Seed New Hash] hash={hash_prefix}: "
+                    "add returned success but live candidate could not be verified; "
+                    "left untouched and not resumed."
+                )
+                continue
+
+            candidate_info = candidate_rows[0]
+            try:
+                candidate_save = normalize_abs(candidate_info.get("save_path"))
+                candidate_root = normalize_abs(candidate_info.get("root_path"))
+                candidate_size_live = int(candidate_info.get("total_size", -1))
+            except (TypeError, ValueError, OverflowError):
+                candidate_save = ""
+                candidate_root = ""
+                candidate_size_live = -1
+
+            if (
+                candidate_save != save_path_norm
+                or candidate_root != expected_root
+                or candidate_size_live != source_size
+            ):
+                try:
+                    node.stop_torrent(candidate_hash)
+                except Exception:
+                    pass
+                print(
+                    f"⛔ [Cross-Seed New Hash] hash={hash_prefix}: "
+                    "post-add path/size verification failed; pause requested, "
+                    "candidate not resumed or deleted."
+                )
+                continue
+
+            state = str(candidate_info.get("state") or "").casefold()
+            checking = state.startswith("checking")
+            paused_states = {
+                "pausedup", "pauseddl", "paused",
+                "stoppedup", "stoppeddl", "stopped",
+            }
+
+            if not checking and state not in paused_states:
+                try:
+                    node.stop_torrent(candidate_hash)
+                except Exception:
+                    pass
+
+                ok, refreshed_rows = read_hash_info(node, candidate_hash)
+                if not ok or len(refreshed_rows) != 1:
+                    print(
+                        f"⚠️ [Cross-Seed New Hash] hash={hash_prefix}: "
+                        "could not confirm pause after add; no resume."
+                    )
+                    continue
+
+                candidate_info = refreshed_rows[0]
+                state = str(candidate_info.get("state") or "").casefold()
+                checking = state.startswith("checking")
+                if not checking and state not in paused_states:
+                    print(
+                        f"⛔ [Cross-Seed New Hash] hash={hash_prefix}: "
+                        "torrent did not reach a paused/checking state; "
+                        "no recheck/resume issued."
+                    )
+                    continue
+
+            if checking:
+                print(
+                    f"🟡 [Cross-Seed New Hash] hash={hash_prefix}: "
+                    "qBittorrent is already checking; no resume issued."
+                )
+                continue
+
+            response = node._execute_request(
+                "POST",
+                f"{node.url}/api/v2/torrents/recheck",
+                data={"hashes": candidate_hash.lower()},
+                headers={"Referer": node.url},
+                auth=getattr(node, "auth", None),
+                verify=False,
+                timeout=20,
+            )
+
+            if response is None or response.status_code != 200:
+                try:
+                    node.stop_torrent(candidate_hash)
+                except Exception:
+                    pass
+                print(
+                    f"⚠️ [Cross-Seed New Hash] hash={hash_prefix}: "
+                    "recheck request failed; pause requested; never resumed."
+                )
+                continue
+
+            # Re-read state to catch any unexpected start. Never auto-resume.
+            ok, refreshed_rows = read_hash_info(node, candidate_hash)
+            if ok and len(refreshed_rows) == 1:
+                state_after = str(refreshed_rows[0].get("state") or "").casefold()
+                if (
+                    not state_after.startswith("checking")
+                    and state_after not in paused_states
+                ):
+                    try:
+                        node.stop_torrent(candidate_hash)
+                    except Exception:
+                        pass
+
+            print(
+                f"🟡 [Cross-Seed New Hash] hash={hash_prefix}: "
+                "PAUSED_ADD_RECHECK_REQUESTED; content verification still pending; "
+                "no resume or deletion performed."
+            )
+
+        except Exception as exc:
+            print(
+                f"⚠️ [Cross-Seed New Hash] hash={hash_prefix}: "
+                f"execution failed ({type(exc).__name__}); no resume/delete attempted."
+            )
+
+
+async def audit_cross_seed_execution_plan(matches, active_nodes):
+    """Read-only audit; never adds trackers/torrents or changes torrent state."""
+    from urllib.parse import urlsplit, parse_qsl
+
+    def url_key(value):
+        try:
+            parsed = urlsplit(str(value or "").strip())
+            scheme = parsed.scheme.casefold()
+            host = (parsed.hostname or "").casefold()
+            if scheme not in {"http", "https", "udp"} or not host:
+                return None
+            try:
+                port = parsed.port
+            except ValueError:
+                return None
+            query = tuple(sorted(parse_qsl(
+                parsed.query, keep_blank_values=True
+            )))
+            return (scheme, host, port, parsed.path or "/", query)
+        except Exception:
+            return None
+
+    def safe_host(value):
+        try:
+            return (urlsplit(str(value or "")).hostname or "unknown").casefold()
+        except Exception:
+            return "unknown"
+
+    def completed(info):
+        try:
+            return (
+                float(info.get("progress", 0)) >= 0.999999
+                and int(info.get("amount_left", -1)) == 0
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    def exact_known_site_manifest(item):
+        """Require exact source/candidate file paths and byte sizes."""
+        try:
+            manifest = item.get("candidate_manifest") or {}
+            files = manifest.get("files") or []
+            mapping = item.get("source_file_mapping") or []
+            extras = item.get("candidate_extra_files") or []
+
+            if extras or not files or not mapping:
+                return False
+
+            if len(files) != len(mapping):
+                return False
+
+            source_pairs = []
+            candidate_pairs = []
+            mapped_pairs = []
+
+            for row in mapping:
+                source_path = str(row.get("source_path") or "")
+                candidate_path = str(row.get("candidate_path") or "")
+                source_size = int(row.get("source_size_bytes"))
+                candidate_size = int(row.get("candidate_size_bytes"))
+
+                if (
+                    not source_path
+                    or source_path != candidate_path
+                    or source_size <= 0
+                    or source_size != candidate_size
+                ):
+                    return False
+
+                source_pairs.append((source_path, source_size))
+                mapped_pairs.append((candidate_path, candidate_size))
+
+            for file in files:
+                path = str(file.get("path") or "")
+                size = int(file.get("size_bytes"))
+
+                if not path or size <= 0:
+                    return False
+
+                candidate_pairs.append((path, size))
+
+            # Reject duplicate paths and non-bijective mappings.
+            if len({path for path, _ in source_pairs}) != len(source_pairs):
+                return False
+
+            if len({path for path, _ in candidate_pairs}) != len(candidate_pairs):
+                return False
+
+            if set(source_pairs) != set(candidate_pairs):
+                return False
+
+            if set(mapped_pairs) != set(candidate_pairs):
+                return False
+
+            # source_size_bytes is explicitly propagated into
+            # cross_seed_matches. Candidate total is derived from
+            # its downloaded and verified metainfo manifest.
+            source_total = int(item.get("source_size_bytes") or 0)
+            mapped_source_total = sum(
+                size for _, size in source_pairs
+            )
+            candidate_total = sum(
+                size for _, size in candidate_pairs
+            )
+
+            if (
+                source_total <= 0
+                or mapped_source_total != source_total
+                or candidate_total != source_total
+            ):
+                return False
+
+            return True
+
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return False
+
+    # Keep only qBittorrent nodes that are active in this cycle.
+    nodes = []
+    for entry in active_nodes or []:
+        node = entry[0] if isinstance(entry, (tuple, list)) and entry else None
+        if node is not None and hasattr(node, "_execute_request") and hasattr(node, "url"):
+            nodes.append(node)
+
+    # Preserve every source association before deduplicating
+    # candidate inspection by (site, candidate_hash).
+    allowed_known_site_statuses = {
+        "filelist_manifest_verified_recheck_required",
+        "source_manifest_verified_filelist_hidden_recheck_required",
+    }
+
+    eligible_source_hashes_by_candidate = {}
+    known_site_updates = {}
+    unique = {}
+
+    for item in matches or []:
+        if not isinstance(item, dict):
+            continue
+
+        candidate_hash = str(
+            item.get("candidate_info_hash") or ""
+        ).strip().upper()
+
+        source_hash = str(
+            item.get("source_hash") or ""
+        ).strip().upper()
+
+        site = str(item.get("site_name") or "Unknown").strip()
+
+        if (
+            len(candidate_hash) != 40
+            or any(c not in "0123456789ABCDEF" for c in candidate_hash)
+        ):
+            print(
+                f"🛑 [Cross-Seed Audit] Invalid candidate hash; "
+                f"skipped site={site!r}"
+            )
+            continue
+
+        key = (site.casefold(), candidate_hash)
+        canonical_site = _canonical_mapping_site(site)
+
+        if (
+            canonical_site
+            and re.fullmatch(r"[0-9A-F]{40}", source_hash)
+            and item.get("preflight_status") in allowed_known_site_statuses
+        ):
+            if exact_known_site_manifest(item):
+                eligible_source_hashes_by_candidate.setdefault(
+                    key, set()
+                ).add(source_hash)
+            else:
+                print(
+                    f"⛔ [Cross-Seed Known Site] site={site!r} "
+                    f"candidate={candidate_hash[:12]} "
+                    "not recorded: source/candidate manifest is not exact"
+                )
+
+        old = unique.get(key)
+
+        if old is None or (
+            source_hash == candidate_hash
+            and str(old.get("source_hash") or "").strip().upper()
+                != candidate_hash
+        ):
+            unique[key] = item
+
+    if not unique:
+        print("ℹ️ [Cross-Seed Audit] No preflight candidates to inspect")
+        return
+
+    print(
+        f"\n🔍 [Cross-Seed Audit] DRY-RUN ONLY "
+        "(qBittorrent/tracker read-only; Known Site metadata only) | "
+        f"unique site/hash candidates={len(unique)}"
+    )
+
+    for (site_key, candidate_hash), item in unique.items():
+        site = str(item.get("site_name") or "Unknown")
+        source_hash = str(item.get("source_hash") or "").strip().upper()
+        tracker_urls = []
+        tracker_keys = set()
+
+        for value in item.get("candidate_trackers") or []:
+            key = url_key(value)
+            if key is not None and key not in tracker_keys:
+                tracker_keys.add(key)
+                tracker_urls.append(str(value).strip())
+
+        if not tracker_urls:
+            print(
+                f"⛔ [Cross-Seed Audit] site={site!r} "
+                f"hash={candidate_hash[:12]} no usable candidate trackers"
+            )
+            continue
+
+        present = []
+        inventory_errors = []
+
+        # Query each active node by exact hash. API errors are not treated
+        # as proof that the torrent is absent.
+        for node in nodes:
+            try:
+                response = node._execute_request(
+                    "GET",
+                    f"{node.url}/api/v2/torrents/info",
+                    params={"hashes": candidate_hash.lower()},
+                    auth=getattr(node, "auth", None),
+                    verify=False,
+                    timeout=10,
+                )
+                if response is None or response.status_code != 200:
+                    inventory_errors.append(getattr(node, "name", "unknown"))
+                    continue
+                payload = response.json()
+                if not isinstance(payload, list):
+                    inventory_errors.append(getattr(node, "name", "unknown"))
+                    continue
+                for info in payload:
+                    if str(info.get("hash") or "").strip().upper() == candidate_hash:
+                        present.append((node, info))
+            except Exception:
+                inventory_errors.append(getattr(node, "name", "unknown"))
+
+        if present:
+            complete_copies = [
+                (node, info) for node, info in present if completed(info)
+            ]
+            if not complete_copies:
+                states = ",".join(
+                    f"{getattr(node, 'name', 'unknown')}:{info.get('state', 'unknown')}"
+                    for node, info in present
+                )
+                print(
+                    f"⏭️ [Cross-Seed Audit] site={site!r} "
+                    f"hash={candidate_hash[:12]} exists but is not complete "
+                    f"({states}); no mutation"
+                )
+                continue
+
+            for node, info in complete_copies:
+                try:
+                    response = node._execute_request(
+                        "GET",
+                        f"{node.url}/api/v2/torrents/trackers",
+                        params={"hash": candidate_hash.lower()},
+                        auth=getattr(node, "auth", None),
+                        verify=False,
+                        timeout=12,
+                    )
+                    if response is None or response.status_code != 200:
+                        print(
+                            f"⚠️ [Cross-Seed Audit] site={site!r} "
+                            f"hash={candidate_hash[:12]} node={node.name}: "
+                            "tracker read failed; no mutation"
+                        )
+                        continue
+                    existing = response.json()
+                    if not isinstance(existing, list):
+                        print(
+                            f"⚠️ [Cross-Seed Audit] site={site!r} "
+                            f"hash={candidate_hash[:12]} node={node.name}: "
+                            "unexpected tracker response; no mutation"
+                        )
+                        continue
+
+                    existing_keys = {
+                        key for key in
+                        (url_key(t.get("url")) for t in existing if isinstance(t, dict))
+                        if key is not None
+                    }
+                    missing = [
+                        url for url in tracker_urls
+                        if url_key(url) not in existing_keys
+                    ]
+
+                    if missing:
+                        hosts = sorted({safe_host(url) for url in missing})
+                        print(
+                            f"🟡 [Cross-Seed Audit] site={site!r} "
+                            f"hash={candidate_hash[:12]} node={node.name}: "
+                            f"WOULD_ADD_TRACKERS count={len(missing)} "
+                            f"hosts={hosts!r}; read-only"
+                        )
+                    else:
+                        print(
+                            f"✅ [Cross-Seed Audit] site={site!r} "
+                            f"hash={candidate_hash[:12]} node={node.name}: "
+                            "ALREADY_PRESENT; no action needed"
+                        )
+
+                        # Candidate is complete, tracker API succeeded,
+                        # and every candidate tracker is already present.
+                        canonical_site = _canonical_mapping_site(site)
+
+                        eligible_sources = (
+                            eligible_source_hashes_by_candidate.get(
+                                (site.casefold(), candidate_hash),
+                                set()
+                            )
+                        )
+
+                        if canonical_site and eligible_sources:
+                            for verified_source_hash in eligible_sources:
+                                known_site_updates.setdefault(
+                                    verified_source_hash, set()
+                                ).add(canonical_site)
+
+                            print(
+                                f"🧭 [Cross-Seed Known Site] "
+                                f"site={canonical_site!r} "
+                                f"source associations={len(eligible_sources)}"
+                            )
+                except Exception as exc:
+                    print(
+                        f"⚠️ [Cross-Seed Audit] site={site!r} "
+                        f"hash={candidate_hash[:12]} node={node.name}: "
+                        f"tracker inspection failed ({type(exc).__name__}); no mutation"
+                    )
+            continue
+
+        if inventory_errors:
+            print(
+                f"🛑 [Cross-Seed Audit] site={site!r} "
+                f"hash={candidate_hash[:12]}: inventory incomplete on "
+                f"{sorted(set(inventory_errors))!r}; cannot safely infer absence"
+            )
+            continue
+
+        if candidate_hash == source_hash:
+            print(
+                f"🛑 [Cross-Seed Audit] site={site!r} "
+                f"hash={candidate_hash[:12]} matches source hash but was not found "
+                "in active node inventory; no action"
+            )
+            continue
+
+        # New-hash additions are proposed only for an exact root/path/size
+        # layout. This is intentionally stricter than preflight's fallback
+        # filename/extension mapping.
+        manifest = item.get("candidate_manifest") or {}
+        root_name = str(manifest.get("root_name") or "")
+        source_name = str(item.get("source_torrent_name") or "")
+        save_path = str(item.get("source_save_path") or "").strip()
+        files = manifest.get("files") or []
+        mapping = item.get("source_file_mapping") or []
+        extras = item.get("candidate_extra_files") or []
+
+        reasons = []
+        if not save_path:
+            reasons.append("missing_source_save_path")
+        if not root_name or root_name != source_name:
+            reasons.append("root_name_mismatch")
+        if extras:
+            reasons.append("candidate_has_extra_files")
+        if not files or len(mapping) != len(files):
+            reasons.append("file_count_mismatch")
+
+        for row in mapping:
+            try:
+                source_path = str(row.get("source_path") or "")
+                candidate_path = str(row.get("candidate_path") or "")
+                source_size = int(row.get("source_size_bytes"))
+                candidate_size = int(row.get("candidate_size_bytes"))
+                if not source_path or source_path != candidate_path:
+                    reasons.append("relative_path_mismatch")
+                    break
+                if source_size != candidate_size:
+                    reasons.append("file_size_mismatch")
+                    break
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                reasons.append("invalid_file_mapping")
+                break
+
+        try:
+            if int(item.get("source_total_size_bytes") or 0) != int(
+                item.get("candidate_total_size_bytes") or 0
+            ):
+                reasons.append("total_size_mismatch")
+        except (TypeError, ValueError, OverflowError):
+            reasons.append("invalid_total_size")
+
+        candidate_pairs = []
+        try:
+            for file in files:
+                candidate_pairs.append((
+                    str(file.get("path") or ""),
+                    int(file.get("size_bytes")),
+                ))
+            if len({path for path, _ in candidate_pairs}) != len(candidate_pairs):
+                reasons.append("duplicate_candidate_paths")
+            mapped_pairs = [
+                (str(row.get("candidate_path") or ""), int(row.get("candidate_size_bytes")))
+                for row in mapping
+            ]
+            if set(candidate_pairs) != set(mapped_pairs):
+                reasons.append("manifest_mapping_not_exact")
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            reasons.append("invalid_candidate_manifest")
+
+        if reasons:
+            print(
+                f"⛔ [Cross-Seed Audit] site={site!r} "
+                f"hash={candidate_hash[:12]}: REJECT_NEW_HASH "
+                f"reasons={sorted(set(reasons))!r}"
+            )
+        else:
+            print(
+                f"🟡 [Cross-Seed Audit] site={site!r} "
+                f"hash={candidate_hash[:12]}: WOULD_ADD_PAUSED_AND_RECHECK "
+                f"target_node={item.get('source_node_name')!r} "
+                f"root={root_name!r}; strict layout passed; read-only"
+            )
+
+    print(
+        "🔒 [Cross-Seed Audit] Finished; "
+        "no qBittorrent/tracker mutation performed."
+    )
+
+    if known_site_updates:
+        await record_cross_seed_known_sites(known_site_updates)
+    else:
+        print(
+            "ℹ️ [Cross-Seed Known Sites] "
+            "No candidate met all persistence conditions"
+        )
+
+
+
 async def main():
     global browser_instance
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(handle_exit(s)))
+        loop.add_signal_handler(sig, handle_exit, sig)
         
     startup_msg = "🚀 Universal Auto-Pilot (nodriver Edition) : Started"
     print(startup_msg)
@@ -6193,7 +10786,9 @@ async def main():
     dl_session = None
     resp = None
     consecutive_errors = 0
-    
+    # Alternate Cross-Seed and Normal Search per active cycle.
+    cycle_mode = "cross_seed"
+
     while not stop_event.is_set():
         try:
             if stop_event.is_set(): break
@@ -6263,41 +10858,341 @@ async def main():
                 await asyncio.sleep(60)
                 continue
 
+
             # =================================================================
             # 2. BROWSER SECTION (nodriver Implementation)
             # =================================================================
             print("\n🌐 STARTING SITE SEARCH & SCRAPING...")
 
-            # เตรียมพารามิเตอร์ stealth_args จาก SET หรือ CFG (ปรับ Key ตามที่ระบบคุณใช้)
-            stealth_args = SET.get('stealth_args', {})
-
-            # หากมีเป้าหมาย Cross-seed ที่เตรียมไว้ สามารถระบุใส่ตัวแปรนี้ได้
-            cross_seed_target = SET.get('cross_seed_target', None)
+            cycle_mode_completed = False
 
             try:
-                # เนื่องจาก scrape_site_search_nodriver ถูกดีไซน์ให้รับ active_nodes และ CFG แบบภาพรวม
-                # สามารถเรียกใช้งานแบบ await ได้เลย (หาก scrape_site_search_nodriver เป็น async def)
-                await scrape_site_search_nodriver(
-                    CFG=CFG,
-                    SET=SET,
-                    active_nodes=active_nodes,
-                    stop_event=stop_event,
-                    stealth_args=stealth_args,
-                    global_clean=global_clean,
-                    cross_seed_target=cross_seed_target
-                )
-                
-                # รีเซ็ตจำนวน Error สะสมเมื่อทำงานสำเร็จครบถ้วน
+                stealth_args = SET.get("stealth_args", {})
+
+                # โหลด mapping
+                mapping_data = await load_mapping()
+
+                # สร้าง inventory จาก torrent ที่อยู่บน node ปัจจุบัน
+                live_hashes = set()
+                source_inventory = {}
+                inventory_nodes_ok = 0
+                inventory_nodes_failed = 0
+                inventory_nodes_expected = len(active_nodes)
+
+                for node_entry in active_nodes:
+                    if isinstance(node_entry, (tuple, list)):
+                        node_obj = node_entry[0] if node_entry else None
+                        node_cfg = (
+                            node_entry[1]
+                            if len(node_entry) > 1
+                            and isinstance(node_entry[1], dict)
+                            else {}
+                        )
+                    else:
+                        node_obj = node_entry
+                        node_cfg = {}
+
+                    node_name = getattr(
+                        node_obj, "name", "Unknown"
+                    )
+
+                    if node_obj is None:
+                        inventory_nodes_failed += 1
+                        print(
+                            "⚠️ [Cross-Seed Inventory] "
+                            "พบ Node entry ที่ไม่มี node object"
+                        )
+                        continue
+
+                    get_torrents = getattr(
+                        node_obj, "get_all_torrents_info", None
+                    )
+
+                    if not callable(get_torrents):
+                        inventory_nodes_failed += 1
+                        print(
+                            f"⚠️ [Cross-Seed Inventory] [{node_name}] "
+                            "ไม่มี get_all_torrents_info()"
+                        )
+                        continue
+
+                    try:
+                        client_torrents = get_torrents()
+
+                        if not isinstance(client_torrents, (list, tuple)):
+                            inventory_nodes_failed += 1
+                            print(
+                                f"⚠️ [Cross-Seed Inventory] [{node_name}] "
+                                "อ่าน inventory ไม่สำเร็จ "
+                                "(API failure / invalid response)"
+                            )
+                            continue
+
+                        # --------------------------------------------
+                        # Temporary per-node inventory.
+                        # Do not modify global inventory until the
+                        # entire node has been processed successfully.
+                        # --------------------------------------------
+                        node_live_hashes = set()
+                        node_source_inventory = {}
+                        node_hash_count = 0
+
+                        for client_torrent in client_torrents:
+                            if not isinstance(client_torrent, dict):
+                                raise TypeError(
+                                    "Invalid torrent entry type"
+                                )
+
+                            torrent_hash = str(
+                                client_torrent.get("hash") or ""
+                            ).strip().upper()
+
+                            if not torrent_hash:
+                                raise ValueError(
+                                    "Torrent entry missing hash"
+                                )
+
+                            node_live_hashes.add(torrent_hash)
+                            node_hash_count += 1
+
+                            # Only fully completed torrents are valid
+                            # Cross-Seed sources.
+                            try:
+                                source_size = int(
+                                    client_torrent.get("size_bytes") or 0
+                                )
+                                amount_left = int(
+                                    client_torrent.get("amount_left", -1)
+                                )
+                                progress = float(
+                                    client_torrent.get("progress", 0.0)
+                                )
+                            except (
+                                TypeError,
+                                ValueError,
+                                OverflowError
+                            ):
+                                continue
+
+                            if (
+                                source_size > 0
+                                and amount_left == 0
+                                and progress >= 0.999999
+                                and str(
+                                    client_torrent.get("save_path") or ""
+                                ).strip()
+                            ):
+                                node_source_inventory.setdefault(
+                                    torrent_hash,
+                                    {
+                                        "node": node_obj,
+                                        "n_cfg": node_cfg,
+                                        "torrent": client_torrent,
+                                    },
+                                )
+
+                        # --------------------------------------------
+                        # Atomic commit: reached only after all
+                        # torrent entries were processed successfully.
+                        # --------------------------------------------
+                        live_hashes.update(node_live_hashes)
+
+                        for torrent_hash, source_record in (
+                            node_source_inventory.items()
+                        ):
+                            source_inventory.setdefault(
+                                torrent_hash,
+                                source_record
+                            )
+
+                        inventory_nodes_ok += 1
+
+                        print(
+                            f"🔎 [Cross-Seed Inventory] [{node_name}] "
+                            f"อ่านได้ {len(client_torrents)} torrents | "
+                            f"มี hash {node_hash_count} รายการ"
+                        )
+
+                    except Exception as inventory_error:
+                        inventory_nodes_failed += 1
+
+                        print(
+                            f"⚠️ [Cross-Seed Inventory] [{node_name}] "
+                            f"{type(inventory_error).__name__}: "
+                            f"{inventory_error} "
+                            "| discard temporary inventory"
+                        )
+
+                if (
+                    inventory_nodes_expected == 0
+                    or inventory_nodes_ok != inventory_nodes_expected
+                    or inventory_nodes_failed != 0
+                ):
+                    # Fail closed: ไม่ใช้ mapping เก่าเมื่ออ่าน inventory ไม่ได้เลย
+                    print(
+                        "❌ [Cross-Seed] อ่าน Inventory ไม่ครบทุก active node "
+                        "จึงยกเลิก Cross-Seed รอบนี้"
+                    )
+                    cross_seed_targets = []
+
+                else:
+                    print(
+                        f"🔎 [Cross-Seed Inventory] "
+                        f"รวม {len(live_hashes)} unique hashes "
+                        f"จาก {inventory_nodes_ok} node(s)"
+                    )
+
+                    # Build Cross-Seed targets only on Cross-Seed cycles.
+                    if cycle_mode == "cross_seed":
+                        cross_seed_targets = build_cross_seed_targets(
+                            mapping_data,
+                            max_targets=10,
+                            active_hashes=live_hashes,
+                            source_inventory=source_inventory,
+                        )
+                    else:
+                        cross_seed_targets = []
+                        print(
+                            "🔎 [Cycle Mode] Normal Search: "
+                            "skip Cross-Seed target construction."
+                        )
+
+                if cycle_mode == "normal":
+
+                    print(
+                        "\n🔎 [Cycle Mode] NORMAL SEARCH "
+                        "— configured sites and target_urls"
+                    )
+
+                    normal_result = await scrape_site_search_nodriver(
+                        CFG=CFG,
+                        SET=SET,
+                        active_nodes=active_nodes,
+                        stop_event=stop_event,
+                        stealth_args=stealth_args,
+                        global_clean=global_clean,
+                        cross_seed_target=None,
+                    )
+
+                    if normal_result is True:
+                        print(
+                            "✅ [Normal Search] "
+                            "Search routine finished."
+                        )
+                    else:
+                        print(
+                            "⚠️ [Normal Search] Unexpected result: "
+                            f"{type(normal_result).__name__}"
+                        )
+
+                else:
+
+                    print("\n🎯 [Cycle Mode] CROSS-SEED")
+
+                    all_cross_seed_matches = []
+
+                    if cross_seed_targets:
+                        print(
+                            f"\n🎯 เริ่ม Cross-seed จำนวน "
+                            f"{len(cross_seed_targets)} เป้าหมาย"
+                        )
+
+                        for index, target in enumerate(cross_seed_targets, start=1):
+                            if stop_event.is_set():
+                                print("🛑 หยุด Cross-seed ตาม stop_event")
+                                break
+
+                            print(
+                                f"\n[{index}/{len(cross_seed_targets)}] "
+                                f"[TARGET] {target['source_site']} | "
+                                f"{target['keyword']} | "
+                                f"{target['target_size_bytes']} bytes"
+                            )
+
+                            result = await scrape_site_search_nodriver(
+                                CFG=CFG,
+                                SET=SET,
+                                active_nodes=active_nodes,
+                                stop_event=stop_event,
+                                stealth_args=stealth_args,
+                                global_clean=global_clean,
+                                cross_seed_target=target
+                            )
+
+                            if isinstance(result, list):
+                                all_cross_seed_matches.extend(result)
+
+                        print(
+                            "\n🎯 [Cross-Seed Summary] "
+                            f"ค้นหา {len(cross_seed_targets)} เป้าหมาย | "
+                            f"พบผลลัพธ์รวม {len(all_cross_seed_matches)} รายการ"
+                        )
+                        await audit_cross_seed_execution_plan(
+                            all_cross_seed_matches, active_nodes
+                        )
+                        _cs_exec_cfg = CFG.get("CROSS_SEED_EXECUTION", {})
+                        if (
+                            isinstance(_cs_exec_cfg, dict)
+                            and _cs_exec_cfg.get("enable_tracker_add") is True
+                        ):
+                            run_opt_in_cross_seed_tracker_additions(
+                                all_cross_seed_matches, active_nodes
+                            )
+                        else:
+                            print(
+                                "🔒 [Cross-Seed Execute] Tracker addition disabled; "
+                                "read-only audit only."
+                            )
+
+                        run_opt_in_new_hash_cross_seed(
+                            all_cross_seed_matches, active_nodes
+                        )
+
+                    else:
+                        print(
+                            "⚠️ ไม่มี Cross-seed target "
+                            "ให้ตรวจสอบ build_cross_seed_targets() และ mapping"
+                        )
+
+                cycle_mode_completed = True
                 consecutive_errors = 0
 
             except Exception as e:
                 consecutive_errors += 1
-                print(f"❌ [Error] การ Scrape ขัดข้อง ({consecutive_errors} ครั้งติดต่อกัน): {e}")
-                
-                # แจ้งเตือนผ่าน Discord/Telegram หากเกิด Error ต่อเนื่อง
+                print(
+                    f"❌ [Error] การ Scrape ขัดข้อง "
+                    f"({consecutive_errors} ครั้งติดต่อกัน): {e}"
+                )
+
                 if consecutive_errors >= 3:
-                    err_msg = f"⚠️ <b>System Alert</b>\nพบข้อผิดพลาดใน Browser Loop ติดต่อกัน {consecutive_errors} ครั้ง\n<code>{e}</code>"
+                    err_msg = (
+                        f"⚠️ <b>System Alert</b>\n"
+                        f"พบข้อผิดพลาดใน Browser Loop ติดต่อกัน "
+                        f"{consecutive_errors} ครั้ง\n"
+                        f"<code>{e}</code>"
+                    )
                     asyncio.create_task(send_notify(err_msg))
+
+            # Switch only after a search branch actually started.
+            if cycle_mode_completed:
+                previous_cycle_mode = cycle_mode
+
+                cycle_mode = (
+                    "normal"
+                    if cycle_mode == "cross_seed"
+                    else "cross_seed"
+                )
+
+                print(
+                    f"🔁 [Cycle Scheduler] "
+                    f"previous={previous_cycle_mode.upper()} | "
+                    f"next={cycle_mode.upper()}"
+                )
+            else:
+                print(
+                    f"↩️ [Cycle Scheduler] Search branch did not complete; "
+                    f"keep={cycle_mode.upper()}"
+                )
 
             #รันรายงานสถิติ (ยิง api ตรง)
             stats_report = format_site_stats_report([n[0] for n in active_nodes])
@@ -6324,6 +11219,125 @@ async def main():
             print(f"🚨 [Global Critical Error] บอทหลุดนอกลูปหลัก: {global_err}")
             await asyncio.sleep(30)
             
+
+    # GRACEFUL_SHUTDOWN_CLEANUP_V1
+    print("\n🧹 [Shutdown] Main Loop หยุดแล้ว; เริ่ม Cleanup...")
+
+    # รอ Browser background task ที่ทราบว่ามีการสร้างไว้
+    current_task = asyncio.current_task()
+    browser_tasks = []
+
+    for task in asyncio.all_tasks():
+        if task is current_task or task.done():
+            continue
+
+        try:
+            coro_name = getattr(
+                task.get_coro(),
+                "__qualname__",
+                ""
+            )
+        except Exception:
+            coro_name = ""
+
+        if "handle_thanks_click" in coro_name:
+            browser_tasks.append(task)
+
+    browser_tasks_pending = False
+
+    if browser_tasks:
+        print(
+            f"⏳ [Shutdown] รอ Browser background tasks "
+            f"{len(browser_tasks)} งาน..."
+        )
+
+        _, pending_browser_tasks = await asyncio.wait(
+            browser_tasks,
+            timeout=10
+        )
+
+        browser_tasks_pending = bool(pending_browser_tasks)
+
+    browser_cleanup_ok = False
+    profile_cleanup_ok = False
+
+    if browser_tasks_pending:
+        print(
+            "🔒 [Shutdown] ยังมี Browser task ทำงานอยู่ "
+            "งดปิด Browser/Profile/Xvfb เพื่อป้องกันการชนกัน"
+        )
+
+    else:
+        # ใช้ Reference ที่ระบบติดตามอยู่
+        browser_to_stop = (
+            browser_instance
+            if browser_instance is not None
+            else globals().get("_active_browser_instance")
+        )
+
+        if browser_to_stop is not None:
+            print("⏳ [Shutdown] กำลัง Stop Browser...")
+
+            try:
+                stop_fn = getattr(browser_to_stop, "stop", None)
+
+                if callable(stop_fn):
+                    stop_fn()
+                    await asyncio.sleep(0.25)
+
+            except Exception as exc:
+                print(
+                    f"⚠️ [Shutdown] Browser stop แจ้งข้อผิดพลาด: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        # ฟังก์ชันนี้ตรวจสอบ PID และ Profile ตามระบบเดิม
+        try:
+            browser_cleanup_ok = bool(kill_specific_browser())
+        except Exception as exc:
+            print(
+                f"⚠️ [Shutdown] Browser verification error: {exc}"
+            )
+
+        # ฟังก์ชันนี้จะไม่ลบ Profile หากยังมี Chrome ใช้อยู่
+        try:
+            profile_cleanup_ok = bool(await cleanup_profile())
+        except Exception as exc:
+            print(
+                f"⚠️ [Shutdown] Profile cleanup error: {exc}"
+            )
+
+        if browser_cleanup_ok and profile_cleanup_ok:
+            try:
+                kill_xvfb()
+                browser_instance = None
+
+                print(
+                    "✅ [Shutdown] Browser/Profile/Xvfb "
+                    "Cleanup เสร็จสมบูรณ์"
+                )
+
+            except Exception as exc:
+                print(
+                    f"⚠️ [Shutdown] Xvfb cleanup error: {exc}"
+                )
+
+        else:
+            print(
+                "🔒 [Shutdown] ไม่สามารถยืนยันการปิดทรัพยากรได้ครบ "
+                "จึงคงทรัพยากรที่เหลือไว้เพื่อความปลอดภัย"
+            )
+
+    # แจ้งเตือนหลังจัดการ Cleanup แล้ว
+    try:
+        await send_notify(
+            "🛑 Universal Auto-Pilot : Graceful Shutdown"
+        )
+    except Exception as exc:
+        print(f"⚠️ [Shutdown] Notification error: {exc}")
+
+    print("👋 [Shutdown] Main coroutine จบการทำงาน")
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
