@@ -2233,8 +2233,22 @@ class QbitNode:
         self.name, self.url = cfg["name"], cfg["url"].rstrip("/")
         self.user, self.pw = cfg["qb_user"], cfg["qb_pass"]
         self.quota_gb = cfg.get("quota_gb", 0)
+
+        # Provider quota telemetry (GiB, binary units).
+        # None means no verified provider quota sample yet.
+        self.quota_total_gb = None
+        self.quota_used_gb = None
+        self.quota_free_gb = None
         
-        self.auth = (self.user, self.pw) if cfg.get("nginx") else None
+        self.provider_sso = cfg.get("provider_sso") is True
+        self.provider_user = str(cfg.get("provider_user") or "").strip()
+        self.provider_pw = str(cfg.get("provider_pass") or "")
+
+        self.auth = (
+            (self.user, self.pw)
+            if cfg.get("nginx") and not self.provider_sso
+            else None
+        )
         
         self.s = requests.Session()
         self.s.auth = self.auth 
@@ -2252,7 +2266,7 @@ class QbitNode:
         
         self.is_connected = False
         self.jobs = 0
-        self.stat_msg = "Active/Total: 0/0"
+        self.stat_msg = "API UNKNOWN: Not authenticated"
     
     def _execute_request(self, method, url, **kwargs):
         # 1. จัดการ Headers
@@ -2275,124 +2289,742 @@ class QbitNode:
             print(f"⚠️ [{self.name}] Network Error in {method} {url}: {e}")
             return None
 
+
+
+
+    def _login_provider_sso(self):
+        """OnlyOne Provider login -> Dashboard SSO -> qBittorrent SID."""
+
+        self.is_connected = False
+        self.s.cookies.clear()
+
+        def fail(reason):
+            self.is_connected = False
+            self.free_gb = 0.0
+            self.stat_msg = f"API ERROR: Provider SSO: {reason}"
+            print(f"⚠️ [{self.name}] Provider SSO failed: {reason}")
+            return False
+
+        try:
+            if not self.provider_user or not self.provider_pw:
+                return fail("Provider credentials missing")
+
+            parsed = urllib.parse.urlsplit(self.url)
+
+            if not parsed.scheme or not parsed.netloc:
+                return fail("Invalid qBittorrent URL")
+
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            qbit_path = parsed.path.rstrip("/")
+            suffix = "/qbittorrent"
+
+            if not qbit_path.endswith(suffix):
+                return fail("URL path must end with /qbittorrent")
+
+            account_path = qbit_path[:-len(suffix)].rstrip("/")
+
+            if not account_path:
+                return fail("Cannot determine account path")
+
+            account_next = account_path + "/"
+
+            login_url = (
+                origin
+                + "/login.php?"
+                + urllib.parse.urlencode({"next": account_next})
+            )
+
+            # Stage 1: Provider login form
+            page = self._execute_request(
+                "GET",
+                login_url,
+                timeout=15,
+                allow_redirects=False
+            )
+
+            if page is None or page.status_code != 200:
+                return fail(
+                    f"Provider login page HTTP "
+                    f"{getattr(page, 'status_code', None)}"
+                )
+
+            content_type = str(
+                page.headers.get("Content-Type", "")
+            ).casefold()
+
+            if "html" not in content_type:
+                return fail("Provider login page is not HTML")
+
+            soup = BeautifulSoup(page.text, "html.parser")
+            form = None
+
+            for candidate in soup.find_all("form"):
+                action = urllib.parse.urljoin(
+                    login_url,
+                    candidate.get("action") or login_url
+                )
+                action_parts = urllib.parse.urlsplit(action)
+
+                if (
+                    action_parts.hostname
+                    and action_parts.hostname.casefold()
+                    == parsed.hostname.casefold()
+                    and action_parts.path == "/login.php"
+                    and candidate.get("method", "get").upper() == "POST"
+                ):
+                    form = candidate
+                    break
+
+            if form is None:
+                return fail("Provider POST login form not found")
+
+            fields = {}
+
+            for item in form.find_all("input"):
+                name = item.get("name")
+                if name:
+                    fields[name] = item.get("value", "")
+
+            if not fields.get("_csrf") or "next" not in fields:
+                return fail("Provider CSRF/next field missing")
+
+            fields["username"] = self.provider_user
+            fields["password"] = self.provider_pw
+
+            action = urllib.parse.urljoin(
+                login_url,
+                form.get("action") or login_url
+            )
+
+            provider_response = self._execute_request(
+                "POST",
+                action,
+                data=fields,
+                headers={
+                    "Origin": origin,
+                    "Referer": login_url
+                },
+                timeout=20,
+                allow_redirects=True
+            )
+
+            if provider_response is None:
+                return fail("Provider login network failure")
+
+            if provider_response.status_code != 200:
+                return fail(
+                    f"Provider login HTTP {provider_response.status_code}"
+                )
+
+            final_provider = urllib.parse.urlsplit(
+                provider_response.url
+            )
+
+            if (
+                final_provider.hostname.casefold()
+                != parsed.hostname.casefold()
+                or not (
+                    final_provider.path == account_path
+                    or final_provider.path.startswith(account_path + "/")
+                )
+            ):
+                return fail("Unexpected Provider redirect")
+
+            if not any(
+                c.name == "oos_sid"
+                for c in self.s.cookies
+            ):
+                return fail("Provider oos_sid not established")
+
+            print(
+                f"✅ [{self.name}] Provider Dashboard session established"
+            )
+
+            # Stage 2: Dashboard SSO hand-off.
+            go_url = origin + account_path + "/go/qbittorrent"
+
+            go_response = self._execute_request(
+                "GET",
+                go_url,
+                headers={
+                    "Referer": origin + account_path + "/"
+                },
+                timeout=20,
+                allow_redirects=True
+            )
+
+            if go_response is None:
+                return fail("qBittorrent SSO hand-off unavailable")
+
+            final_qbit = urllib.parse.urlsplit(go_response.url)
+
+            if (
+                go_response.status_code != 200
+                or final_qbit.hostname.casefold()
+                != parsed.hostname.casefold()
+                or final_qbit.path.rstrip("/") != qbit_path
+            ):
+                return fail(
+                    f"SSO hand-off rejected "
+                    f"(HTTP {go_response.status_code})"
+                )
+
+            if not any(
+                c.name == "SID"
+                for c in self.s.cookies
+            ):
+                return fail("qBittorrent SID not established")
+
+            print(
+                f"✅ [{self.name}] Dashboard SSO issued qBittorrent SID"
+            )
+
+            # Stage 3: Verify actual qBittorrent API.
+            version_response = self._execute_request(
+                "GET",
+                f"{self.url}/api/v2/app/version",
+                timeout=15,
+                allow_redirects=False
+            )
+
+            if (
+                version_response is None
+                or version_response.status_code != 200
+            ):
+                return fail(
+                    f"Version API HTTP "
+                    f"{getattr(version_response, 'status_code', None)}"
+                )
+
+            version = str(
+                version_response.text or ""
+            ).strip()
+
+            version_type = str(
+                version_response.headers.get("Content-Type", "")
+            ).casefold()
+
+            if (
+                "html" in version_type
+                or not re.fullmatch(
+                    r"v?\d+\.\d+\.\d+(?:[-+][^\s]*)?",
+                    version
+                )
+            ):
+                return fail("Invalid qBittorrent version response")
+
+            self.is_connected = True
+
+            print(
+                f"✅ [{self.name}] Provider SSO verified: "
+                f"qBittorrent={version}, Cookies=oos_sid+SID"
+            )
+            return True
+
+        except Exception as e:
+            return fail(f"{type(e).__name__}: {e}")
+
     def login(self):
+        if self.provider_sso:
+            return self._login_provider_sso()
+
+        self.is_connected = False
+
         try:
             self.s.cookies.clear()
-            
-            # การล็อกอินเข้า qBittorrent: 
-            # 1. ส่ง auth=self.auth เพื่อผ่านด่าน Nginx Basic Auth
-            # 2. ส่ง data={"username": ..., "password": ...} เพื่อ Login เข้า Web UI
+
+            parsed = urllib.parse.urlsplit(self.url)
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            referer = self.url.rstrip("/") + "/"
+
             r = self._execute_request(
-                'POST',
-                f"{self.url}/api/v2/auth/login", 
-                data={"username": self.user, "password": self.pw}, 
-                headers = {'Referer': self.url, 'Origin': self.url},
-                timeout=10
+                "POST",
+                f"{self.url}/api/v2/auth/login",
+                data={
+                    "username": self.user,
+                    "password": self.pw
+                },
+                headers={
+                    "Referer": referer,
+                    "Origin": origin
+                },
+                timeout=10,
+                allow_redirects=False
             )
 
             if r is None:
-                self.is_connected = False
+                self.stat_msg = "API ERROR: Login network failure"
+                self.free_gb = 0.0
                 return False
 
-            # ตรวจสอบสถานะ: qBittorrent ปกติจะตอบ 200 หรือ 204
-            if r.status_code in [200, 204]:
-                has_sid = any("SID" in cookie.name for cookie in self.s.cookies)
-                is_ok_text = "Ok." in r.text
-                
-                self.is_connected = has_sid or is_ok_text
-                
-                if self.is_connected:
-                    print(f"✅ [{self.name}] Login successful! (SID: {has_sid}, Text: {is_ok_text})")
-                else:
-                    print(f"⚠️ [{self.name}] Login accepted but session not found. Response: {r.text[:50]}")
-            
-            elif r.status_code == 403:
-                print(f"❌ [{self.name}] Login failed: 403 Forbidden (Check CSRF/Referer/Origin headers)")
+            content_type = str(
+                r.headers.get("Content-Type", "")
+            ).casefold()
+
+            body = str(r.text or "").lstrip().casefold()
+
+            is_html = (
+                "text/html" in content_type
+                or body.startswith(("<!doctype html", "<html"))
+            )
+
+            cookie_names = [
+                cookie.name for cookie in self.s.cookies
+            ]
+
+            # qBittorrent <= 5.1: SID
+            # qBittorrent >= 5.2: QBT_SID_<WebUI port>
+            has_session_cookie = any(
+                name == "SID"
+                or re.fullmatch(r"QBT_SID_\d+", name)
+                for name in cookie_names
+            )
+
+            if (
+                r.status_code not in (200, 204)
+                or is_html
+                or not has_session_cookie
+            ):
+                location_info = ""
+
+                location = r.headers.get("Location", "")
+                if location:
+                    try:
+                        target = urllib.parse.urlsplit(
+                            urllib.parse.urljoin(
+                                self.url.rstrip("/") + "/",
+                                location
+                            )
+                        )
+
+                        host = target.hostname or ""
+                        port = (
+                            f":{target.port}"
+                            if target.port else ""
+                        )
+
+                        location_info = (
+                            f"{host}{port}{target.path}"
+                        )
+                    except Exception:
+                        location_info = "unparseable"
+
                 self.is_connected = False
-            elif r.status_code == 401:
-                print(f"❌ [{self.name}] Login failed: 401 Unauthorized (Check Username/Password)")
+                self.free_gb = 0.0
+                self.stat_msg = (
+                    f"API ERROR: Login rejected "
+                    f"(HTTP {r.status_code})"
+                )
+
+                print(
+                    f"⚠️ [{self.name}] Login rejected: "
+                    f"HTTP={r.status_code}, "
+                    f"CookieNames={cookie_names!r}, "
+                    f"Set-Cookie={bool(r.headers.get('Set-Cookie'))}, "
+                    f"HTML={is_html}, "
+                    f"Location={location_info!r}"
+                )
+                return False
+
+            # Verify the session against a read-only qBittorrent API.
+            version_response = self._execute_request(
+                "GET",
+                f"{self.url}/api/v2/app/version",
+                timeout=10,
+                allow_redirects=False
+            )
+
+            if (
+                version_response is None
+                or version_response.status_code != 200
+            ):
                 self.is_connected = False
-            else:
-                print(f"⚠️ [{self.name}] Login failed with unexpected status: {r.status_code}")
+                self.free_gb = 0.0
+                self.stat_msg = (
+                    "API ERROR: Session verification failed"
+                )
+
+                print(
+                    f"⚠️ [{self.name}] Session verification failed: "
+                    f"HTTP={getattr(version_response, 'status_code', None)}"
+                )
+                return False
+
+            version_content_type = str(
+                version_response.headers.get(
+                    "Content-Type", ""
+                )
+            ).casefold()
+
+            version_text = str(
+                version_response.text or ""
+            ).strip()
+
+            if (
+                "text/html" in version_content_type
+                or not re.match(
+                    r"^v?\d+\.\d+(?:\.\d+)?(?:[-+][^\s]*)?$",
+                    version_text
+                )
+            ):
                 self.is_connected = False
-                
-            return self.is_connected
+                self.free_gb = 0.0
+                self.stat_msg = (
+                    "API ERROR: Invalid version response"
+                )
+
+                print(
+                    f"⚠️ [{self.name}] Invalid app/version response: "
+                    f"Content-Type={version_content_type!r}, "
+                    f"HTML={version_text[:20].casefold().startswith('<!doctype html')}"
+                )
+                return False
+
+            self.is_connected = True
+
+            print(
+                f"✅ [{self.name}] Login successful: "
+                f"qBittorrent={version_text}, "
+                f"CookieType="
+                f"{'SID' if 'SID' in cookie_names else 'QBT_SID'}"
+            )
+            return True
 
         except Exception as e:
-            print(f" ⚠️ [{self.name}] Login Exception: {e}")
             self.is_connected = False
+            self.free_gb = 0.0
+            self.stat_msg = "API ERROR: Login exception"
+
+            print(
+                f"⚠️ [{self.name}] Login Exception: "
+                f"{type(e).__name__}: {e}"
+            )
             return False
+    def _get_provider_quota_bytes(self, retry_auth=True):
+        """
+        Read verified account quota from Provider Dashboard.
+        Returns (used_bytes, total_bytes).
+
+        This is read-only. It does not modify torrents or storage.
+        """
+        if not self.provider_sso:
+            raise RuntimeError("Provider SSO is not enabled")
+
+        parsed = urllib.parse.urlsplit(self.url)
+
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError("Invalid qBittorrent URL")
+
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        qbit_path = parsed.path.rstrip("/")
+        suffix = "/qbittorrent"
+
+        if not qbit_path.endswith(suffix):
+            raise ValueError(
+                "Provider qBittorrent URL must end with /qbittorrent"
+            )
+
+        account_path = qbit_path[:-len(suffix)].rstrip("/")
+
+        if not account_path:
+            raise ValueError("Cannot determine Provider account path")
+
+        endpoint = (
+            origin + account_path + "/api/tenant/stats"
+        )
+
+        response = self._execute_request(
+            "GET",
+            endpoint,
+            headers={
+                "Accept": "application/json",
+                "Referer": origin + account_path + "/",
+            },
+            timeout=15,
+            allow_redirects=False,
+        )
+
+        if response is None:
+            raise RuntimeError("Provider quota network failure")
+
+        if response.status_code in (401, 403):
+            if retry_auth and self.login():
+                return self._get_provider_quota_bytes(
+                    retry_auth=False
+                )
+
+            raise RuntimeError(
+                f"Provider quota authentication HTTP "
+                f"{response.status_code}"
+            )
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Provider quota HTTP {response.status_code}"
+            )
+
+        content_type = str(
+            response.headers.get("Content-Type", "")
+        ).casefold()
+
+        if "json" not in content_type:
+            raise ValueError(
+                "Provider quota response is not JSON"
+            )
+
+        payload = response.json()
+
+        if not isinstance(payload, dict):
+            raise TypeError("Provider stats payload is invalid")
+
+        quota = payload.get("quota")
+
+        if not isinstance(quota, dict):
+            raise ValueError("Provider quota object is missing")
+
+        if quota.get("ok") is not True:
+            raise ValueError("Provider quota status is not OK")
+
+        used_bytes = quota.get("used")
+        total_bytes = quota.get("total")
+
+        if (
+            isinstance(used_bytes, bool)
+            or not isinstance(used_bytes, int)
+            or isinstance(total_bytes, bool)
+            or not isinstance(total_bytes, int)
+        ):
+            raise TypeError(
+                "Provider quota values must be integer bytes"
+            )
+
+        if total_bytes <= 0:
+            raise ValueError("Provider quota total is invalid")
+
+        if used_bytes < 0 or used_bytes > total_bytes:
+            raise ValueError("Provider quota used is out of range")
+
+        return used_bytes, total_bytes
+
 
     def refresh_status(self, retry_login=True):
-        if not self.is_connected:
+
+        def fail(message, disconnect=True):
+            if disconnect:
+                self.is_connected = False
+
+            self.stat_msg = f"API ERROR: {message}"
+            self.free_gb = 0.0
             return False
-        
+
+        if not self.is_connected:
+            return fail("Not authenticated")
+
         try:
-            # 1. ดึงข้อมูล Maindata
-            r_main = self._execute_request('GET', f"{self.url}/api/v2/sync/maindata", timeout=10)
-            
-            # ตรวจสอบ Session Expired / Unauthorized
-            if r_main is None or r_main.status_code in [401, 403]:
+            r_main = self._execute_request(
+                "GET",
+                f"{self.url}/api/v2/sync/maindata",
+                timeout=10,
+                allow_redirects=False
+            )
+
+            if r_main is None or r_main.status_code in (401, 403):
+                self.is_connected = False
+
                 if retry_login:
-                    print(f" 🔄 [{self.name}] Session expired, re-logging...")
-                    return self.login() and self.refresh_status(retry_login=False)
-                return False
+                    print(
+                        f"🔄 [{self.name}] "
+                        "Session unavailable; retry login"
+                    )
+
+                    if self.login():
+                        return self.refresh_status(
+                            retry_login=False
+                        )
+
+                return fail("maindata unavailable")
 
             if r_main.status_code != 200:
-                print(f"⚠️ [{self.name}] Sync maindata failed with status: {r_main.status_code}")
-                return False
+                return fail(
+                    f"maindata HTTP {r_main.status_code}"
+                )
 
             try:
                 main_data = r_main.json()
-                server_state = main_data.get('server_state', {})
-            except Exception as e:
-                print(f"⚠️ [{self.name}] Failed to parse maindata JSON: {e}")
-                return False
 
-            # 2. ดึงลิสต์ทอร์เรนต์ทั้งหมด
-            r_torrents = self._execute_request('GET', f"{self.url}/api/v2/torrents/info", timeout=15)
-            if r_torrents is None or r_torrents.status_code in [401, 403]:
+                if not isinstance(main_data, dict):
+                    raise TypeError("maindata is not a dictionary")
+
+                server_state = main_data.get("server_state")
+
+                if not isinstance(server_state, dict):
+                    raise TypeError("server_state is invalid")
+
+                raw_free = server_state.get("free_space_on_disk")
+
+                if raw_free is None:
+                    raise ValueError(
+                        "free_space_on_disk missing"
+                    )
+
+                real_disk_free_bytes = int(raw_free)
+
+                if real_disk_free_bytes < 0:
+                    raise ValueError(
+                        "free_space_on_disk is negative"
+                    )
+
+            except Exception as e:
+                print(
+                    f"⚠️ [{self.name}] Invalid maindata: "
+                    f"{type(e).__name__}: {e}"
+                )
+                return fail("Invalid maindata payload")
+
+            r_torrents = self._execute_request(
+                "GET",
+                f"{self.url}/api/v2/torrents/info",
+                timeout=15,
+                allow_redirects=False
+            )
+
+            if r_torrents is None or r_torrents.status_code in (401, 403):
+                self.is_connected = False
+
                 if retry_login:
-                    return self.login() and self.refresh_status(retry_login=False)
-                return False
+                    print(
+                        f"🔄 [{self.name}] "
+                        "Torrent session unavailable; retry login"
+                    )
+
+                    if self.login():
+                        return self.refresh_status(
+                            retry_login=False
+                        )
+
+                return fail("torrent inventory unavailable")
 
             if r_torrents.status_code != 200:
-                print(f"⚠️ [{self.name}] Torrents info failed with status: {r_torrents.status_code}")
-                return False
+                return fail(
+                    f"torrents/info HTTP {r_torrents.status_code}"
+                )
 
             try:
                 torrents = r_torrents.json()
+
+                if not isinstance(torrents, list):
+                    raise TypeError(
+                        "torrents/info response is not a list"
+                    )
+
+                if any(
+                    not isinstance(item, dict)
+                    for item in torrents
+                ):
+                    raise TypeError(
+                        "invalid torrent entry"
+                    )
+
             except Exception as e:
-                print(f"⚠️ [{self.name}] Failed to parse torrents JSON: {e}")
-                return False
-            
-            # นับจำนวนทอร์เรนต์ทั้งหมด
-            active_count = len(torrents) if isinstance(torrents, list) else 0
-            
-            # 3. คำนวณพื้นที่
-            capacity_limit_gb = getattr(self, 'total_disk_gb', self.quota_gb) 
-            real_disk_free_gb = server_state.get('free_space_on_disk', 0) / (1024**3)
-            used_gb = max(0.0, capacity_limit_gb - real_disk_free_gb)
-            quota_free_gb = max(0.0, self.quota_gb - used_gb)
-            
-            # 4. สรุปผล
-            safety_buffer = 15.0
-            display_free = min(quota_free_gb, real_disk_free_gb)
-            
-            self.stat_msg = (
-                f"FREE(Q): {quota_free_gb:.1f}GB | FREE(D): {real_disk_free_gb:.1f}GB | "
-                f"Total: {active_count} | Used: {used_gb:.1f}G / {self.quota_gb:.0f}G | "
-                f"Safe: {max(0.0, display_free - safety_buffer):.1f}G"
+                print(
+                    f"⚠️ [{self.name}] Invalid torrent response: "
+                    f"{type(e).__name__}: {e}"
+                )
+                return fail("Invalid torrent inventory")
+
+            active_count = len(torrents)
+
+            real_disk_free_gb = (
+                real_disk_free_bytes / (1024 ** 3)
             )
 
-            self.free_gb = max(0.0, display_free - safety_buffer)
-            
-            return True
-            
-        except Exception as e:
-            print(f"⚠️ [{self.name}] qBittorrent Refresh Error: {e}")
-            return False
+            safety_buffer = 15.0
 
+            if self.provider_sso:
+                # Provider quota is authoritative for account usage.
+                # Do not infer account usage from shared filesystem free.
+                try:
+                    used_bytes, total_bytes = (
+                        self._get_provider_quota_bytes()
+                    )
+                except Exception as quota_error:
+                    return fail(
+                        "Provider quota unavailable: "
+                        f"{type(quota_error).__name__}: {quota_error}",
+                        disconnect=False
+                    )
+
+                used_gb = used_bytes / (1024 ** 3)
+                quota_total_gb = total_bytes / (1024 ** 3)
+                quota_free_gb = (
+                    total_bytes - used_bytes
+                ) / (1024 ** 3)
+
+                self.quota_used_gb = used_gb
+                self.quota_total_gb = quota_total_gb
+                self.quota_free_gb = quota_free_gb
+
+                display_free = min(
+                    quota_free_gb,
+                    real_disk_free_gb
+                )
+
+                self.stat_msg = (
+                    f"FREE(Q): {quota_free_gb:.1f}GiB | "
+                    f"FREE(D): {real_disk_free_gb:.1f}GiB | "
+                    f"Total: {active_count} | "
+                    f"Used: {used_gb:.1f}GiB / "
+                    f"{quota_total_gb:.1f}GiB | "
+                    f"Safe: "
+                    f"{max(0.0, display_free - safety_buffer):.1f}GiB"
+                )
+
+            else:
+                # Preserve existing accounting for other qBittorrent nodes.
+                capacity_limit_gb = getattr(
+                    self,
+                    "total_disk_gb",
+                    self.quota_gb
+                )
+
+                used_gb = max(
+                    0.0,
+                    capacity_limit_gb - real_disk_free_gb
+                )
+
+                quota_free_gb = max(
+                    0.0,
+                    self.quota_gb - used_gb
+                )
+
+                display_free = min(
+                    quota_free_gb,
+                    real_disk_free_gb
+                )
+
+                self.stat_msg = (
+                    f"FREE(Q): {quota_free_gb:.1f}GB | "
+                    f"FREE(D): {real_disk_free_gb:.1f}GB | "
+                    f"Total: {active_count} | "
+                    f"Used: {used_gb:.1f}G / "
+                    f"{self.quota_gb:.0f}G | "
+                    f"Safe: "
+                    f"{max(0.0, display_free - safety_buffer):.1f}G"
+                )
+
+            self.free_gb = max(
+                0.0,
+                display_free - safety_buffer
+            )
+
+            return True
+
+        except Exception as e:
+            print(
+                f"⚠️ [{self.name}] qBittorrent Refresh Error: "
+                f"{type(e).__name__}: {e}"
+            )
+            return fail("refresh exception")
     def add(self, content, site_name="Universal", size=None, n_cfg=None, save_path=None, skip_checking=False, tags="AutoPilot", paused=False, cross_seed=False):
         """
         เพิ่ม Torrent เข้า qBittorrent รองรับทั้ง Normal Grab และ Cross-Seed Mode
@@ -2505,7 +3137,8 @@ class QbitNode:
                 params={'filter': 'all'},
                 auth=self.auth,
                 verify=False,
-                timeout=15
+                timeout=15,
+                allow_redirects=False
             )
 
             if r is None or r.status_code != 200:
@@ -2991,30 +3624,67 @@ class QbitNode:
             print(f" ⚠️ [{self.name}] Stop Error for {hash_str}: {e}")
             return False
 
+
     def reannounce_all(self):
-        """ สั่ง Re-announce ทุก Torrent (หรือเฉพาะที่กำลังโหลด) """
-        try:
-            # ใช้ _execute_request เพื่อรวมมาตรฐานการเชื่อมต่อทั้งหมด
-            # ไม่ต้องใส่ auth, verify หรือ headers ที่ซ้ำซ้อน
-            r = self._execute_request(
-                'POST', 
-                f"{self.url}/api/v2/torrents/reannounce", 
-                data={"hashes": "all"}, 
-                headers={'Referer': self.url},
-                timeout=15
+        """Submit re-announce request only with a valid session."""
+
+        if not self.is_connected:
+            print(
+                f"⏭️ [{self.name}] Re-announce skipped: "
+                "not authenticated"
             )
-            
-            if r is not None and r.status_code == 200:
-                return True
-            
-            # ตรวจสอบสถานะการเชื่อมต่อหากมีการปฏิเสธสิทธิ์
-            if r is not None and r.status_code in [401, 403]:
-                self.is_connected = False
-                
-            return False
-        except Exception:
             return False
 
+        try:
+            r = self._execute_request(
+                "POST",
+                f"{self.url}/api/v2/torrents/reannounce",
+                data={"hashes": "all"},
+                headers={"Referer": self.url.rstrip("/") + "/"},
+                timeout=15,
+                allow_redirects=False
+            )
+
+            if r is None:
+                return False
+
+            if r.status_code in (401, 403):
+                self.is_connected = False
+                self.stat_msg = (
+                    "API ERROR: Re-announce session rejected"
+                )
+                self.free_gb = 0.0
+                return False
+
+            content_type = str(
+                r.headers.get("Content-Type", "")
+            ).casefold()
+
+            body = str(r.text or "").lstrip().casefold()
+
+            is_html = (
+                "text/html" in content_type
+                or body.startswith(("<!doctype html", "<html"))
+            )
+
+            if r.status_code != 200 or is_html:
+                print(
+                    f"⚠️ [{self.name}] Re-announce rejected: "
+                    f"HTTP={r.status_code}, "
+                    f"Content-Type={content_type!r}"
+                )
+                return False
+
+            # HTTP 200 means API accepted the request.
+            # It does not prove tracker/peer communication succeeded.
+            return True
+
+        except Exception as e:
+            print(
+                f"⚠️ [{self.name}] Re-announce exception: "
+                f"{type(e).__name__}: {e}"
+            )
+            return False
     async def sync_to_mapping(self, web_data_list=None, mapper_func=None):
         """
         ดึงข้อมูลทอร์เรนต์ทั้งหมดจาก qBittorrent แล้วอัปเดตลง JSON Mapping (Async)
@@ -3390,26 +4060,50 @@ def _extract_torrent_info_hash(content):
 
 
 def update_trackers(node):
-    """ สั่งให้ Node อัปเดตข้อมูลไปยัง Tracker """
-    try:
-        # สมมติว่าคุณเพิ่ม method reannounce_all ใน Class ไว้แล้วตามที่คุยกันก่อนหน้า
-        if hasattr(node, 'reannounce_all'):
-            if node.reannounce_all():
-                print(f"  ✅ [{node.name}] Trackers re-announced.")
-                return True
-        else:
-            # กรณีไม่ได้เพิ่ม method ใน class สามารถใช้ logic นี้แทนได้
-            if isinstance(node, QbitNode):
-                node.s.post(f"{node.url}/api/v2/torrents/reannounce", data={"hashes": "all"}, auth=node.auth, timeout=10)
-            elif isinstance(node, RtorrentNode):
-                # logic rtorrent re-announce
-                pass
-            print(f"  ✅ [{node.name}] Sent re-announce request.")
-    except Exception as e:
-        print(f"  ⚠️ [{node.name}] Update trackers failed: {e}")
-    return False
+    """Submit one guarded re-announce request per node."""
 
-# ========================= ADD TORRENT =========================
+    try:
+        if getattr(node, "is_connected", True) is False:
+            print(
+                f"⏭️ [{node.name}] Re-announce skipped: "
+                "node is disconnected"
+            )
+            return False
+
+        reannounce = getattr(
+            node,
+            "reannounce_all",
+            None
+        )
+
+        if not callable(reannounce):
+            print(
+                f"⚠️ [{node.name}] "
+                "No re-announce implementation"
+            )
+            return False
+
+        success = bool(reannounce())
+
+        if success:
+            print(
+                f"✅ [{node.name}] "
+                "Re-announce request accepted"
+            )
+        else:
+            print(
+                f"⚠️ [{node.name}] "
+                "Re-announce request failed"
+            )
+
+        return success
+
+    except Exception as e:
+        print(
+            f"⚠️ [{getattr(node, 'name', 'Unknown')}] "
+            f"Update trackers failed: {type(e).__name__}: {e}"
+        )
+        return False
 
 def safe_add_torrent(node, content, site):
     # ตรวจสอบก่อนว่ามันเป็น callable หรือไม่
@@ -6838,7 +7532,20 @@ def get_node_dynamic_cap(node, disk_type):
 
     # --- [ปรับปรุง Space Factor: สายเปย์] ---
     # ยอมให้รับงานหนักได้จนถึงพื้นที่เหลือ 30%
-    free_percent = (node.free_gb / (node.quota_gb or 1000)) * 100
+    quota_basis_gb = getattr(
+        node, "quota_total_gb", None
+    )
+
+    if (
+        isinstance(quota_basis_gb, bool)
+        or not isinstance(quota_basis_gb, (int, float))
+        or quota_basis_gb <= 0
+    ):
+        quota_basis_gb = node.quota_gb or 1000
+
+    free_percent = (
+        node.free_gb / quota_basis_gb
+    ) * 100
 
     if free_percent > 60:
         space_factor = 6.0   # เร่งเครื่องเต็มสูบ
@@ -6863,20 +7570,28 @@ def get_node_dynamic_cap(node, disk_type):
     reduction_factor = {'NVME': 15, 'SSD': 10, 'HYBRID': 7, 'HDD': 5}.get(disk_type, 5)
     latency_cap = int(base / (1 + (proxy_wait / reduction_factor)))
 
+    calculated_cap = int(latency_cap * space_factor)
+
+    # Provider nodes must stop when quota space reaches the safety stop.
+    # Preserve the historical minimum-cap behavior for other nodes.
+    if getattr(node, "provider_sso", False) and space_factor <= 0:
+        final_cap = 0
+    else:
+        final_cap = max(3, calculated_cap)
+
     print(
         f"[CAP AUDIT] [{node.name}] "
         f"disk={disk_type} "
         f"latency_cap={latency_cap} "
         f"space_factor={space_factor} "
         f"free={node.free_gb:.1f}GB "
-        f"quota={node.quota_gb}GB "
+        f"quota={quota_basis_gb:.1f}GB "
         f"free_pct={free_percent:.1f}% "
         f"pending={pending_gb:.1f}GB "
         f"proxy_wait={proxy_wait:.2f} "
-        f"final_cap={max(3, int(latency_cap * space_factor))}"
+        f"final_cap={final_cap}"
     )
-    # ปรับจังหวะสุดท้าย: การันตีขั้นต่ำ 3 งานเสมอสำหรับ Node ที่ยังไม่ตาย
-    return max(3, int(latency_cap * space_factor)), proxy_wait
+    return final_cap, proxy_wait
 
 
 def get_node_current_weight(node):
@@ -11327,7 +12042,6 @@ async def main():
                     if hasattr(node, '_sweeper_force_start'):
                         node._sweeper_force_start()
 
-                    node.reannounce_all()
                     node.refresh_status()
                     
                     await node.sync_to_mapping()
