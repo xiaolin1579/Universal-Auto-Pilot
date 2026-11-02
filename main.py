@@ -317,35 +317,205 @@ def add_hash_to_site(site_key, t_hash):
 def save_data(path, data):
     with open(path, "w", encoding='utf-8') as f: f.write("\n".join(sorted(list(data))))
 
+# MAPPING_ZONE_SCHEMA_PHASE1_V1
+
+def _build_mapping_site_zone_registry():
+    """Build a safe registry from configured site endpoints; no listing inference."""
+    import json
+    import os
+    import unicodedata
+    from urllib.parse import urlsplit
+
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    with open(config_path, "r", encoding="utf-8") as handle:
+        config = json.load(handle)
+
+    domain_map = {
+        "bearbit.org": "BEARBIT",
+        "bitsuse.com": "BITSUSE",
+        "dedbit.com": "DEDBIT",
+        "torrentdd.com": "TORRENTDD",
+        "unlimitz.biz": "UNLIMITZ",
+    }
+    result = []
+    for site_cfg in config.get("SITE", []):
+        if not isinstance(site_cfg, dict):
+            continue
+        base_url = str(site_cfg.get("base_url") or "").strip()
+        host = (urlsplit(base_url).hostname or "").lower()
+        site_key = next((key for domain, key in domain_map.items()
+                         if host == domain or host.endswith("." + domain)), None)
+        if not site_key:
+            continue
+        site_group = "DEDBIT" if site_key in {"BITSUSE", "DEDBIT"} else site_key
+        for zone in (site_cfg.get("target_urls") or []):
+            if not isinstance(zone, dict):
+                continue
+            raw_url = str(zone.get("url") or "").strip()
+            if not raw_url:
+                continue
+            name = unicodedata.normalize("NFKC", str(zone.get("name") or "")).casefold()
+            path = urlsplit(raw_url).path
+            path_lower = path.casefold()
+            if ("ปกติ" in name or "no 18" in name or "no18" in name
+                    or "viewno18" in path_lower):
+                zone_id = "normal"
+            elif ("พิเศษ" in name or "18+" in name or "browse18" in path_lower
+                    or "clip18" in path_lower or "viewbrsb" in path_lower):
+                zone_id = "special"
+            elif site_key == "BITSUSE":
+                zone_id = "special"
+            elif site_key == "DEDBIT":
+                zone_id = "normal"
+            elif site_key in {"TORRENTDD", "UNLIMITZ"} and path_lower.endswith("/browse.php"):
+                zone_id = "normal"
+            else:
+                zone_id = "unknown"
+            result.append({
+                "site_group": site_group,
+                "site_key": site_key,
+                "zone_id": zone_id,
+                "zone_name": str(zone.get("name") or "Unknown"),
+                "enabled": bool(zone.get("enable", True)),
+                "host": host,
+                "url_path": path,
+            })
+    if not result:
+        raise RuntimeError("ไม่สามารถสร้าง Site Zone Registry จาก config.json ได้")
+    return result
+
+
+def _ensure_mapping_zone_schema(data):
+    """Additive defaults only. Never infer historical source/listing zones."""
+    import copy
+
+    if not isinstance(data, dict) or not isinstance(data.get("torrents"), list):
+        raise ValueError("Invalid Mapping structure; refusing to write")
+    version = data.get("zone_metadata_version", 0)
+    try:
+        if int(version or 0) > 1:
+            raise ValueError(f"Unsupported zone metadata version: {version}")
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid zone_metadata_version: {version!r}")
+
+    for index, record in enumerate(data["torrents"]):
+        if not isinstance(record, dict):
+            raise ValueError(f"Invalid Mapping record at index {index}")
+        ci = record.get("client_info")
+        if not isinstance(ci, dict) or not re.fullmatch(
+            r"[0-9A-Fa-f]{40}", str(ci.get("hash") or "")
+        ):
+            raise ValueError(f"Invalid/missing v1 infohash at Mapping index {index}")
+        record.setdefault("content_group_id", None)
+        record.setdefault("source_zone_id", None)
+        record.setdefault("source_zone_verified", False)
+        record.setdefault("zone_metadata_version", 1)
+        variant = record.get("variant_info")
+        if variant is None:
+            variant = {}
+            record["variant_info"] = variant
+        if not isinstance(variant, dict):
+            raise ValueError(f"Invalid variant_info at Mapping index {index}")
+        variant.setdefault("role", "unclassified")
+        variant.setdefault("original_infohash", None)
+        variant.setdefault("target_site", None)
+        variant.setdefault("target_zone_id", None)
+        variant.setdefault("verified", False)
+        listings = record.get("site_listings")
+        if listings is None:
+            listings = []
+            record["site_listings"] = listings
+        if not isinstance(listings, list) or any(not isinstance(x, dict) for x in listings):
+            raise ValueError(f"Invalid site_listings at Mapping index {index}")
+
+    data.setdefault("zone_metadata_version", 1)
+    registry = _build_mapping_site_zone_registry()
+    current = data.get("site_zone_registry")
+    if current is None:
+        data["site_zone_registry"] = copy.deepcopy(registry)
+    elif not isinstance(current, list):
+        raise ValueError("Invalid site_zone_registry; refusing to write")
+    else:
+        merged = {}
+        for item in current:
+            if not isinstance(item, dict):
+                raise ValueError("Invalid site_zone_registry entry")
+            key = (item.get("site_group"), item.get("site_key"), item.get("zone_id"))
+            if key in merged:
+                raise ValueError(f"Duplicate site_zone_registry key: {key}")
+            merged[key] = item
+        for item in registry:
+            key = (item["site_group"], item["site_key"], item["zone_id"])
+            merged.setdefault(key, {}).update(item)
+        data["site_zone_registry"] = sorted(
+            merged.values(),
+            key=lambda x: (str(x.get("site_group")), str(x.get("site_key")), str(x.get("zone_id")))
+        )
+    return data
+
+
+def _atomic_save_mapping_file(data):
+    """Atomic JSON replacement with fsync and original mode/ownership preservation."""
+    import json
+    import os
+    import stat
+    import tempfile
+
+    mapping_path = MAPPING_FILE
+    mapping_dir = os.path.dirname(mapping_path) or "."
+    original_stat = os.stat(mapping_path) if os.path.exists(mapping_path) else None
+    fd, temp_path = tempfile.mkstemp(prefix="torrent_mapping.", suffix=".tmp", dir=mapping_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=4, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if original_stat:
+            os.chown(temp_path, original_stat.st_uid, original_stat.st_gid)
+            os.chmod(temp_path, stat.S_IMODE(original_stat.st_mode))
+        else:
+            os.chmod(temp_path, 0o644)
+        os.replace(temp_path, mapping_path)
+        try:
+            dir_fd = os.open(mapping_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    except Exception:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        raise
+
+
 async def load_mapping():
-    """โหลดข้อมูลจากไฟล์ JSON แบบ Asynchronous"""
+    """Load Mapping fail-closed and add in-memory schema defaults."""
     def _load():
         if not os.path.exists(MAPPING_FILE):
-            initial_data = {"version": "1.1", "torrents": []}
-            # เขียนไฟล์เริ่มต้นแบบซิงค์ภายในเธรดแยก
-            with open(MAPPING_FILE, 'w', encoding='utf-8') as f:
-                json.dump(initial_data, f, indent=4, ensure_ascii=False)
-            return initial_data
-        try:
-            with open(MAPPING_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"❌ Error loading mapping: {e}")
-            return {"version": "1.1", "torrents": []}
+            data = {"version": "1.1", "torrents": []}
+        else:
+            try:
+                with open(MAPPING_FILE, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Mapping read/JSON failure; refusing empty fallback: {exc}"
+                ) from exc
+        return _ensure_mapping_zone_schema(data)
 
-    # ใช้ asyncio.to_thread เพื่อรันงานอ่านไฟล์ไม่ให้บล็อก Event Loop
     return await asyncio.to_thread(_load)
 
-async def save_mapping(data):
-    """บันทึกข้อมูลลงไฟล์ JSON แบบ Asynchronous"""
-    def _save():
-        try:
-            with open(MAPPING_FILE, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
-        except Exception as e:
-            print(f"❌ Error saving mapping: {e}")
 
+async def save_mapping(data):
+    """Persist Mapping atomically while preserving Zone/Variant metadata."""
+    def _save():
+        _ensure_mapping_zone_schema(data)
+        _atomic_save_mapping_file(data)
     await asyncio.to_thread(_save)
+    return True
+
 
 def extract_info_hash(torrent_content: bytes) -> str | None:
     if not torrent_content:
@@ -833,6 +1003,292 @@ async def handle_new_torrent_grabbed(web_item, client_response, host_name):
         node_data=node_data
     )
 
+
+
+# MAPPING_ZONE_PHASE1C_V1
+
+def _build_mapping_target_zone_meta(site_cfg, zone):
+    """Resolve one configured target endpoint to its persisted Zone Registry row."""
+    from urllib.parse import urlsplit
+
+    if not isinstance(site_cfg, dict) or not isinstance(zone, dict):
+        return None
+
+    base_url = str(site_cfg.get("base_url") or "").strip()
+    raw_url = str(zone.get("url") or "").strip()
+    if not base_url or not raw_url:
+        return None
+
+    host = (urlsplit(base_url).hostname or "").casefold()
+    path = urlsplit(raw_url).path or raw_url.split("?", 1)[0]
+    if not host or not path:
+        return None
+
+    try:
+        registry = _build_mapping_site_zone_registry()
+    except Exception as exc:
+        print(
+            "⚠️ [Zone Metadata] Registry resolution failed: "
+            f"{type(exc).__name__}"
+        )
+        return None
+
+    matches = [
+        row for row in registry
+        if isinstance(row, dict)
+        and str(row.get("host") or "").casefold() == host
+        and str(row.get("url_path") or "") == path
+    ]
+    if len(matches) != 1:
+        print(
+            f"⚠️ [Zone Metadata] Endpoint is ambiguous/unregistered: "
+            f"host={host!r} path={path!r} matches={len(matches)}"
+        )
+        return None
+
+    row = matches[0]
+    return {
+        "site_group": row.get("site_group"),
+        "site_key": row.get("site_key"),
+        "zone_id": row.get("zone_id"),
+        "zone_name": row.get("zone_name"),
+        "host": row.get("host"),
+        "url_path": row.get("url_path"),
+        "enabled": row.get("enabled") is True,
+    }
+
+
+def _validate_mapping_target_zone_meta(meta):
+    """Fail-closed validation against config-derived registry; only enabled known zones."""
+    if not isinstance(meta, dict):
+        return None
+
+    site_group = str(meta.get("site_group") or "").strip().upper()
+    site_key = str(meta.get("site_key") or "").strip().upper()
+    zone_id = str(meta.get("zone_id") or "").strip().casefold()
+    host = str(meta.get("host") or "").strip().casefold()
+    url_path = str(meta.get("url_path") or "").strip()
+
+    if zone_id not in {"normal", "special"} or not host or not url_path:
+        return None
+    expected_group = "DEDBIT" if site_key in {"BITSUSE", "DEDBIT"} else site_key
+    if not site_key or site_group != expected_group:
+        return None
+    if meta.get("enabled") is not True:
+        return None
+
+    try:
+        registry = _build_mapping_site_zone_registry()
+    except Exception:
+        return None
+
+    matches = [
+        row for row in registry
+        if isinstance(row, dict)
+        and str(row.get("site_group") or "").upper() == site_group
+        and str(row.get("site_key") or "").upper() == site_key
+        and str(row.get("zone_id") or "").casefold() == zone_id
+        and str(row.get("host") or "").casefold() == host
+        and str(row.get("url_path") or "") == url_path
+        and row.get("enabled") is True
+    ]
+    if len(matches) != 1:
+        return None
+
+    row = matches[0]
+    return {
+        "site_group": site_group,
+        "site_key": site_key,
+        "zone_id": zone_id,
+        "zone_name": str(row.get("zone_name") or "Unknown"),
+        "host": host,
+        "url_path": url_path,
+        "enabled": True,
+    }
+
+
+async def record_cross_seed_site_listings(updates):
+    """Persist only exact-manifest, complete-inventory, tracker-verified listings."""
+    from datetime import datetime, timezone
+    from urllib.parse import parse_qs, urlsplit
+
+    if not isinstance(updates, dict) or not updates:
+        print("ℹ️ [Cross-Seed Site Listings] No valid updates")
+        return False
+
+    normalized = {}
+    for source_hash, raw_listings in updates.items():
+        source_hash = str(source_hash or "").strip().upper()
+        if not re.fullmatch(r"[0-9A-F]{40}", source_hash):
+            continue
+        if not isinstance(raw_listings, (list, tuple)):
+            continue
+
+        for raw in raw_listings:
+            if not isinstance(raw, dict):
+                continue
+            zone_meta = _validate_mapping_target_zone_meta(raw.get("target_zone_meta"))
+            candidate_hash = str(raw.get("infohash") or "").strip().upper()
+            torrent_id = str(raw.get("torrent_id") or "").strip()
+            details_url = str(raw.get("details_url") or "").strip()
+            parsed_details = urlsplit(details_url)
+            details_host = (parsed_details.hostname or "").casefold()
+            detail_query = parse_qs(parsed_details.query)
+            detail_ids = {
+                str(value).strip()
+                for field in ("id", "tid", "torrentid")
+                for value in detail_query.get(field, [])
+            }
+
+            if not zone_meta:
+                continue
+            if not re.fullmatch(r"[0-9A-F]{40}", candidate_hash):
+                continue
+            if not re.fullmatch(r"[0-9]{1,20}", torrent_id):
+                continue
+            if parsed_details.scheme.casefold() not in {"http", "https"}:
+                continue
+            if torrent_id not in detail_ids:
+                continue
+            allowed_domains = {
+                "BEARBIT": "bearbit.org",
+                "BITSUSE": "bitsuse.com",
+                "DEDBIT": "dedbit.com",
+                "TORRENTDD": "torrentdd.com",
+                "UNLIMITZ": "unlimitz.biz",
+            }
+            expected_domain = allowed_domains.get(zone_meta["site_key"])
+            if not expected_domain or not (
+                details_host == expected_domain
+                or details_host.endswith("." + expected_domain)
+            ):
+                continue
+
+            listing = {
+                **zone_meta,
+                "torrent_id": torrent_id,
+                "infohash": candidate_hash,
+                "details_url": details_url,
+                "verified": True,
+                "verification_status": "live_inventory_exact_manifest_tracker_verified",
+                "verified_by": [
+                    "exact_source_candidate_file_manifest",
+                    "live_qbittorrent_complete_inventory",
+                    "candidate_tracker_api_all_present",
+                ],
+                "verified_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            key = (
+                listing["site_group"], listing["site_key"],
+                listing["zone_id"], listing["infohash"],
+            )
+            normalized.setdefault(source_hash, {})[key] = listing
+
+    if not normalized:
+        print("ℹ️ [Cross-Seed Site Listings] No listing passed zone/hash/URL validation")
+        return False
+
+    data = await load_mapping()
+    if not isinstance(data, dict) or not isinstance(data.get("torrents"), list):
+        print("🛑 [Cross-Seed Site Listings] Invalid Mapping; no write")
+        return False
+
+    matched_sources = set()
+    changed = 0
+    for record in data["torrents"]:
+        if not isinstance(record, dict):
+            continue
+        client_info = record.get("client_info")
+        if not isinstance(client_info, dict):
+            continue
+        source_hash = str(client_info.get("hash") or "").strip().upper()
+        requested = normalized.get(source_hash)
+        if not requested:
+            continue
+
+        matched_sources.add(source_hash)
+        listings = record.get("site_listings")
+        if not isinstance(listings, list) or any(not isinstance(x, dict) for x in listings):
+            raise ValueError(
+                f"Invalid site_listings for source hash {source_hash[:12]}; refusing write"
+            )
+
+        index_by_key = {}
+        for index, old in enumerate(listings):
+            old_key = (
+                str(old.get("site_group") or "").upper(),
+                str(old.get("site_key") or "").upper(),
+                str(old.get("zone_id") or "").casefold(),
+                str(old.get("infohash") or "").upper(),
+            )
+            if old_key in index_by_key:
+                raise ValueError(
+                    f"Duplicate site listing key for {source_hash[:12]}: {old_key}"
+                )
+            index_by_key[old_key] = index
+
+        for key, listing in requested.items():
+            if key in index_by_key:
+                old = listings[index_by_key[key]]
+                # Never downgrade an already verified listing.
+                if old.get("verified") is True:
+                    continue
+                old.update(listing)
+            else:
+                listings.append(listing)
+            changed += 1
+
+    missing_sources = set(normalized) - matched_sources
+    if missing_sources:
+        print(
+            "⚠️ [Cross-Seed Site Listings] Source hashes not found in Mapping: "
+            f"{len(missing_sources)}; those entries skipped"
+        )
+
+    if not changed:
+        print("ℹ️ [Cross-Seed Site Listings] No new verified listing to persist")
+        return not missing_sources
+
+    await save_mapping(data)
+    verified_data = await load_mapping()
+    verified_index = {}
+    for record in verified_data.get("torrents", []):
+        ci = record.get("client_info") if isinstance(record, dict) else None
+        if isinstance(ci, dict):
+            h = str(ci.get("hash") or "").strip().upper()
+            verified_index[h] = record
+
+    failed = []
+    for source_hash, requested in normalized.items():
+        record = verified_index.get(source_hash)
+        if not record:
+            failed.append(source_hash)
+            continue
+        actual = record.get("site_listings") or []
+        actual_keys = {
+            (
+                str(x.get("site_group") or "").upper(),
+                str(x.get("site_key") or "").upper(),
+                str(x.get("zone_id") or "").casefold(),
+                str(x.get("infohash") or "").upper(),
+            )
+            for x in actual if isinstance(x, dict) and x.get("verified") is True
+        }
+        if not set(requested).issubset(actual_keys):
+            failed.append(source_hash)
+
+    if failed:
+        print(
+            f"❌ [Cross-Seed Site Listings] Persistence verification failed: "
+            f"{len(failed)} source records"
+        )
+        return False
+
+    print(
+        f"✅ [Cross-Seed Site Listings] Verified listings persisted: "
+        f"{changed}; source records={len(normalized) - len(missing_sources)}"
+    )
+    return True
 
 
 async def record_cross_seed_known_sites(updates):
@@ -8049,6 +8505,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                     ),
                                     "search_params": zone_params,
                                     "cross_seed_meta": item,
+                                    "target_zone_meta": _build_mapping_target_zone_meta(site_cfg, zone),
                                 })
 
                     elif any(
@@ -8096,6 +8553,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                     ),
                                     "search_params": zone_params,
                                     "cross_seed_meta": item,
+                                    "target_zone_meta": _build_mapping_target_zone_meta(site_cfg, zone),
                                 })
 
                     else:
@@ -8129,6 +8587,11 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                     count_skip = 0
                     cross_seed_matches_before_zone = (
                         len(cross_seed_matches) if cross_seed_target else 0
+                    )
+                    target_zone_meta = (
+                        target_item.get("target_zone_meta")
+                        if isinstance(target_item, dict)
+                        else None
                     )
 
                     # ---------------------------------------------------------
@@ -9004,6 +9467,11 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                     cross_seed_matches.append({
                                         "torrent_id": t_id,
                                         "site_name": site,
+                                        "target_zone_meta": (
+                                            dict(target_zone_meta)
+                                            if isinstance(target_zone_meta, dict)
+                                            else None
+                                        ),
                                         "release_name": raw_title,
                                         "details_url": details_url,
                                         "download_url": download_url,
@@ -10454,7 +10922,9 @@ async def audit_cross_seed_execution_plan(matches, active_nodes):
     }
 
     eligible_source_hashes_by_candidate = {}
+    eligible_zone_meta_by_candidate = {}
     known_site_updates = {}
+    zone_listing_updates = {}
     unique = {}
 
     for item in matches or []:
@@ -10481,8 +10951,16 @@ async def audit_cross_seed_execution_plan(matches, active_nodes):
             )
             continue
 
-        key = (site.casefold(), candidate_hash)
+        target_zone_meta = _validate_mapping_target_zone_meta(
+            item.get("target_zone_meta")
+        )
         canonical_site = _canonical_mapping_site(site)
+        if target_zone_meta and canonical_site != target_zone_meta.get("site_key"):
+            target_zone_meta = None
+        zone_bucket = str(
+            target_zone_meta.get("zone_id") if target_zone_meta else "unknown"
+        ).casefold()
+        key = (site.casefold(), zone_bucket, candidate_hash)
 
         if (
             canonical_site
@@ -10493,6 +10971,8 @@ async def audit_cross_seed_execution_plan(matches, active_nodes):
                 eligible_source_hashes_by_candidate.setdefault(
                     key, set()
                 ).add(source_hash)
+                if target_zone_meta:
+                    eligible_zone_meta_by_candidate[key] = target_zone_meta
             else:
                 print(
                     f"⛔ [Cross-Seed Known Site] site={site!r} "
@@ -10519,7 +10999,7 @@ async def audit_cross_seed_execution_plan(matches, active_nodes):
         f"unique site/hash candidates={len(unique)}"
     )
 
-    for (site_key, candidate_hash), item in unique.items():
+    for (site_key, zone_bucket, candidate_hash), item in unique.items():
         site = str(item.get("site_name") or "Unknown")
         source_hash = str(item.get("source_hash") or "").strip().upper()
         tracker_urls = []
@@ -10637,9 +11117,12 @@ async def audit_cross_seed_execution_plan(matches, active_nodes):
                         # and every candidate tracker is already present.
                         canonical_site = _canonical_mapping_site(site)
 
+                        candidate_audit_key = (
+                            site.casefold(), zone_bucket, candidate_hash
+                        )
                         eligible_sources = (
                             eligible_source_hashes_by_candidate.get(
-                                (site.casefold(), candidate_hash),
+                                candidate_audit_key,
                                 set()
                             )
                         )
@@ -10649,6 +11132,20 @@ async def audit_cross_seed_execution_plan(matches, active_nodes):
                                 known_site_updates.setdefault(
                                     verified_source_hash, set()
                                 ).add(canonical_site)
+
+                            verified_zone_meta = eligible_zone_meta_by_candidate.get(
+                                candidate_audit_key
+                            )
+                            if verified_zone_meta:
+                                for verified_source_hash in eligible_sources:
+                                    zone_listing_updates.setdefault(
+                                        verified_source_hash, []
+                                    ).append({
+                                        "target_zone_meta": verified_zone_meta,
+                                        "torrent_id": item.get("torrent_id"),
+                                        "details_url": item.get("details_url"),
+                                        "infohash": candidate_hash,
+                                    })
 
                             print(
                                 f"🧭 [Cross-Seed Known Site] "
@@ -10770,6 +11267,14 @@ async def audit_cross_seed_execution_plan(matches, active_nodes):
         )
 
 
+
+    if zone_listing_updates:
+        await record_cross_seed_site_listings(zone_listing_updates)
+    else:
+        print(
+            "ℹ️ [Cross-Seed Site Listings] "
+            "No candidate met verified Zone listing conditions"
+        )
 
 async def main():
     global browser_instance
