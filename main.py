@@ -2234,15 +2234,6 @@ class QbitNode:
         self.user, self.pw = cfg["qb_user"], cfg["qb_pass"]
         self.quota_gb = cfg.get("quota_gb", 0)
 
-        # Storage telemetry is selected per node. Existing nodes retain the
-        # historical 15 GiB safety buffer unless explicitly configured.
-        self.storage_api = str(cfg.get("storage_api") or "").strip().lower()
-        self.storage_mount = str(cfg.get("storage_mount") or "/").strip() or "/"
-        self.storage_safety_buffer_gb = cfg.get(
-            "storage_safety_buffer_gb", 15.0
-        )
-        self.allow_space_reclaim = cfg.get("allow_space_reclaim", True) is True
-
         # Provider quota telemetry (GiB, binary units).
         # None means no verified provider quota sample yet.
         self.quota_total_gb = None
@@ -2250,7 +2241,6 @@ class QbitNode:
         self.quota_free_gb = None
         
         self.provider_sso = cfg.get("provider_sso") is True
-        self.preallocated_downloads_accounted_in_free_space = cfg.get("preallocated_downloads_accounted_in_free_space") is True
         self.provider_user = str(cfg.get("provider_user") or "").strip()
         self.provider_pw = str(cfg.get("provider_pass") or "")
 
@@ -2710,118 +2700,6 @@ class QbitNode:
                 f"{type(e).__name__}: {e}"
             )
             return False
-    @staticmethod
-    def _parse_swizzin_size_gib(value):
-        """Parse a dashboard size such as '10.64 GiB' into binary GiB."""
-        if not isinstance(value, str):
-            raise TypeError("Swizzin size must be a string with a unit")
-
-        match = re.fullmatch(
-            r"\s*(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB|KIB|MIB|GIB|TIB)\s*",
-            value,
-            flags=re.IGNORECASE,
-        )
-        if not match:
-            raise ValueError(f"Invalid Swizzin size: {value!r}")
-
-        amount = float(match.group(1))
-        unit = match.group(2).upper()
-        multipliers = {
-            "B": 1,
-            "KB": 1000,
-            "MB": 1000 ** 2,
-            "GB": 1000 ** 3,
-            "TB": 1000 ** 4,
-            "KIB": 1024,
-            "MIB": 1024 ** 2,
-            "GIB": 1024 ** 3,
-            "TIB": 1024 ** 4,
-        }
-        byte_value = amount * multipliers[unit]
-        if not (0.0 <= byte_value < float("inf")):
-            raise ValueError("Swizzin size is outside the valid range")
-        return byte_value / (1024 ** 3)
-
-    def _get_swizzin_storage_stats(self):
-        """Read and validate ReadyIDC Swizzin quota and root-disk telemetry."""
-        parsed = urllib.parse.urlsplit(self.url)
-        if not parsed.scheme or not parsed.netloc:
-            raise ValueError("Invalid qBittorrent URL for Swizzin API")
-
-        origin = f"{parsed.scheme}://{parsed.netloc}"
-        headers = {
-            "Accept": "application/json",
-            "Referer": origin + "/",
-        }
-
-        def get_json(endpoint):
-            response = self._execute_request(
-                "GET",
-                origin + endpoint,
-                headers=headers,
-                timeout=15,
-                allow_redirects=False,
-            )
-            if response is None:
-                raise RuntimeError(f"Swizzin {endpoint} network failure")
-            if response.status_code != 200:
-                raise RuntimeError(
-                    f"Swizzin {endpoint} HTTP {response.status_code}"
-                )
-            content_type = str(
-                response.headers.get("Content-Type", "")
-            ).casefold()
-            if "json" not in content_type:
-                raise ValueError(f"Swizzin {endpoint} response is not JSON")
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise TypeError(f"Swizzin {endpoint} payload is invalid")
-            return payload
-
-        quota_payload = get_json("/stats/quota")
-        disk_payload = get_json("/stats/disk")
-
-        quota = quota_payload.get("quota")
-        storage_mount = str(getattr(self, "storage_mount", "/") or "/").strip()
-        if (
-            not storage_mount.startswith("/")
-            or ".." in storage_mount.split("/")
-        ):
-            raise ValueError("Swizzin storage_mount must be a safe absolute mount path")
-        root_disk = disk_payload.get(storage_mount)
-        if not isinstance(quota, dict):
-            raise ValueError("Swizzin quota object is missing")
-        if not isinstance(root_disk, dict):
-            raise ValueError(
-                f"Swizzin configured mount {storage_mount!r} is missing"
-            )
-
-        quota_free = self._parse_swizzin_size_gib(quota.get("diskfree"))
-        quota_total = self._parse_swizzin_size_gib(quota.get("disktotal"))
-        quota_used = self._parse_swizzin_size_gib(quota.get("diskused"))
-        disk_free = self._parse_swizzin_size_gib(root_disk.get("diskfree"))
-        disk_total = self._parse_swizzin_size_gib(root_disk.get("disktotal"))
-        disk_used = self._parse_swizzin_size_gib(root_disk.get("diskused"))
-
-        if quota_total <= 0 or disk_total <= 0:
-            raise ValueError("Swizzin reported a zero or invalid total capacity")
-        if not (0 <= quota_free <= quota_total and 0 <= quota_used <= quota_total):
-            raise ValueError("Swizzin quota values are out of range")
-        if not (0 <= disk_free <= disk_total and 0 <= disk_used <= disk_total):
-            raise ValueError(
-                f"Swizzin mount {storage_mount!r} values are out of range"
-            )
-
-        return {
-            "quota_free_gb": quota_free,
-            "quota_total_gb": quota_total,
-            "quota_used_gb": quota_used,
-            "disk_free_gb": disk_free,
-            "disk_total_gb": disk_total,
-            "disk_used_gb": disk_used,
-            "disk_mount": storage_mount,
-        }
-
     def _get_provider_quota_bytes(self, retry_auth=True):
         """
         Read verified account quota from Provider Dashboard.
@@ -2937,11 +2815,6 @@ class QbitNode:
 
             self.stat_msg = f"API ERROR: {message}"
             self.free_gb = 0.0
-            if getattr(self, "storage_api", "") == "swizzin":
-                # Never retain a stale provider quota sample after a failed refresh.
-                self.quota_total_gb = None
-                self.quota_used_gb = None
-                self.quota_free_gb = None
             return False
 
         if not self.is_connected:
@@ -3065,55 +2938,9 @@ class QbitNode:
                 real_disk_free_bytes / (1024 ** 3)
             )
 
-            try:
-                safety_buffer = float(self.storage_safety_buffer_gb)
-                if not (0.0 <= safety_buffer < float("inf")):
-                    raise ValueError("safety buffer must be finite and non-negative")
-            except (TypeError, ValueError, OverflowError) as buffer_error:
-                return fail(
-                    f"Invalid storage safety buffer: {buffer_error}",
-                    disconnect=False
-                )
+            safety_buffer = 15.0
 
-            if self.storage_api == "swizzin":
-                try:
-                    storage = self._get_swizzin_storage_stats()
-                except Exception as storage_error:
-                    return fail(
-                        "Swizzin storage unavailable: "
-                        f"{type(storage_error).__name__}: {storage_error}",
-                        disconnect=False
-                    )
-
-                quota_free_gb = storage["quota_free_gb"]
-                quota_total_gb = storage["quota_total_gb"]
-                used_gb = storage["quota_used_gb"]
-                swizzin_disk_free_gb = storage["disk_free_gb"]
-
-                self.quota_used_gb = used_gb
-                self.quota_total_gb = quota_total_gb
-                self.quota_free_gb = quota_free_gb
-
-                # Use the most conservative of account quota, configured
-                # Swizzin mount, and qBittorrent maindata disk-free readings.
-                display_free = min(
-                    quota_free_gb,
-                    swizzin_disk_free_gb,
-                    real_disk_free_gb,
-                )
-
-                self.stat_msg = (
-                    f"FREE(Q): {quota_free_gb:.2f}GiB | "
-                    f"FREE(D): {swizzin_disk_free_gb:.2f}GiB | "
-                    f"Mount: {storage['disk_mount']} | "
-                    f"FREE(QBT): {real_disk_free_gb:.2f}GiB | "
-                    f"Total: {active_count} | "
-                    f"Used: {used_gb:.2f}GiB / "
-                    f"{quota_total_gb:.2f}GiB | "
-                    f"Safe: {max(0.0, display_free - safety_buffer):.2f}GiB"
-                )
-
-            elif self.provider_sso:
+            if self.provider_sso:
                 # Provider quota is authoritative for account usage.
                 # Do not infer account usage from shared filesystem free.
                 try:
@@ -3594,14 +3421,6 @@ class QbitNode:
             return False
 
     def get_downloading_size(self):
-        # Preallocated bytes are already reflected in verified free-space telemetry.
-        if getattr(
-            self,
-            'preallocated_downloads_accounted_in_free_space',
-            False
-        ) is True:
-            return 0.0
-
         try:
             # ใช้ _execute_request แทน self.s.get เพื่อให้ผ่าน Adapter และ Header ที่เราตั้งไว้
             r = self._execute_request(
@@ -5008,13 +4827,6 @@ class NodeCleaner:
         ปรับปรุงเป็น Instance Method ของ NodeCleaner
         เพิ่มเงื่อนไข: โหลดเสร็จแล้วอย่างน้อย 1 ชม. และเรโชอย่างน้อย 1.0
         """
-        if getattr(self.node, "allow_space_reclaim", True) is not True:
-            print(
-                f"🛡️ [{self.node.name}] Space reclaim disabled by node config; "
-                "no reclaim scan or torrent action performed"
-            )
-            return False
-
         try:
             self.node.refresh_status()
             buffer_gb = 5.0 if is_emergency else 2.5
@@ -7762,10 +7574,7 @@ def get_node_dynamic_cap(node, disk_type):
 
     # Provider nodes must stop when quota space reaches the safety stop.
     # Preserve the historical minimum-cap behavior for other nodes.
-    if (
-        getattr(node, "provider_sso", False)
-        or getattr(node, "storage_api", "") == "swizzin"
-    ) and space_factor <= 0:
+    if getattr(node, "provider_sso", False) and space_factor <= 0:
         final_cap = 0
     else:
         final_cap = max(3, calculated_cap)
