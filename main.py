@@ -78,9 +78,16 @@ STATS_CACHE_FILE = os.path.join(BASE_DIR, "stats_cache.json")
 STATS_HISTORY_FILE = os.path.join(BASE_DIR, "stats_history.json")
 MAPPING_FILE = os.path.join(BASE_DIR, "torrent_mapping.json")
 
+# UAP_PHASE_F_RESUME_RECLAIM_GUARDS_V1
+# Automatic resume is opt-in per node; absent/false means keep paused.
 # PURGE_AUTH_DRYRUN_PATCH_V1
 # Phase A: Read-only authorization; deletion remains disabled.
 PURGE_AUTH_DRY_RUN = True
+
+# Phase G Controlled Runtime Test: fail-closed defaults.
+PHASE_G_ALLOW_STARTUP_REANNOUNCE = False
+PHASE_G_ALLOW_NORMAL_TORRENT_ADD = False
+PHASE_G_ALLOW_MAPPING_WRITES = False
 
 # Exact tracker hostname aliases supplied and verified by operator.
 PURGE_TRACKER_HOST_ALIASES = {
@@ -409,6 +416,9 @@ def _ensure_mapping_zone_schema(data):
         record.setdefault("content_group_id", None)
         record.setdefault("source_zone_id", None)
         record.setdefault("source_zone_verified", False)
+        record.setdefault("source_zone_evidence", None)
+        if record.get("source_zone_evidence") is not None and not isinstance(record.get("source_zone_evidence"), dict):
+            raise ValueError(f"Invalid source_zone_evidence at Mapping index {index}")
         record.setdefault("zone_metadata_version", 1)
         variant = record.get("variant_info")
         if variant is None:
@@ -454,16 +464,67 @@ def _ensure_mapping_zone_schema(data):
     return data
 
 
+
+# MAPPING_PERSISTENCE_TRANSACTION_V1
+import contextvars
+import functools
+from contextlib import asynccontextmanager
+
+mapping_lock = asyncio.Lock()
+
+_mapping_transaction_owner = contextvars.ContextVar(
+    "uap_mapping_transaction_owner",
+    default=None,
+)
+
+
+@asynccontextmanager
+async def mapping_transaction():
+    current_task = asyncio.current_task()
+
+    if current_task is None:
+        raise RuntimeError(
+            "Mapping transaction requires an active asyncio task"
+        )
+
+    # Re-entrant only for the same asyncio Task.
+    if _mapping_transaction_owner.get() is current_task:
+        yield
+        return
+
+    async with mapping_lock:
+        token = _mapping_transaction_owner.set(current_task)
+        try:
+            yield
+        finally:
+            _mapping_transaction_owner.reset(token)
+
+
+def _mapping_transactional(func):
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        async with mapping_transaction():
+            return await func(*args, **kwargs)
+
+    return wrapper
+
+
 def _atomic_save_mapping_file(data):
     """Atomic JSON replacement with fsync and original mode/ownership preservation."""
+    if globals().get("PHASE_G_ALLOW_MAPPING_WRITES", False) is not True:
+        raise RuntimeError(
+            "Mapping file write blocked by Phase G safety gate"
+        )
     import json
     import os
     import stat
     import tempfile
 
-    mapping_path = MAPPING_FILE
+    mapping_path = os.path.realpath(
+        os.path.abspath(os.fspath(MAPPING_FILE))
+    )
     mapping_dir = os.path.dirname(mapping_path) or "."
-    original_stat = os.stat(mapping_path) if os.path.exists(mapping_path) else None
+    original_stat = os.stat(mapping_path)
     fd, temp_path = tempfile.mkstemp(prefix="torrent_mapping.", suffix=".tmp", dir=mapping_dir)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -493,27 +554,43 @@ def _atomic_save_mapping_file(data):
 async def load_mapping():
     """Load Mapping fail-closed and add in-memory schema defaults."""
     def _load():
-        if not os.path.exists(MAPPING_FILE):
-            data = {"version": "1.1", "torrents": []}
-        else:
-            try:
-                with open(MAPPING_FILE, "r", encoding="utf-8") as handle:
-                    data = json.load(handle)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Mapping read/JSON failure; refusing empty fallback: {exc}"
-                ) from exc
+        mapping_path = os.path.realpath(
+            os.path.abspath(os.fspath(MAPPING_FILE))
+        )
+
+        if not os.path.isfile(mapping_path):
+            raise RuntimeError(
+                "Mapping file missing or not a regular file; "
+                f"refusing empty fallback: {mapping_path}"
+            )
+
+        try:
+            with open(mapping_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Mapping read/JSON failure; refusing empty fallback: {exc}"
+            ) from exc
         return _ensure_mapping_zone_schema(data)
 
     return await asyncio.to_thread(_load)
 
 
 async def save_mapping(data):
-    """Persist Mapping atomically while preserving Zone/Variant metadata."""
+    """Persist Mapping through the shared transaction and atomic writer."""
+    if globals().get("PHASE_G_ALLOW_MAPPING_WRITES", False) is not True:
+        print("🔒 [Mapping] Save blocked by Phase G; read-only mode.")
+        return False
+    if not isinstance(data, dict) or not isinstance(data.get("torrents"), list):
+        raise ValueError("Invalid Mapping structure; refusing write")
+
     def _save():
         _ensure_mapping_zone_schema(data)
         _atomic_save_mapping_file(data)
-    await asyncio.to_thread(_save)
+
+    async with mapping_transaction():
+        await asyncio.to_thread(_save)
+
     return True
 
 
@@ -678,6 +755,131 @@ def _canonical_mapping_site(value):
     return ""
 
 
+
+# MAPPING_DUPLICATE_TRI_STATE_PHASE_C_V1
+def _classify_hash_presence_state(
+    seen_hash_duplicate,
+    matched_node_count,
+    inventory_check_failed,
+):
+    """
+    History is a per-site processing ledger, not Node presence evidence.
+    A positive live match is decisive even if another Node is unavailable.
+    """
+    if matched_node_count > 0:
+        return "live_duplicate"
+
+    if inventory_check_failed:
+        return "inventory_incomplete"
+
+    if seen_hash_duplicate:
+        return "history_duplicate"
+
+    return "eligible_for_add"
+
+
+# MAPPING_NODE_LOCATIONS_PHASE_B_V1
+def _merge_mapping_node_location(record, node_data):
+    """
+    Add/update one explicitly observed Node location.
+
+    Trust levels:
+      live_qbittorrent_inventory = live inventory confirmed
+      successful_add_response    = add response accepted, not inventory confirmed
+
+    Historical node_info is intentionally left unchanged by this helper.
+    """
+    if not isinstance(record, dict):
+        return False
+
+    if not isinstance(node_data, dict):
+        return False
+
+    host = str(node_data.get("seedbox_host") or "").strip()
+    if not host:
+        return False
+
+    method = str(
+        node_data.get("verification_method") or ""
+    ).strip()
+
+    trust_rank = {
+        "successful_add_response": 1,
+        "live_qbittorrent_inventory": 2,
+    }
+
+    incoming_rank = trust_rank.get(method, 0)
+    if incoming_rank == 0:
+        return False
+
+    save_path = str(node_data.get("save_path") or "").strip()
+    if not save_path:
+        return False
+
+    locations = record.get("node_locations")
+
+    if locations is None:
+        locations = []
+    elif not isinstance(locations, list):
+        raise ValueError(
+            "Invalid node_locations structure; refusing overwrite"
+        )
+
+    if any(not isinstance(item, dict) for item in locations):
+        raise ValueError(
+            "Invalid node_locations entry; refusing overwrite"
+        )
+
+    matches = [
+        item for item in locations
+        if str(item.get("seedbox_host") or "").strip().casefold()
+        == host.casefold()
+    ]
+
+    if len(matches) > 1:
+        raise ValueError(
+            f"Duplicate node_locations entries for Node {host!r}"
+        )
+
+    inventory_verified = (
+        method == "live_qbittorrent_inventory"
+    )
+
+    if not matches:
+        location = {
+            "seedbox_host": host,
+            "save_path": save_path,
+            "inventory_verified": inventory_verified,
+            "verification_method": method,
+        }
+        locations.append(location)
+
+    else:
+        location = matches[0]
+
+        previous_method = str(
+            location.get("verification_method") or ""
+        ).strip()
+
+        previous_rank = trust_rank.get(
+            previous_method,
+            2 if location.get("inventory_verified") is True else 0
+        )
+
+        # Weaker evidence must never downgrade or replace a
+        # stronger verified Node location.
+        if incoming_rank < previous_rank:
+            return False
+
+        location["verification_method"] = method
+        location["inventory_verified"] = inventory_verified
+        location["seedbox_host"] = host
+        location["save_path"] = save_path
+
+    record["node_locations"] = locations
+    return True
+
+@_mapping_transactional
 async def add_or_update_torrent(client_data, web_data=None, node_data=None):
     """
     Mapping provenance rules:
@@ -691,6 +893,10 @@ async def add_or_update_torrent(client_data, web_data=None, node_data=None):
 
     Unknown source metadata is never promoted from observed_site.
     """
+    if globals().get("PHASE_G_ALLOW_MAPPING_WRITES", False) is not True:
+        print("🔒 [Mapper] Update blocked by Phase G; read-only mode.")
+        return False
+
     data = await load_mapping()
     torrents = data.get("torrents", [])
 
@@ -749,7 +955,7 @@ async def add_or_update_torrent(client_data, web_data=None, node_data=None):
             and isinstance(record.get("client_info"), dict)
             and str(
                 record["client_info"].get("hash") or ""
-            ).upper() == target_hash
+            ).strip().upper() == target_hash
         ),
         None
     )
@@ -959,6 +1165,83 @@ async def add_or_update_torrent(client_data, web_data=None, node_data=None):
             f"| known_sites={known_sites}"
         )
 
+    target_record = (
+        existing if existing is not None else new_record
+    )
+
+    effective_source = (
+        _canonical_mapping_site(target_record.get("source_site"))
+        if target_record.get("source_site_verified") is True
+        else ""
+    )
+    incoming_zone_evidence = _validate_mapping_source_zone_evidence(
+        web_data.get("source_zone_evidence"),
+        effective_source,
+        web_data.get("torrent_id"),
+        web_data.get("details_url"),
+    ) if effective_source else None
+
+    if incoming_zone_evidence:
+        existing_zone_id = str(
+            target_record.get("source_zone_id") or ""
+        ).strip().casefold()
+
+        # Never trust the historical Boolean flag alone.
+        # Existing evidence must independently validate against
+        # the current source site, torrent ID and details URL.
+        existing_zone_evidence = (
+            _validate_mapping_source_zone_evidence(
+                target_record.get("source_zone_evidence"),
+                effective_source,
+                target_record.get("torrent_id"),
+                target_record.get("details_url"),
+            )
+            if effective_source
+            else None
+        )
+
+        existing_source_zone_is_valid = (
+            target_record.get("source_zone_verified") is True
+            and existing_zone_evidence is not None
+            and existing_zone_id == existing_zone_evidence["zone_id"]
+        )
+
+        if existing_source_zone_is_valid:
+            if existing_zone_id != incoming_zone_evidence["zone_id"]:
+                # Two independently valid proofs conflict.
+                # Preserve the existing verified provenance.
+                print(
+                    "⚠️ [Mapper] Conflicting verified Source Zone; "
+                    f"preserving existing zone={existing_zone_id!r}"
+                )
+            # Same verified zone: preserve the existing evidence and
+            # its matching torrent ID/details URL.
+        else:
+            # Existing zone metadata is absent, stale, or unverifiable.
+            # Adopt the new independently validated evidence as one
+            # consistent provenance bundle.
+            target_record["source_zone_id"] = (
+                incoming_zone_evidence["zone_id"]
+            )
+            target_record["source_zone_verified"] = True
+            target_record["source_zone_evidence"] = (
+                incoming_zone_evidence
+            )
+            target_record["torrent_id"] = (
+                incoming_zone_evidence["torrent_id"]
+            )
+            target_record["details_url"] = (
+                incoming_zone_evidence["details_url"]
+            )
+
+            print(
+                "🧭 [Mapper] Source Zone verified/reconciled: "
+                f"{effective_source}/"
+                f"{incoming_zone_evidence['zone_id']}"
+            )
+
+    _merge_mapping_node_location(target_record, node_data)
+
     data["torrents"] = torrents
     await save_mapping(data)
     return True
@@ -983,6 +1266,44 @@ async def handle_new_torrent_grabbed(web_item, client_response, host_name):
     web_item["source_site"] = source_name
     web_item["source_site_verified"] = bool(source_name)
 
+    # Source Zone is proven only when the current enabled Browse endpoint,
+    # the exact details URL/torrent ID, and the successful add all agree.
+    web_item.pop("source_zone_evidence", None)
+    zone_meta = _validate_mapping_target_zone_meta(
+        web_item.get("source_zone_meta")
+    )
+    if zone_meta and source_name and zone_meta.get("site_key") == source_name:
+        from datetime import datetime, timezone
+        source_zone_evidence = {
+            **zone_meta,
+            "torrent_id": str(web_item.get("torrent_id") or "").strip(),
+            "details_url": str(web_item.get("details_url") or "").strip(),
+            "verified": True,
+            "verification_status": "successful_add_from_verified_zone",
+            "verification_method": "successful_add_from_verified_zone",
+            "verified_by": [
+                "configured_enabled_zone_registry",
+                "matching_search_result_details_url",
+                "successful_add_response",
+            ],
+            "verified_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        validated_evidence = _validate_mapping_source_zone_evidence(
+            source_zone_evidence,
+            source_name,
+            web_item.get("torrent_id"),
+            web_item.get("details_url"),
+        )
+        if validated_evidence:
+            web_item["source_zone_evidence"] = validated_evidence
+        else:
+            print(
+                "⚠️ [Mapper] Source Zone evidence rejected: "
+                "details URL / torrent ID / registry mismatch"
+            )
+    elif web_item.get("source_zone_meta") is not None:
+        print("⚠️ [Mapper] Source Zone metadata rejected: site/registry mismatch")
+
     client_data = {
         "client_type": client_response.get("type", "qbittorrent"),
         "hash": client_response["hash"],
@@ -994,7 +1315,8 @@ async def handle_new_torrent_grabbed(web_item, client_response, host_name):
 
     node_data = {
         "seedbox_host": host_name,
-        "save_path": client_response.get("save_path", "")
+        "save_path": client_response.get("save_path", ""),
+        "verification_method": "successful_add_response"
     }
 
     await add_or_update_torrent(
@@ -1107,8 +1429,81 @@ def _validate_mapping_target_zone_meta(meta):
     }
 
 
+def _validate_mapping_source_zone_evidence(evidence, source_site, torrent_id, details_url):
+    """Validate source-zone proof against the enabled registry and exact details URL."""
+    from urllib.parse import parse_qs, urlsplit
+
+    if not isinstance(evidence, dict) or evidence.get("verified") is not True:
+        return None
+    if evidence.get("verification_method") != "successful_add_from_verified_zone":
+        return None
+
+    meta = _validate_mapping_target_zone_meta(evidence)
+    canonical_source = _canonical_mapping_site(source_site)
+    if not meta or not canonical_source or meta["site_key"] != canonical_source:
+        return None
+
+    expected_id = str(torrent_id or "").strip()
+    evidence_id = str(evidence.get("torrent_id") or "").strip()
+    expected_url = str(details_url or "").strip()
+    evidence_url = str(evidence.get("details_url") or "").strip()
+    if (
+        not re.fullmatch(r"[0-9]{1,20}", expected_id)
+        or evidence_id != expected_id
+        or not expected_url
+        or evidence_url != expected_url
+    ):
+        return None
+
+    parsed = urlsplit(expected_url)
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if parsed.scheme.casefold() not in {"http", "https"} or host != meta["host"].casefold().rstrip("."):
+        return None
+    if not re.search(r"(?:^|/)(?:bs_)?details(?:new)?\.php$", parsed.path, re.I):
+        return None
+
+    query = parse_qs(parsed.query)
+    ids = {
+        str(value).strip()
+        for field in ("id", "tid", "torrentid")
+        for value in query.get(field, [])
+    }
+    if expected_id not in ids:
+        return None
+
+    verified_by = evidence.get("verified_by")
+    if not isinstance(verified_by, list) or not {
+        "configured_enabled_zone_registry",
+        "matching_search_result_details_url",
+        "successful_add_response",
+    }.issubset(set(verified_by)):
+        return None
+    verified_at = str(evidence.get("verified_at") or "").strip()
+    if not verified_at:
+        return None
+
+    return {
+        **meta,
+        "torrent_id": expected_id,
+        "details_url": expected_url,
+        "verified": True,
+        "verification_status": "successful_add_from_verified_zone",
+        "verification_method": "successful_add_from_verified_zone",
+        "verified_by": [
+            "configured_enabled_zone_registry",
+            "matching_search_result_details_url",
+            "successful_add_response",
+        ],
+        "verified_at": verified_at,
+    }
+
+
+@_mapping_transactional
 async def record_cross_seed_site_listings(updates):
     """Persist only exact-manifest, complete-inventory, tracker-verified listings."""
+    if globals().get("PHASE_G_ALLOW_MAPPING_WRITES", False) is not True:
+        print("🔒 [Site Listings] Persistence blocked by Phase G.")
+        return False
     from datetime import datetime, timezone
     from urllib.parse import parse_qs, urlsplit
 
@@ -1291,6 +1686,7 @@ async def record_cross_seed_site_listings(updates):
     return True
 
 
+@_mapping_transactional
 async def record_cross_seed_known_sites(updates):
     """
     Persist verified candidate-site observations against SOURCE hashes.
@@ -1298,6 +1694,10 @@ async def record_cross_seed_known_sites(updates):
     Only known_sites is modified.
     Source provenance and torrent/tracker state are never changed.
     """
+    if globals().get("PHASE_G_ALLOW_MAPPING_WRITES", False) is not True:
+        print("🔒 [Known Sites] Persistence blocked by Phase G.")
+        return False
+
     normalized = {}
 
     for source_hash, raw_sites in (updates or {}).items():
@@ -1390,68 +1790,12 @@ async def record_cross_seed_known_sites(updates):
         return False
 
     if changed_records:
-        def _atomic_write_mapping():
-            import tempfile
-            import stat
-
-            # Resolve symlinks so the actual Mapping file is replaced.
-            mapping_path = os.path.realpath(os.fspath(MAPPING_FILE))
-            mapping_dir = os.path.dirname(mapping_path)
-
-            original_stat = os.stat(mapping_path)
-
-            fd, temp_path = tempfile.mkstemp(
-                prefix=".torrent_mapping.",
-                suffix=".tmp",
-                dir=mapping_dir,
-            )
-
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    json.dump(
-                        data,
-                        handle,
-                        indent=4,
-                        ensure_ascii=False,
-                    )
-                    handle.flush()
-                    os.fsync(handle.fileno())
-
-                os.chown(
-                    temp_path,
-                    original_stat.st_uid,
-                    original_stat.st_gid,
-                )
-                os.chmod(
-                    temp_path,
-                    stat.S_IMODE(original_stat.st_mode),
-                )
-
-                # Atomic replacement in the same filesystem.
-                os.replace(temp_path, mapping_path)
-
-                try:
-                    dir_fd = os.open(
-                        mapping_dir,
-                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-                    )
-                    try:
-                        os.fsync(dir_fd)
-                    finally:
-                        os.close(dir_fd)
-                except OSError:
-                    pass
-
-            except Exception:
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
-                raise
-
         try:
-            await asyncio.to_thread(_atomic_write_mapping)
+            await save_mapping(data)
         except Exception as exc:
             print(
-                "❌ [Cross-Seed Known Sites] Atomic Mapping write failed: "
+                "❌ [Cross-Seed Known Sites] "
+                "Shared Mapping write failed: "
                 f"{type(exc).__name__}: {exc}"
             )
             return False
@@ -3868,74 +4212,232 @@ class QbitNode:
             return False
     async def sync_to_mapping(self, web_data_list=None, mapper_func=None):
         """
-        ดึงข้อมูลทอร์เรนต์ทั้งหมดจาก qBittorrent แล้วอัปเดตลง JSON Mapping (Async)
-        - web_data_list: ข้อมูลรายการทอร์เรนต์ที่กวาดมาจากหน้าเว็บ (ถ้าเป็น None จะซิงค์ทุกทอร์เรนต์จาก qBittorrent โดยตรง)
-        - mapper_func: ฟังก์ชันสำหรับบันทึกข้อมูลแบบ async (เช่น add_or_update_torrent)
+        Sync only verified live qBittorrent inventory into Mapping.
+
+        None / invalid inventory = failure.
+        Empty complete inventory = successful empty inventory.
+        Web-target sync succeeds only when every requested hash is
+        found in this Node's live inventory and every Mapper call
+        returns exactly True.
         """
-        # ตรวจสอบการเชื่อมต่อ
+        if globals().get("PHASE_G_ALLOW_MAPPING_WRITES", False) is not True:
+            print(
+                f"🔒 [{self.name}] Mapping sync disabled by Phase G; "
+                "no Mapper calls performed."
+            )
+            return False
+
         if not self.is_connected:
             if not self.login():
                 return False
-            
-        # ดึงรายการทอร์เรนต์ทั้งหมดจาก qBittorrent
+
         all_qbt_torrents = self.get_all_torrents_info()
-        if not all_qbt_torrents:
+
+        if all_qbt_torrents is None:
+            print(
+                f"🛑 [{self.name}] Mapping sync aborted: "
+                "inventory query failed"
+            )
             return False
-        
-        # เลือกฟังก์ชันบันทึก (ใช้ mapper_func ที่ส่งมา หรือ fallback เป็น add_or_update_torrent)
-        save_func = mapper_func if mapper_func else add_or_update_torrent
+
+        if not isinstance(all_qbt_torrents, (list, tuple)):
+            print(
+                f"🛑 [{self.name}] Mapping sync aborted: "
+                "invalid inventory type"
+            )
+            return False
+
+        # Validate the complete inventory before writing any Mapping data.
+        qbt_map = {}
+
+        for torrent in all_qbt_torrents:
+            if not isinstance(torrent, dict):
+                print(
+                    f"🛑 [{self.name}] Mapping sync aborted: "
+                    "invalid torrent entry"
+                )
+                return False
+
+            torrent_hash = str(
+                torrent.get("hash") or ""
+            ).strip().lower()
+
+            if (
+                len(torrent_hash) not in (40, 64)
+                or any(
+                    ch not in "0123456789abcdef"
+                    for ch in torrent_hash
+                )
+            ):
+                print(
+                    f"🛑 [{self.name}] Mapping sync aborted: "
+                    "invalid inventory infohash"
+                )
+                return False
+
+            if torrent_hash in qbt_map:
+                print(
+                    f"🛑 [{self.name}] Mapping sync aborted: "
+                    f"duplicate inventory hash {torrent_hash[:12]}"
+                )
+                return False
+
+            qbt_map[torrent_hash] = torrent
+
+        save_func = (
+            mapper_func
+            if mapper_func is not None
+            else add_or_update_torrent
+        )
+
         synced_count = 0
+        failed_count = 0
 
-        # กรณีที่มีการส่ง web_data_list มา (จับคู่เฉพาะทอร์เรนต์ที่มีในเว็บ)
+        # ----------------------------------------------------
+        # Web-observed hash sync: exact match on this Node.
+        # ----------------------------------------------------
         if web_data_list:
-            qbt_map = {t['hash'].lower(): t for t in all_qbt_torrents}
-            for web_item in web_data_list:
-                target_hash = web_item.get('hash', '').lower()
-            
-                if target_hash in qbt_map:
-                    qbt_t = qbt_map[target_hash]
-                
-                    client_data = {
-                        "client_type": "qbittorrent",
-                        "hash": qbt_t['hash'],
-                        "name": qbt_t['name'],
-                        "size_bytes": qbt_t['size_bytes'],
-                        "state": qbt_t['state'],
-                        "ratio": qbt_t['ratio']
-                    }
-                
-                    node_data = {
-                        "seedbox_host": self.name,
-                        "save_path": qbt_t.get('save_path', '')
-                    }
-                
-                    await save_func(client_data=client_data, web_data=web_item, node_data=node_data)
-                    synced_count += 1
+            if not isinstance(web_data_list, (list, tuple)):
+                print(
+                    f"🛑 [{self.name}] Invalid web_data_list"
+                )
+                return False
 
-        # กรณีที่ไม่ได้ส่ง web_data_list มา (เรียกจาก Node Section รอบปกติ จะซิงค์ทุกตัวจาก qBittorrent ตรงๆ)
-        else:
-            for qbt_t in all_qbt_torrents:
+            requests = []
+
+            # Validate all requested entries before any writes.
+            for web_item in web_data_list:
+                if not isinstance(web_item, dict):
+                    print(
+                        f"🛑 [{self.name}] Invalid web item"
+                    )
+                    return False
+
+                target_hash = str(
+                    web_item.get("hash") or ""
+                ).strip().lower()
+
+                if (
+                    len(target_hash) not in (40, 64)
+                    or any(
+                        ch not in "0123456789abcdef"
+                        for ch in target_hash
+                    )
+                ):
+                    print(
+                        f"🛑 [{self.name}] Invalid requested infohash"
+                    )
+                    return False
+
+                qbt_torrent = qbt_map.get(target_hash)
+
+                if qbt_torrent is None:
+                    print(
+                        f"⚠️ [{self.name}] Requested hash "
+                        f"{target_hash[:12]} is not present "
+                        "in this Node's live inventory"
+                    )
+                    return False
+
+                requests.append((web_item, qbt_torrent))
+
+            for web_item, qbt_torrent in requests:
                 client_data = {
                     "client_type": "qbittorrent",
-                    "hash": qbt_t['hash'],
-                    "name": qbt_t['name'],
-                    "size_bytes": qbt_t['size_bytes'],
-                    "state": qbt_t['state'],
-                    "ratio": qbt_t['ratio']
+                    "hash": qbt_torrent["hash"],
+                    "name": qbt_torrent.get("name"),
+                    "size_bytes": qbt_torrent.get("size_bytes", 0),
+                    "state": qbt_torrent.get("state", "unknown"),
+                    "ratio": qbt_torrent.get("ratio", 0.0)
                 }
-            
+
                 node_data = {
                     "seedbox_host": self.name,
-                    "save_path": qbt_t.get('save_path', '')
+                    "save_path": qbt_torrent.get("save_path", ""),
+                    "verification_method": "live_qbittorrent_inventory"
                 }
-            
-                # ส่ง web_data เป็น dict เปล่า เพราะรอบนี้ไม่ได้กวาดเว็บมา
-                await save_func(client_data=client_data, web_data={}, node_data=node_data)
+
+                try:
+                    result = await save_func(
+                        client_data=client_data,
+                        web_data=web_item,
+                        node_data=node_data
+                    )
+                except Exception as exc:
+                    result = False
+                    print(
+                        f"⚠️ [{self.name}] Mapper exception: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+                if result is True:
+                    synced_count += 1
+                else:
+                    failed_count += 1
+
+            print(
+                f"🔄 [{self.name}] Target Mapping sync: "
+                f"success={synced_count}, failed={failed_count}"
+            )
+
+            return (
+                synced_count == len(requests)
+                and failed_count == 0
+                and synced_count > 0
+            )
+
+        # ----------------------------------------------------
+        # Normal complete Node inventory sync.
+        # ----------------------------------------------------
+
+        if not all_qbt_torrents:
+            print(
+                f"ℹ️ [{self.name}] Complete inventory is empty; "
+                "no Mapping changes required"
+            )
+            return True
+
+        for qbt_torrent in all_qbt_torrents:
+            client_data = {
+                "client_type": "qbittorrent",
+                "hash": qbt_torrent["hash"],
+                "name": qbt_torrent.get("name"),
+                "size_bytes": qbt_torrent.get("size_bytes", 0),
+                "state": qbt_torrent.get("state", "unknown"),
+                "ratio": qbt_torrent.get("ratio", 0.0)
+            }
+
+            node_data = {
+                "seedbox_host": self.name,
+                "save_path": qbt_torrent.get("save_path", ""),
+                "verification_method": "live_qbittorrent_inventory"
+            }
+
+            try:
+                result = await save_func(
+                    client_data=client_data,
+                    web_data={},
+                    node_data=node_data
+                )
+            except Exception as exc:
+                result = False
+                print(
+                    f"⚠️ [{self.name}] Mapper exception: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+            if result is True:
                 synced_count += 1
-            
-        if synced_count > 0:
-            print(f"🔄 [{self.name}] ซิงค์ข้อมูล qBittorrent เข้า Mapping เรียบร้อยแล้ว ({synced_count} รายการ)")
-        return True
+            else:
+                failed_count += 1
+
+        print(
+            f"🔄 [{self.name}] Complete Mapping sync: "
+            f"success={synced_count}, failed={failed_count}"
+        )
+
+        return failed_count == 0
+
 
     def get_stats_by_site(self):
         """ดึงสถิติแยกตาม Category ของแต่ละเว็บ"""
@@ -4287,6 +4789,15 @@ def update_trackers(node):
         return False
 
 def safe_add_torrent(node, content, site):
+    if globals().get(
+        "PHASE_G_ALLOW_NORMAL_TORRENT_ADD", False
+    ) is not True:
+        print(
+            f"🔒 [{getattr(node, 'name', 'Unknown')}] "
+            "Normal Torrent Add blocked (Phase G)"
+        )
+        return False
+
     # ตรวจสอบก่อนว่ามันเป็น callable หรือไม่
     if hasattr(node, 'add') and callable(node.add):
         return node.add(content, site_name=site)
@@ -7232,7 +7743,13 @@ async def trigger_download_if_needed(t_id, t_name, t_size_gb, details_url, downl
                         'stoppeddl',
                         'stoppedup',
                     }:
-                        node_obj.resume_torrent(t_hash)
+                        if n_cfg.get('allow_resume_existing_torrents', False) is True:
+                            node_obj.resume_torrent(t_hash)
+                        else:
+                            print(
+                                f"🔒 [{node_obj.name}] Existing paused torrent "
+                                f"{t_hash[:12]} kept paused (Auto-Resume disabled)"
+                            )
 
                     print(
                         f"ℹ️ ไฟล์ {t_hash[:8]} "
@@ -8377,48 +8894,99 @@ def build_cross_seed_targets(
         ):
             continue
 
-        inventory = source_inventory.get(source_hash)
-        if not isinstance(inventory, dict):
+        if not re.fullmatch(r"[0-9A-F]{40}", source_hash):
             continue
 
-        source_node = inventory.get("node")
-        source_cfg = inventory.get("n_cfg") or {}
-        source_torrent = inventory.get("torrent") or {}
-
-        if (
-            source_node is None
-            or not isinstance(source_torrent, dict)
-        ):
+        raw_candidates = source_inventory.get(source_hash)
+        if isinstance(raw_candidates, dict):
+            # Backward compatibility with the pre-Phase-D inventory shape.
+            raw_candidates = [raw_candidates]
+        if not isinstance(raw_candidates, (list, tuple)):
             continue
 
         try:
             mapped_size = int(
                 client_info.get("size_bytes") or 0
             )
-            actual_size = int(
-                source_torrent.get("size_bytes") or 0
-            )
-            amount_left = int(
-                source_torrent.get("amount_left", -1)
-            )
-            progress = float(
-                source_torrent.get("progress", 0.0)
-            )
         except (TypeError, ValueError, OverflowError):
             continue
+        if mapped_size <= 0:
+            continue
 
+        valid_candidates = []
+        seen_candidate_nodes = set()
+
+        for candidate in raw_candidates:
+            if not isinstance(candidate, dict):
+                continue
+
+            candidate_node = candidate.get("node")
+            candidate_cfg = candidate.get("n_cfg") or {}
+            candidate_torrent = candidate.get("torrent") or {}
+
+            if (
+                candidate_node is None
+                or not isinstance(candidate_cfg, dict)
+                or not isinstance(candidate_torrent, dict)
+            ):
+                continue
+
+            # A single Node must contribute at most one source record per hash.
+            candidate_node_key = id(candidate_node)
+            if candidate_node_key in seen_candidate_nodes:
+                continue
+
+            try:
+                candidate_size = int(
+                    candidate_torrent.get("size_bytes") or 0
+                )
+                candidate_amount_left = int(
+                    candidate_torrent.get("amount_left", -1)
+                )
+                candidate_progress = float(
+                    candidate_torrent.get("progress", 0.0)
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+
+            candidate_save_path = str(
+                candidate_torrent.get("save_path") or ""
+            ).strip()
+
+            if (
+                candidate_size <= 0
+                or candidate_size != mapped_size
+                or candidate_amount_left != 0
+                or candidate_progress < 0.999999
+                or not candidate_save_path
+            ):
+                continue
+
+            candidate_node_name = str(
+                candidate.get("node_name")
+                or getattr(candidate_node, "name", "Unknown Node")
+            )
+
+            valid_candidates.append({
+                "node": candidate_node,
+                "n_cfg": candidate_cfg,
+                "torrent": candidate_torrent,
+                "node_name": candidate_node_name,
+            })
+            seen_candidate_nodes.add(candidate_node_key)
+
+        if not valid_candidates:
+            continue
+
+        # Preserve legacy single-source fields while carrying all live copies.
+        inventory = valid_candidates[0]
+        source_node = inventory.get("node")
+        source_cfg = inventory.get("n_cfg") or {}
+        source_torrent = inventory.get("torrent") or {}
+        actual_size = int(source_torrent.get("size_bytes") or 0)
         save_path = str(
             source_torrent.get("save_path") or ""
         ).strip()
-
-        if actual_size <= 0 or mapped_size != actual_size:
-            continue
-
-        if amount_left != 0 or progress < 0.999999:
-            continue
-
-        if not save_path:
-            continue
 
         keyword = str(
             record.get("release_name")
@@ -8501,12 +9069,155 @@ def build_cross_seed_targets(
             getattr(source_node, "name", "Unknown Node")
         )
 
+        source_zone_evidence = None
+        source_zone_id = "unknown"
+        source_zone_verified = False
+        if record.get("source_zone_verified") is True:
+            _raw_source_zone_evidence = record.get("source_zone_evidence")
+            source_zone_evidence = _validate_mapping_source_zone_evidence(
+                _raw_source_zone_evidence,
+                source_site,
+                record.get("torrent_id") or (
+                    _raw_source_zone_evidence.get("torrent_id")
+                    if isinstance(_raw_source_zone_evidence, dict) else None
+                ),
+                record.get("details_url") or (
+                    _raw_source_zone_evidence.get("details_url")
+                    if isinstance(_raw_source_zone_evidence, dict) else None
+                ),
+            )
+            if (
+                source_zone_evidence
+                and str(record.get("source_zone_id") or "").casefold()
+                    == source_zone_evidence["zone_id"]
+            ):
+                source_zone_id = source_zone_evidence["zone_id"]
+                source_zone_verified = True
+            else:
+                source_zone_evidence = None
+
+        verified_site_listings = []
+        raw_site_listings = record.get("site_listings")
+
+        from urllib.parse import parse_qs, urlsplit
+
+        allowed_listing_domains = {
+            "BEARBIT": "bearbit.org",
+            "BITSUSE": "bitsuse.com",
+            "DEDBIT": "dedbit.com",
+            "TORRENTDD": "torrentdd.com",
+            "UNLIMITZ": "unlimitz.biz",
+        }
+
+        required_listing_proofs = {
+            "exact_source_candidate_file_manifest",
+            "live_qbittorrent_complete_inventory",
+            "candidate_tracker_api_all_present",
+        }
+
+        if isinstance(raw_site_listings, list):
+            for listing in raw_site_listings:
+                if (
+                    not isinstance(listing, dict)
+                    or listing.get("verified") is not True
+                    or listing.get("verification_status")
+                    != "live_inventory_exact_manifest_tracker_verified"
+                ):
+                    continue
+
+                listing_meta = _validate_mapping_target_zone_meta(listing)
+
+                listing_hash = str(
+                    listing.get("infohash") or ""
+                ).strip().upper()
+
+                listing_torrent_id = str(
+                    listing.get("torrent_id") or ""
+                ).strip()
+
+                listing_details_url = str(
+                    listing.get("details_url") or ""
+                ).strip()
+
+                verified_by = listing.get("verified_by")
+                verified_at = str(
+                    listing.get("verified_at") or ""
+                ).strip()
+
+                if (
+                    not listing_meta
+                    or not re.fullmatch(r"[0-9A-F]{40}", listing_hash)
+                    or not re.fullmatch(r"[0-9]{1,20}", listing_torrent_id)
+                    or not isinstance(verified_by, (list, tuple, set))
+                    or not required_listing_proofs.issubset(
+                        {str(value) for value in verified_by}
+                    )
+                    or not verified_at
+                ):
+                    continue
+
+                try:
+                    parsed_details = urlsplit(listing_details_url)
+                    details_host = (
+                        parsed_details.hostname or ""
+                    ).casefold().rstrip(".")
+
+                    detail_query = parse_qs(parsed_details.query)
+
+                    detail_ids = {
+                        str(value).strip()
+                        for field in ("id", "tid", "torrentid")
+                        for value in detail_query.get(field, [])
+                    }
+
+                except (TypeError, ValueError):
+                    continue
+
+                expected_domain = allowed_listing_domains.get(
+                    listing_meta["site_key"]
+                )
+
+                domain_matches = bool(
+                    expected_domain
+                    and (
+                        details_host == expected_domain
+                        or details_host.endswith("." + expected_domain)
+                    )
+                )
+
+                if (
+                    parsed_details.scheme.casefold() not in {"http", "https"}
+                    or not domain_matches
+                    or listing_torrent_id not in detail_ids
+                ):
+                    continue
+
+                verified_site_listings.append({
+                    **listing_meta,
+                    "torrent_id": listing_torrent_id,
+                    "details_url": listing_details_url,
+                    "infohash": listing_hash,
+                    "verified": True,
+                    "verification_status":
+                        "live_inventory_exact_manifest_tracker_verified",
+                    "verified_by": [
+                        "exact_source_candidate_file_manifest",
+                        "live_qbittorrent_complete_inventory",
+                        "candidate_tracker_api_all_present",
+                    ],
+                    "verified_at": verified_at,
+                })
+
         targets.append({
             "keyword": keyword,
             "target_size_bytes": actual_size,
             "source_hash": source_hash,
             "source_site": source_site,
             "source_site_verified": source_site_verified,
+            "source_zone_id": source_zone_id,
+            "source_zone_verified": source_zone_verified,
+            "source_zone_evidence": source_zone_evidence,
+            "site_listings": verified_site_listings,
             "known_sites": known_sites,
             "source_details_url": record.get("details_url", ""),
             "source_torrent_name": str(
@@ -8517,6 +9228,7 @@ def build_cross_seed_targets(
             "source_node": source_node,
             "source_node_config": source_cfg,
             "source_node_name": source_node_name,
+            "source_candidates": valid_candidates,
         })
 
         seen.add(source_hash)
@@ -8838,13 +9550,15 @@ def _verify_cross_seed_filelist(filelist_data, candidate_manifest):
     }
 
 
-async def _preflight_cross_seed_candidate(
+# PHASE_D_PREFLIGHT_SHARED_ARTIFACT_CACHE_V1
+async def _preflight_cross_seed_candidate_single_source(
     browser_tab,
     cross_seed_target,
     site,
     torrent_id,
     details_url,
     download_url,
+    _shared_preflight_cache=None,
 ):
     """
     Download candidate metadata and compare it with the live source manifest.
@@ -8852,6 +9566,20 @@ async def _preflight_cross_seed_candidate(
     """
     tab = browser_tab
     phase = "validate source metadata"
+
+    # This cache is private to one candidate torrent and is shared only across
+    # source-node fallback attempts for that same tracker result.
+    cache_key = tuple(
+        str(value or "")
+        for value in (site, torrent_id, details_url, download_url)
+    )
+    if isinstance(_shared_preflight_cache, dict):
+        shared_cache = _shared_preflight_cache
+        if shared_cache.get("_cache_key") != cache_key:
+            shared_cache.clear()
+            shared_cache["_cache_key"] = cache_key
+    else:
+        shared_cache = {}
 
     try:
         source_node = cross_seed_target.get("source_node")
@@ -8885,76 +9613,118 @@ async def _preflight_cross_seed_candidate(
             raise ValueError("Existing authenticated site tab is unavailable")
 
         # Reuse the authenticated search tab: do not create another CDP session.
-        phase = "download candidate torrent"
-        content = await download_torrent_smart(
-            tab, details_url, download_url
-        )
+        # Candidate torrent bytes, parsed metainfo and tracker File List are
+        # common to every source copy of this one target; acquire them once.
+        if shared_cache.get("ready") is True:
+            phase = "validate cached tracker metadata"
+            content = shared_cache.get("content")
+            candidate = shared_cache.get("candidate")
+            candidate_hash = str(
+                shared_cache.get("candidate_hash") or ""
+            ).strip().upper()
+            site_filelist = shared_cache.get("site_filelist")
+            filelist_hidden = shared_cache.get("filelist_hidden") is True
+            filelist_check = shared_cache.get("filelist_check")
 
-        phase = "parse candidate torrent metainfo"
+            if (
+                not isinstance(content, bytes)
+                or not isinstance(candidate, dict)
+                or not re.fullmatch(r"[0-9A-F]{40}", candidate_hash)
+                or not candidate.get("announce_urls")
+                or not isinstance(site_filelist, dict)
+                or not isinstance(filelist_check, dict)
+            ):
+                raise ValueError("Cached candidate/tracker metadata is invalid")
 
-        if not isinstance(content, (bytes, bytearray)) or len(content) < 10:
-            raise ValueError("Torrent download returned no usable bytes")
-
-        content = bytes(content)
-        candidate = _extract_torrent_manifest(content)
-
-        phase = "validate candidate hash and trackers"
-        candidate_hash = str(
-            candidate.get("info_hash") or ""
-        ).strip().upper()
-
-        if not re.fullmatch(r"[0-9A-F]{40}", candidate_hash):
-            raise ValueError("Candidate does not have a valid v1 info hash")
-        if not candidate.get("announce_urls"):
-            raise ValueError("Candidate contains no usable tracker URL")
-
-        # Verify the tracker-visible File List against the downloaded metainfo.
-        # A different torrent root name is not by itself a rejection reason.
-        phase = "read tracker file list"
-        site_filelist = await _read_cross_seed_filelist(
-            browser_tab=tab,
-            site=site,
-            torrent_id=torrent_id,
-            details_url=details_url,
-        )
-
-        filelist_hidden = (
-            site_filelist.get("visibility") == "hidden"
-            and not site_filelist.get("entries")
-        )
-
-        if filelist_hidden:
-            # This does NOT mean the web File List was verified.
-            # Strict source-vs-candidate manifest checks must succeed below.
-            filelist_check = {
-                "ok": None,
-                "verification": "skipped_explicit_hidden_marker",
-                "matched_count": 0,
-                "file_count": len(candidate.get("files") or []),
-                "matches": [],
-            }
             print(
-                f"⚠️ [Cross-Seed File List] [{site}] ID={torrent_id}: "
-                "web list explicitly hidden; source/candidate manifest "
-                "equivalence required."
+                f"♻️ [Cross-Seed Preflight] [{site}] ID={torrent_id}: "
+                "reusing downloaded metainfo and tracker File List for source fallback"
             )
         else:
-            phase = "compare tracker file list with candidate metainfo"
-            filelist_check = _verify_cross_seed_filelist(
-                site_filelist, candidate
+            phase = "download candidate torrent"
+            content = await download_torrent_smart(
+                tab, details_url, download_url
             )
-            if not filelist_check.get("ok"):
-                raise ValueError(
-                    "Tracker File List does not match candidate metainfo: "
-                    + str(
-                        filelist_check.get("error") or "unknown mismatch"
-                    )
+
+            phase = "parse candidate torrent metainfo"
+
+            if not isinstance(content, (bytes, bytearray)) or len(content) < 10:
+                raise ValueError("Torrent download returned no usable bytes")
+
+            content = bytes(content)
+            candidate = _extract_torrent_manifest(content)
+
+            phase = "validate candidate hash and trackers"
+            candidate_hash = str(
+                candidate.get("info_hash") or ""
+            ).strip().upper()
+
+            if not re.fullmatch(r"[0-9A-F]{40}", candidate_hash):
+                raise ValueError("Candidate does not have a valid v1 info hash")
+            if not candidate.get("announce_urls"):
+                raise ValueError("Candidate contains no usable tracker URL")
+
+            # Verify the tracker-visible File List against the downloaded metainfo.
+            # A different torrent root name is not by itself a rejection reason.
+            phase = "read tracker file list"
+            site_filelist = await _read_cross_seed_filelist(
+                browser_tab=tab,
+                site=site,
+                torrent_id=torrent_id,
+                details_url=details_url,
+            )
+
+            filelist_hidden = (
+                site_filelist.get("visibility") == "hidden"
+                and not site_filelist.get("entries")
+            )
+
+            if filelist_hidden:
+                # This does NOT mean the web File List was verified.
+                # Strict source-vs-candidate manifest checks must succeed below.
+                filelist_check = {
+                    "ok": None,
+                    "verification": "skipped_explicit_hidden_marker",
+                    "matched_count": 0,
+                    "file_count": len(candidate.get("files") or []),
+                    "matches": [],
+                }
+                print(
+                    f"⚠️ [Cross-Seed File List] [{site}] ID={torrent_id}: "
+                    "web list explicitly hidden; source/candidate manifest "
+                    "equivalence required."
                 )
-            print(
-                f"🧾 [Cross-Seed File List] [{site}] ID={torrent_id} "
-                f"verified={filelist_check.get('matched_count', 0)}/"
-                f"{filelist_check.get('file_count', 0)} files"
-            )
+            else:
+                phase = "compare tracker file list with candidate metainfo"
+                filelist_check = _verify_cross_seed_filelist(
+                    site_filelist, candidate
+                )
+                if not filelist_check.get("ok"):
+                    raise ValueError(
+                        "Tracker File List does not match candidate metainfo: "
+                        + str(
+                            filelist_check.get("error") or "unknown mismatch"
+                        )
+                    )
+                print(
+                    f"🧾 [Cross-Seed File List] [{site}] ID={torrent_id} "
+                    f"verified={filelist_check.get('matched_count', 0)}/"
+                    f"{filelist_check.get('file_count', 0)} files"
+                )
+
+            # Populate only after all tracker-side checks have completed.
+            # A source-manifest failure on Node-A can then fall back to Node-B
+            # without a second torrent download or a second File List request.
+            shared_cache.update({
+                "_cache_key": cache_key,
+                "ready": True,
+                "content": content,
+                "candidate": candidate,
+                "candidate_hash": candidate_hash,
+                "site_filelist": site_filelist,
+                "filelist_hidden": filelist_hidden,
+                "filelist_check": filelist_check,
+            })
 
         phase = "read source file manifest"
         source_files = source_node.get_torrent_file_manifest(source_hash)
@@ -9155,6 +9925,143 @@ async def _preflight_cross_seed_candidate(
         pass
 
 
+
+
+# MAPPING_MULTINODE_PHASE_D_V1
+async def _preflight_cross_seed_candidate(
+    browser_tab,
+    cross_seed_target,
+    site,
+    torrent_id,
+    details_url,
+    download_url,
+):
+    """Try live source copies until one passes the existing strict preflight.
+
+    Candidate torrent download and tracker File List checks are retried only
+    when the failure is source-specific. No qBittorrent mutation API is used.
+    """
+    if not isinstance(cross_seed_target, dict):
+        return {"ok": False, "error": "Invalid Cross-Seed target"}
+
+    raw_candidates = cross_seed_target.get("source_candidates")
+    if isinstance(raw_candidates, (list, tuple)) and raw_candidates:
+        candidates = list(raw_candidates)
+    else:
+        # Backward compatibility for old callers/targets without a candidate list.
+        candidates = [{
+            "node": cross_seed_target.get("source_node"),
+            "n_cfg": cross_seed_target.get("source_node_config") or {},
+            "node_name": cross_seed_target.get("source_node_name") or "",
+            "torrent": {
+                "name": cross_seed_target.get("source_torrent_name") or "",
+                "size_bytes": cross_seed_target.get("source_size_bytes") or 0,
+                "save_path": cross_seed_target.get("source_save_path") or "",
+                "amount_left": 0,
+                "progress": 1.0,
+            },
+        }]
+
+    retryable_prefixes = (
+        "validate source metadata:",
+        "read source file manifest:",
+        "compare source files against candidate manifest:",
+    )
+    candidate_errors = []
+    valid_candidate_count = 0
+    shared_preflight_cache = {}
+
+    for candidate_index, candidate in enumerate(candidates, start=1):
+        if not isinstance(candidate, dict):
+            candidate_errors.append(
+                f"candidate#{candidate_index}: invalid candidate record"
+            )
+            continue
+
+        source_node = candidate.get("node")
+        source_cfg = candidate.get("n_cfg") or {}
+        source_torrent = candidate.get("torrent") or {}
+        if not isinstance(source_cfg, dict):
+            source_cfg = {}
+        if not isinstance(source_torrent, dict):
+            source_torrent = {}
+
+        node_name = str(
+            candidate.get("node_name")
+            or getattr(source_node, "name", "Unknown Node")
+        )
+
+        attempt_target = dict(cross_seed_target)
+        attempt_target.update({
+            "source_node": source_node,
+            "source_node_config": source_cfg,
+            "source_node_name": node_name,
+            # Do not borrow another Node's path/name/size when this
+            # candidate is incomplete. The legacy fallback candidate above
+            # already carries the original top-level values explicitly.
+            "source_torrent_name": str(source_torrent.get("name") or ""),
+            "source_size_bytes": source_torrent.get("size_bytes") or 0,
+            "source_save_path": str(
+                source_torrent.get("save_path") or ""
+            ).strip(),
+        })
+
+        valid_candidate_count += 1
+        result = await _preflight_cross_seed_candidate_single_source(
+            browser_tab=browser_tab,
+            cross_seed_target=attempt_target,
+            site=site,
+            torrent_id=torrent_id,
+            details_url=details_url,
+            download_url=download_url,
+            _shared_preflight_cache=shared_preflight_cache,
+        )
+
+        if result.get("ok") is True:
+            result.update({
+                "source_hash": str(
+                    attempt_target.get("source_hash") or ""
+                ).strip().upper(),
+                "source_node": source_node,
+                "source_node_config": source_cfg,
+                "source_node_name": node_name,
+                "source_save_path": attempt_target.get("source_save_path", ""),
+                "source_torrent_name": attempt_target.get("source_torrent_name", ""),
+                "source_size_bytes": int(
+                    attempt_target.get("source_size_bytes") or 0
+                ),
+                "source_candidate_index": candidate_index,
+                "source_candidate_count": len(candidates),
+            })
+            print(
+                f"✅ [Cross-Seed Source Selected] [{site}] "
+                f"{node_name}: manifest passed "
+                f"(candidate {candidate_index}/{len(candidates)})"
+            )
+            return result
+
+        error = str(result.get("error") or "Unknown preflight error")
+        candidate_errors.append(f"{node_name}: {error}")
+
+        # Candidate download / tracker File List / metainfo failures are not
+        # caused by the source Node. Do not repeat those web operations.
+        if not error.startswith(retryable_prefixes):
+            return result
+
+    if valid_candidate_count == 0:
+        return {
+            "ok": False,
+            "error": "No structurally valid live source candidate was available",
+        }
+
+    return {
+        "ok": False,
+        "error": (
+            "All live source candidates failed manifest preflight: "
+            + " | ".join(candidate_errors)
+        ),
+    }
+
 async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealth_args, global_clean=None, cross_seed_target=None):
     """
     ฟังก์ชันสแกนและค้นหาทอร์เรนต์โดยใช้ nodriver (Browser Automation)
@@ -9173,72 +10080,6 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
             break
 
         site = site_cfg['name']
-
-        # Skip the source tracker/site entirely once the source site is known.
-        if cross_seed_target:
-            if isinstance(cross_seed_target, dict):
-                _cs_site_targets = [cross_seed_target]
-            elif isinstance(cross_seed_target, (list, tuple)):
-                _cs_site_targets = [
-                    item for item in cross_seed_target
-                    if isinstance(item, dict)
-                ]
-            else:
-                _cs_site_targets = []
-
-            def _cs_site_key(value):
-                return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
-
-            _cs_current_site_key = _cs_site_key(site)
-            _cs_source_site_keys = [
-                _cs_site_key(item.get("source_site"))
-                if item.get("source_site_verified") is True
-                else ""
-                for item in _cs_site_targets
-            ]
-
-            if (
-                _cs_source_site_keys
-                and all(
-                    key not in ("", "unknown")
-                    and key == _cs_current_site_key
-                    for key in _cs_source_site_keys
-                )
-            ):
-                print(
-                    f"↩️ [Cross-Seed] [{site}] skipped: "
-                    "this is the verified source site."
-                )
-                continue
-
-            # Skip this site only when every target in the current
-            # batch is already recorded as known on this site.
-            _cs_known_site_sets = []
-
-            for item in _cs_site_targets:
-                raw_known = item.get("known_sites") or []
-
-                if not isinstance(raw_known, (list, tuple, set)):
-                    raw_known = []
-
-                _cs_known_site_sets.append({
-                    _cs_site_key(value)
-                    for value in raw_known
-                    if _cs_site_key(value)
-                })
-
-            if (
-                _cs_known_site_sets
-                and all(
-                    _cs_current_site_key in known_set
-                    for known_set in _cs_known_site_sets
-                )
-            ):
-                print(
-                    f"↩️ [Cross-Seed] [{site}] skipped: "
-                    "all current hashes are already known on this site."
-                )
-                continue
 
         current_site_seen_file = get_seen_file(site)
         seen_ids = load_data(current_site_seen_file)
@@ -9499,6 +10340,66 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                         if isinstance(target_item, dict)
                         else None
                     )
+                    source_zone_meta = None
+                    if not cross_seed_target and isinstance(target_item, dict):
+                        source_zone_meta = _validate_mapping_target_zone_meta(
+                            _build_mapping_target_zone_meta(site_cfg, target_item)
+                        )
+                        if source_zone_meta is None:
+                            print(
+                                f"⚠️ [{site}] Source Zone is not registered/enabled: "
+                                f"{target_item.get('name', 'Unknown Zone')!r}"
+                            )
+
+                    # Cross-seed skipping is zone-scoped. known_sites and hash
+                    # history are observations, not proof of a listing in this zone.
+                    if cross_seed_target and isinstance(target_item, dict):
+                        _zone_for_skip = _validate_mapping_target_zone_meta(
+                            target_zone_meta
+                        )
+                        _source_for_skip = target_item.get("cross_seed_meta")
+                        if _zone_for_skip and isinstance(_source_for_skip, dict):
+                            _source_site_for_skip = (
+                                _canonical_mapping_site(_source_for_skip.get("source_site"))
+                                if _source_for_skip.get("source_site_verified") is True
+                                else ""
+                            )
+                            _same_verified_source_zone = (
+                                _source_site_for_skip == _zone_for_skip["site_key"]
+                                and _source_for_skip.get("source_zone_verified") is True
+                                and str(_source_for_skip.get("source_zone_id") or "").casefold()
+                                    == _zone_for_skip["zone_id"]
+                            )
+                            _zone_listing_exists = any(
+                                isinstance(_listing, dict)
+                                and _listing.get("verified") is True
+                                and _listing.get("verification_status")
+                                    == "live_inventory_exact_manifest_tracker_verified"
+                                and str(_listing.get("site_key") or "").upper()
+                                    == _zone_for_skip["site_key"]
+                                and str(_listing.get("zone_id") or "").casefold()
+                                    == _zone_for_skip["zone_id"]
+                                and re.fullmatch(
+                                    r"[0-9A-F]{40}",
+                                    str(_listing.get("infohash") or "").upper()
+                                )
+                                for _listing in (
+                                    _source_for_skip.get("site_listings") or []
+                                    if isinstance(_source_for_skip.get("site_listings"), (list, tuple))
+                                    else []
+                                )
+                            )
+                            if _same_verified_source_zone or _zone_listing_exists:
+                                _reason = (
+                                    "verified source listing in this zone"
+                                    if _same_verified_source_zone
+                                    else "verified Site Listing already exists in this zone"
+                                )
+                                print(
+                                    f"↩️ [Cross-Seed] [{site}/{_zone_for_skip['zone_id']}] "
+                                    f"skipped: {_reason}."
+                                )
+                                continue
 
                     # ---------------------------------------------------------
                     # A. Resolve target URL
@@ -10283,53 +11184,6 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                     str(site or "").casefold(),
                                 )
 
-                                source_is_verified = (
-                                    cross_seed_target.get(
-                                        "source_site_verified"
-                                    ) is True
-                                )
-
-                                if (
-                                    source_is_verified
-                                    and source_site_key
-                                    and source_site_key != "unknown"
-                                    and source_site_key == candidate_site_key
-                                ):
-                                    print(
-                                        f"↩️ [Cross-Seed] [{site}] "
-                                        "verified source site; not a cross-seed target"
-                                    )
-                                    continue
-
-                                raw_known_sites = (
-                                    cross_seed_target.get("known_sites") or []
-                                )
-
-                                if not isinstance(
-                                    raw_known_sites,
-                                    (list, tuple, set)
-                                ):
-                                    raw_known_sites = []
-
-                                known_site_keys = {
-                                    re.sub(
-                                        r"[^a-z0-9]+",
-                                        "",
-                                        str(value or "").casefold()
-                                    )
-                                    for value in raw_known_sites
-                                }
-
-                                if (
-                                    candidate_site_key
-                                    and candidate_site_key in known_site_keys
-                                ):
-                                    print(
-                                        f"↩️ [Cross-Seed] [{site}] "
-                                        "hash already observed on this site"
-                                    )
-                                    continue
-
                                 try:
                                     target_bytes = int(
                                         cross_seed_target.get("target_size_bytes", 0) or 0
@@ -10386,17 +11240,22 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
 
                                         # Keep exact source context for a later,
                                         # verified add stage.
-                                        "source_hash": cross_seed_target.get("source_hash", ""),
-                                        "source_node": cross_seed_target.get("source_node"),
-                                        "source_node_config": cross_seed_target.get("source_node_config"),
-                                        "source_node_name": cross_seed_target.get("source_node_name", ""),
-                                        "source_save_path": cross_seed_target.get("source_save_path", ""),
-                                        "source_torrent_name": cross_seed_target.get("source_torrent_name", ""),
-                                        "source_size_bytes": cross_seed_target.get("source_size_bytes", 0),
+                                        "source_hash": _cs_preflight.get("source_hash", cross_seed_target.get("source_hash", "")),
+                                        "source_node": _cs_preflight.get("source_node"),
+                                        "source_node_config": _cs_preflight.get("source_node_config"),
+                                        "source_node_name": _cs_preflight.get("source_node_name", ""),
+                                        "source_save_path": _cs_preflight.get("source_save_path", ""),
+                                        "source_torrent_name": _cs_preflight.get("source_torrent_name", ""),
+                                        "source_size_bytes": _cs_preflight.get("source_size_bytes", 0),
                                         "source_site": cross_seed_target.get("source_site", "Unknown"),
                                         "source_site_verified": (
                                             cross_seed_target.get("source_site_verified") is True
                                         ),
+                                        "source_zone_id": cross_seed_target.get("source_zone_id", "unknown"),
+                                        "source_zone_verified": (
+                                            cross_seed_target.get("source_zone_verified") is True
+                                        ),
+                                        "source_zone_evidence": cross_seed_target.get("source_zone_evidence"),
                                         "known_sites": list(
                                             cross_seed_target.get("known_sites") or []
                                         ),
@@ -10532,25 +11391,49 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                     print("❌ ไม่สามารถดาวน์โหลดไฟล์ได้แม้จะลองคลิกผ่าน Browser แล้ว")
 
                             # ---------------------------------------------------------
+                            # ---------------------------------------------------------
                             # 6. CHECK DUPLICATE HASH & SYNC
                             # ---------------------------------------------------------
                             if download_ready:
-                                is_duplicate = False
-                                target_node_name = ""
-
-                                # Verify duplicate status using tri-state results.
+                                # Site history prevents repeated processing,
+                                # but never proves that a torrent exists on a Node.
                                 seen_hash_duplicate = t_hash in seen_hashes
-                                is_duplicate = seen_hash_duplicate
-                                target_node_name = ""
+
+                                matched_nodes = []
                                 inventory_check_failed = not bool(active_nodes)
+                                checked_node_names = set()
 
-                                if not active_nodes:
-                                    print(
-                                        "⚠️ [Mapper] ไม่มี Active Node "
-                                        "สำหรับตรวจสอบ Duplicate"
-                                    )
-
+                                # Check every Active Node. Do not stop at
+                                # the first positive match.
                                 for node_obj, _ in active_nodes:
+                                    node_name = str(
+                                        getattr(
+                                            node_obj,
+                                            "name",
+                                            ""
+                                        ) or ""
+                                    ).strip()
+
+                                    if not node_name:
+                                        inventory_check_failed = True
+                                        print(
+                                            "⚠️ [Mapper] Active Node "
+                                            "has no usable Node name"
+                                        )
+                                        continue
+
+                                    node_key = node_name.casefold()
+
+                                    if node_key in checked_node_names:
+                                        inventory_check_failed = True
+                                        print(
+                                            f"⚠️ [Mapper] Duplicate Active Node "
+                                            f"name: {node_name!r}"
+                                        )
+                                        continue
+
+                                    checked_node_names.add(node_key)
+
                                     exists_method = getattr(
                                         node_obj,
                                         "is_torrent_exists",
@@ -10560,8 +11443,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                     if not callable(exists_method):
                                         inventory_check_failed = True
                                         print(
-                                            f"⚠️ [Mapper] "
-                                            f"[{getattr(node_obj, 'name', 'Unknown')}] "
+                                            f"⚠️ [Mapper] [{node_name}] "
                                             "ไม่มี Hash verification method"
                                         )
                                         continue
@@ -10571,81 +11453,153 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                     except Exception as check_error:
                                         exists = None
                                         print(
-                                            f"⚠️ [Mapper] "
-                                            f"[{getattr(node_obj, 'name', 'Unknown')}] "
+                                            f"⚠️ [Mapper] [{node_name}] "
+                                            f"{type(check_error).__name__}: "
                                             f"{check_error}"
                                         )
 
-                                    if (
-                                        exists is None
-                                        or type(exists) is not bool
-                                    ):
+                                    if type(exists) is not bool:
                                         inventory_check_failed = True
+                                        print(
+                                            f"⚠️ [Mapper] [{node_name}] "
+                                            "Hash verification inconclusive"
+                                        )
                                         continue
 
                                     if exists is True:
-                                        is_duplicate = True
-                                        target_node_name = getattr(
-                                            node_obj,
-                                            "name",
-                                            "Unknown"
+                                        matched_nodes.append(
+                                            (node_obj, node_name)
                                         )
-                                        break
 
-                                # If no positive duplicate is located and
-                                # a Node cannot be verified, fail closed.
-                                if (
-                                    inventory_check_failed
-                                    and not target_node_name
-                                ):
+                                duplicate_state = _classify_hash_presence_state(
+                                    seen_hash_duplicate,
+                                    len(matched_nodes),
+                                    inventory_check_failed,
+                                )
+
+                                # ------------------------------------------------
+                                # Live duplicate: persist every positively
+                                # verified Node location independently.
+                                # ------------------------------------------------
+                                if duplicate_state == "live_duplicate":
+                                    matched_names = [
+                                        node_name
+                                        for _, node_name in matched_nodes
+                                    ]
+
+                                    print(
+                                        f"❌ Live duplicate [...{t_hash[-5:]}] "
+                                        f"found on {len(matched_nodes)} Node(s): "
+                                        f"{', '.join(matched_names)}"
+                                    )
+
+                                    seen_ids.add(t_id)
+                                    seen_hashes.add(t_hash)
+
+                                    sync_data = {
+                                        "hash": t_hash,
+                                        "observed_site": site,
+                                        "observed_torrent_id": t_id,
+                                        "observed_details_url": details_url,
+                                        "observed_release_name": raw_title,
+                                        "observed_web_size": data.get(
+                                            "size_str", ""
+                                        ),
+                                    }
+
+                                    sync_success_nodes = []
+                                    sync_failed_nodes = []
+
+                                    for node_obj, node_name in matched_nodes:
+                                        sync_method = getattr(
+                                            node_obj,
+                                            "sync_to_mapping",
+                                            None
+                                        )
+
+                                        if not callable(sync_method):
+                                            sync_failed_nodes.append(node_name)
+                                            print(
+                                                f"⚠️ [Mapper] [{node_name}] "
+                                                "ไม่มี sync_to_mapping()"
+                                            )
+                                            continue
+
+                                        try:
+                                            sync_result = await sync_method(
+                                                web_data_list=[sync_data]
+                                            )
+                                        except Exception as sync_error:
+                                            sync_result = False
+                                            print(
+                                                f"⚠️ [Mapper] [{node_name}] "
+                                                f"Sync exception: "
+                                                f"{type(sync_error).__name__}: "
+                                                f"{sync_error}"
+                                            )
+
+                                        if sync_result is True:
+                                            sync_success_nodes.append(node_name)
+                                        else:
+                                            sync_failed_nodes.append(node_name)
+
+                                    print(
+                                        f"📍 [Mapper] Location sync result: "
+                                        f"success={sync_success_nodes!r}, "
+                                        f"failed={sync_failed_nodes!r}"
+                                    )
+
+                                    # A live positive match always prevents
+                                    # another Add, even if another Node failed.
+                                    await handle_thanks_click(
+                                        browser_instance,
+                                        details_url
+                                    )
+                                    count_skip += 1
+                                    download_ready = False
+
+                                # ------------------------------------------------
+                                # No positive match + incomplete checks:
+                                # fail closed; do not Add or assign a fallback.
+                                # ------------------------------------------------
+                                elif duplicate_state == "inventory_incomplete":
                                     print(
                                         f"🛑 [Mapper] Hash={t_hash[:12]} "
-                                        "ตรวจสอบ Duplicate ไม่ครบ "
+                                        "ตรวจสอบ Active Node ไม่ครบ "
+                                        "และไม่มี Node ใดยืนยันว่าพบ Hash "
                                         "ยกเลิกการ Add รอบนี้"
                                     )
                                     download_ready = False
 
-                                elif is_duplicate:
+                                # ------------------------------------------------
+                                # Historical site observation only:
+                                # preserve old skip behaviour, but never assign
+                                # a Node or create a Node location from history.
+                                # ------------------------------------------------
+                                elif duplicate_state == "history_duplicate":
+                                    print(
+                                        f"⏭️ [Mapper] Hash={t_hash[:12]} "
+                                        "อยู่ใน Site History แต่ไม่พบใน Live "
+                                        "Inventory ของ Node ที่ตรวจครบ "
+                                        "ข้ามการประมวลผลซ้ำโดยไม่บันทึก Node"
+                                    )
 
-                                    effective_node_name = target_node_name
-                                    if not effective_node_name and active_nodes:
-                                        effective_node_name = active_nodes[0][0].name
-                                        print(f" ⚠️ [Mapper]: ไม่พบชื่อ Node ของแฮชนี้ กำลังใช้ Node สำรอง: {effective_node_name}")
-
-                                    print(f" ❌ ข้าม: ตรวจพบ Hash [...{t_hash[-5:]}] ซ้ำในระบบ/วิ่งอยู่ใน {effective_node_name or 'Unknown Node'}")
                                     seen_ids.add(t_id)
                                     seen_hashes.add(t_hash)
 
-                                    # ซิงค์ข้อมูลลง Mapping
-                                    if effective_node_name:
-                                        # This site only observed the hash.
-                                        # It is not necessarily the source tracker.
-                                        sync_data = {
-                                            "hash": t_hash,
-                                            "observed_site": site,
-                                            "observed_torrent_id": t_id,
-                                            "observed_details_url": details_url,
-                                            "observed_release_name": raw_title,
-                                            "observed_web_size": data.get("size_str", ""),
-                                        }
-
-                                        synced = False
-                                        for node_obj, _ in active_nodes:
-                                            if node_obj.name == effective_node_name:
-                                                if hasattr(node_obj, 'sync_to_mapping'):
-                                                    await node_obj.sync_to_mapping(web_data_list=[sync_data])
-                                                synced = True
-                                                break
-
-                                        if not synced and active_nodes and hasattr(active_nodes[0][0], 'sync_to_mapping'):
-                                            await active_nodes[0][0].sync_to_mapping(web_data_list=[sync_data])
-
-                                    # กดปุ่ม ขอบคุณ (Thanks) และข้าม
-                                    await handle_thanks_click(browser_instance, details_url)
+                                    await handle_thanks_click(
+                                        browser_instance,
+                                        details_url
+                                    )
                                     count_skip += 1
                                     download_ready = False
 
-                            # ---------------------------------------------------------
+                                # eligible_for_add:
+                                # all Nodes returned False and this site's
+                                # history does not contain the hash.
+                                # Continue to the existing Add workflow.
+
+
                             # 7. PROCESS & SEND TO CLIENT NODE
                             # ---------------------------------------------------------
                             if download_ready:
@@ -10747,7 +11701,20 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                         if 'safe_add_torrent' in globals():
                                             result = safe_add_torrent(node_obj, raw_bytes, site)
                                         elif hasattr(node_obj, 'add_torrent'):
-                                            result = await node_obj.add_torrent(torrent_bytes=raw_bytes, category=site)
+                                            if globals().get(
+                                                "PHASE_G_ALLOW_NORMAL_TORRENT_ADD",
+                                                False
+                                            ) is True:
+                                                result = await node_obj.add_torrent(
+                                                    torrent_bytes=raw_bytes,
+                                                    category=site
+                                                )
+                                            else:
+                                                print(
+                                                    f"🔒 [{node_name}] "
+                                                    "Normal Torrent Add blocked (Phase G)"
+                                                )
+                                                result = False
 
                                         if result:
                                             size_gb_val = t_size_gb if t_size_gb is not None else 0.0
@@ -10769,7 +11736,12 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                                 "release_name": raw_title,
                                                 "web_size": data.get('size_str', ''),
                                                 "download_url": download_url,
-                                                "details_url": details_url
+                                                "details_url": details_url,
+                                                "source_zone_meta": (
+                                                    dict(source_zone_meta)
+                                                    if isinstance(source_zone_meta, dict)
+                                                    else None
+                                                ),
                                             }
 
                                             client_response_payload = {
@@ -12182,6 +13154,17 @@ async def audit_cross_seed_execution_plan(matches, active_nodes):
             "No candidate met verified Zone listing conditions"
         )
 
+@_mapping_transactional
+async def _persist_cross_seed_linking():
+    if globals().get("PHASE_G_ALLOW_MAPPING_WRITES", False) is not True:
+        print("🔒 [Cross-Seed Linking] Persistence blocked by Phase G.")
+        return False
+
+    mapping_data = await load_mapping()
+    updated_mapping = process_cross_seed_linking(mapping_data)
+    return await save_mapping(updated_mapping)
+
+
 async def main():
     global browser_instance
     loop = asyncio.get_running_loop()
@@ -12231,15 +13214,19 @@ async def main():
                     await asyncio.sleep(2)  
 
                     if hasattr(node, '_sweeper_force_start'):
-                        node._sweeper_force_start()
+                        if n_cfg.get('allow_sweeper_auto_resume', False) is True:
+                            node._sweeper_force_start()
+                        else:
+                            print(
+                                f"🔒 [{node.name}] Sweeper Auto-Resume disabled "
+                                "(set allow_sweeper_auto_resume=true to opt in)"
+                            )
 
                     node.refresh_status()
                     
                     await node.sync_to_mapping()
                     
-                    mapping_data = await load_mapping()
-                    updated_mapping = process_cross_seed_linking(mapping_data)
-                    await save_mapping(updated_mapping)
+                    await _persist_cross_seed_linking()
 
                     gained = node.free_gb - pre_free
                     if gained > 0.01:
@@ -12253,9 +13240,22 @@ async def main():
                 line = f"{icon} [{node.name}] {getattr(node, 'stat_msg', 'N/A')}"
                 print(line)
                 node_status_buffer.append(line)
-                update_trackers(node)
+                if globals().get(
+                    "PHASE_G_ALLOW_STARTUP_REANNOUNCE", False
+                ) is True:
+                    update_trackers(node)
+                else:
+                    print(
+                        f"🔒 [{node.name}] "
+                        "Startup Re-announce disabled (Phase G)"
+                    )
 
-            if active_nodes:
+            if (
+                active_nodes
+                and globals().get(
+                    "PHASE_G_ALLOW_STARTUP_REANNOUNCE", False
+                ) is True
+            ):
                 print("⏳ Waiting 5s for trackers to sync with All Trackers")
                 await asyncio.sleep(5)
 
@@ -12357,13 +13357,27 @@ async def main():
                                 client_torrent.get("hash") or ""
                             ).strip().upper()
 
-                            if not torrent_hash:
+                            if not re.fullmatch(
+                                r"(?:[0-9A-F]{40}|[0-9A-F]{64})",
+                                torrent_hash,
+                            ):
                                 raise ValueError(
-                                    "Torrent entry missing hash"
+                                    "Torrent entry has invalid v1/v2 hash"
+                                )
+
+                            if torrent_hash in node_live_hashes:
+                                raise ValueError(
+                                    f"Duplicate hash in node inventory: {torrent_hash}"
                                 )
 
                             node_live_hashes.add(torrent_hash)
                             node_hash_count += 1
+
+                            # Mapping currently stores v1 SHA1 hashes only.
+                            # Keep v2 hashes in the live-presence set, but do
+                            # not treat them as v1 Cross-Seed source records.
+                            if len(torrent_hash) != 40:
+                                continue
 
                             # Only fully completed torrents are valid
                             # Cross-Seed sources.
@@ -12394,12 +13408,13 @@ async def main():
                             ):
                                 node_source_inventory.setdefault(
                                     torrent_hash,
-                                    {
-                                        "node": node_obj,
-                                        "n_cfg": node_cfg,
-                                        "torrent": client_torrent,
-                                    },
-                                )
+                                    [],
+                                ).append({
+                                    "node": node_obj,
+                                    "n_cfg": node_cfg,
+                                    "torrent": client_torrent,
+                                    "node_name": str(node_name),
+                                })
 
                         # --------------------------------------------
                         # Atomic commit: reached only after all
@@ -12407,13 +13422,18 @@ async def main():
                         # --------------------------------------------
                         live_hashes.update(node_live_hashes)
 
-                        for torrent_hash, source_record in (
+                        for torrent_hash, source_records in (
                             node_source_inventory.items()
                         ):
-                            source_inventory.setdefault(
+                            committed_records = source_inventory.setdefault(
                                 torrent_hash,
-                                source_record
+                                [],
                             )
+                            if not isinstance(committed_records, list):
+                                raise TypeError(
+                                    "Global source inventory candidate list is invalid"
+                                )
+                            committed_records.extend(source_records)
 
                         inventory_nodes_ok += 1
 
@@ -12514,7 +13534,8 @@ async def main():
 
                             print(
                                 f"\n[{index}/{len(cross_seed_targets)}] "
-                                f"[TARGET] {target['source_site']} | "
+                                f"[TARGET] {target['source_site']} / "
+                                f"{target.get('source_zone_id', 'unknown') if target.get('source_zone_verified') is True else 'zone-unknown'} | "
                                 f"{target['keyword']} | "
                                 f"{target['target_size_bytes']} bytes"
                             )
