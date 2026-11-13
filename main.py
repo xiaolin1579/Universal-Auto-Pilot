@@ -3951,7 +3951,7 @@ class QbitNode:
             )
             return None
 
-    def delete_torrent(self, hash_str):
+    def delete_torrent(self, hash_str, delete_files=False):
         if not self.is_connected and not self.login(): 
             return False
 
@@ -3960,7 +3960,7 @@ class QbitNode:
             r = self._execute_request(
                 'POST', 
                 f"{self.url}/api/v2/torrents/delete", 
-                data={"hashes": hash_str, "deleteFiles": "true"}, 
+                data={"hashes": hash_str, "deleteFiles": "true" if delete_files is True else "false"},
                 timeout=10
             )
             return r is not None and r.status_code == 200
@@ -5142,8 +5142,14 @@ class RtorrentNode:
                     for row in values[0])
         )
 
-    def delete_torrent(self, t_hash):
-        """Hard Delete: หยุดและลบข้อมูลในคำสั่งเดียว (Atomic Operation)"""
+    def delete_torrent(self, t_hash, delete_files=False):
+        """Erase only after exclusive-data ownership was verified by Cleaner.
+
+        Erase hooks may delete files; rTorrent cannot promise torrent-only removal.
+        """
+        if delete_files is not True:
+            print(f"🔒 [{self.name}] Keeping torrent: erase hooks may delete shared data")
+            return False
         #สิ่งที่ต้องเพิ่มใน .rtorrent.rc
         #ให้เพิ่มบรรทัดนี้ไว้ก่อนบรรทัด # -- END HERE --:
         #method.set_key = event.download.erased, delete_tied, "execute={rm,-rf,--,$d.base_path=}"
@@ -5685,6 +5691,82 @@ def safe_add_torrent(node, content, site):
         
 # ========================= AUTO CLEAN =========================
 
+def _storage_path(value):
+    """Normalize remote Linux paths without accepting relative or traversal paths."""
+    import posixpath
+    value = str(value or "")
+    if not value.startswith("/") or ".." in value.split("/") or "\x00" in value:
+        raise ValueError("Unverifiable remote storage path")
+    normalized = posixpath.normpath(value)
+    if normalized == "/":
+        raise ValueError("Refusing storage-root deletion")
+    return normalized
+
+
+def _storage_file(base, relative):
+    import posixpath
+    relative = str(relative or "")
+    if not relative or relative.startswith("/") or ".." in relative.split("/"):
+        raise ValueError("Invalid relative file path")
+    return _storage_path(posixpath.join(_storage_path(base), relative))
+
+
+def _read_storage_inventory(node):
+    """Read all jobs and file references; any incomplete response blocks data deletion."""
+    result = []
+    if isinstance(node, QbitNode):
+        response = node._execute_request("GET", node.url + "/api/v2/torrents/info",
+                                         timeout=15, verify=True, allow_redirects=False)
+        if response is None or response.status_code != 200:
+            raise ValueError("Inventory unavailable")
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise ValueError("Invalid inventory")
+        for row in rows:
+            torrent_hash = str(row["hash"]).lower()
+            root = _storage_path(row.get("content_path"))
+            response = node._execute_request("GET", node.url + "/api/v2/torrents/files",
+                                             params={"hash": torrent_hash}, timeout=15,
+                                             verify=True, allow_redirects=False)
+            if response is None or response.status_code != 200:
+                raise ValueError("File inventory unavailable")
+            files = response.json()
+            if not isinstance(files, list) or not files:
+                raise ValueError("Incomplete file inventory")
+            paths = {_storage_file(row.get("save_path"), f["name"]) for f in files}
+            result.append({"hash": torrent_hash, "root": root, "files": paths})
+    elif isinstance(node, RtorrentNode):
+        def read(method, params):
+            response = node.s.post(node.url, data=xmlrpc.client.dumps(params, methodname=method),
+                                   auth=node.auth, headers=node.headers, timeout=15,
+                                   verify=True, allow_redirects=False)
+            if response.status_code != 200:
+                raise ValueError("rTorrent storage inventory unavailable")
+            values, _ = xmlrpc.client.loads(response.content)
+            if len(values) != 1 or not isinstance(values[0], (list, tuple)):
+                raise ValueError("Invalid rTorrent storage inventory")
+            return values[0]
+        rows = read("d.multicall2", ("", "main", "d.hash=", "d.directory=", "d.base_path="))
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) != 3:
+                raise ValueError("Incomplete rTorrent storage row")
+            torrent_hash, directory, root = row
+            files = read("f.multicall", (torrent_hash, "", "f.path="))
+            if not files or any(not isinstance(f, (list, tuple)) or len(f) != 1 for f in files):
+                raise ValueError("Incomplete rTorrent file inventory")
+            result.append({"hash": str(torrent_hash).lower(), "root": _storage_path(root),
+                           "files": {_storage_file(directory, f[0]) for f in files}})
+    else:
+        raise ValueError("Unsupported storage inventory client")
+    hashes = [r["hash"] for r in result]
+    if len(hashes) != len(set(hashes)) or any(not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", h) for h in hashes):
+        raise ValueError("Ambiguous storage inventory")
+    for row in result:
+        if any(f != row["root"] and not f.startswith(row["root"] + "/") for f in row["files"]):
+            raise ValueError("File lies outside verified content root")
+    return result
+
+
 class NodeCleaner:
     _PROTECTED_CACHE_STORAGE = None
 
@@ -6171,6 +6253,50 @@ class NodeCleaner:
             sorted(tracker_sites),
         )
 
+    def _can_delete_data(self, t_hash):
+        """Require complete live references on every configured client sharing storage."""
+        clients = globals().get("CFG", {}).get("NODES", [])
+        own = [c for c in clients if c.get("name") == self.node.name]
+        if len(own) != 1:
+            return False
+
+        def storage_key(config):
+            return str(config.get("storage_id") or
+                       urlsplit(config.get("url", "")).hostname or "").casefold()
+
+        key = storage_key(own[0])
+        if not key:
+            return False
+        peers = []
+        try:
+            inventory = _read_storage_inventory(self.node)
+            targets = [r for r in inventory if r["hash"] == str(t_hash).lower()]
+            if len(targets) != 1:
+                return False
+            target = targets[0]
+            references = [r for r in inventory if r is not target]
+            # Include disabled clients too: their existing jobs can still own files.
+            for config in clients:
+                if config is own[0] or storage_key(config) != key:
+                    continue
+                peer = RtorrentNode(config) if config.get("type") == "rtorrent" else QbitNode(config)
+                peers.append(peer)
+                if not peer.login():
+                    return False
+                references.extend(_read_storage_inventory(peer))
+            for other in references:
+                a, b = target["root"], other["root"]
+                if (target["files"] & other["files"] or a == b
+                        or a.startswith(b + "/") or b.startswith(a + "/")):
+                    return False
+            return True
+        except Exception as exc:
+            print(f"🔒 [{self.node.name}] Data ownership unverified: {type(exc).__name__}")
+            return False
+        finally:
+            for peer in peers:
+                peer.s.close()
+
     def _hard_purge_sequence(self, t_hash):
         """Final fail-closed authorization gate before deletion."""
 
@@ -6191,6 +6317,11 @@ class NodeCleaner:
             )
             return False
 
+        delete_files = self._can_delete_data(t_hash)
+        if not delete_files and isinstance(self.node, RtorrentNode):
+            print(f"🔒 [{self.node.name}] Shared or unverified data; keeping rTorrent job and files")
+            return False
+
         site_label = ",".join(sites)
 
         print(
@@ -6209,11 +6340,17 @@ class NodeCleaner:
             if not self.node.stop_torrent(t_hash):
                 return False
 
-            success = self.node.delete_torrent(t_hash)
+            # Re-read references after stopping; never rely on a pre-stop snapshot.
+            if delete_files:
+                delete_files = self._can_delete_data(t_hash)
+                if not delete_files and isinstance(self.node, RtorrentNode):
+                    return False
+            success = self.node.delete_torrent(t_hash, delete_files=delete_files)
 
             if success:
-                self._update_db_status(t_hash, "DELETED")
-                print(f"✅ [PURGE] ลบสำเร็จ: {t_hash}")
+                if delete_files:
+                    self._update_db_status(t_hash, "DELETED")
+                print(f"✅ [PURGE] Removed job: {t_hash}; delete_files={delete_files}")
                 return True
 
             print(f"❌ [PURGE] Delete API failed: {t_hash}")
