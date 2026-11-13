@@ -2665,12 +2665,48 @@ class QbitNode:
                 + urllib.parse.urlencode({"next": account_next})
             )
 
+            # OnlyOne authenticates at the central hub, then returns to this node.
+            trusted_origins = {origin}
+            if parsed.scheme == "https" and (
+                parsed.hostname == "onlyoneseedbox.opik.net"
+                or parsed.hostname.endswith(".onlyoneseedbox.opik.net")
+            ):
+                trusted_origins.add("https://onlyoneseedbox.opik.net")
+
+            def trusted_url(url):
+                target = urllib.parse.urlsplit(url)
+                return (
+                    not target.username and not target.password
+                    and f"{target.scheme}://{target.netloc}" in trusted_origins
+                )
+
+            def sso_request(method, url, **kwargs):
+                # Validate every hop before sending cookies or login fields.
+                for _ in range(10):
+                    if not trusted_url(url):
+                        raise ValueError("Untrusted Provider SSO redirect")
+                    response = self._execute_request(
+                        method, url, allow_redirects=False, **kwargs
+                    )
+                    if response is None or response.status_code not in (301, 302, 303, 307, 308):
+                        return response
+                    location = response.headers.get("Location")
+                    if not location:
+                        return response
+                    url = urllib.parse.urljoin(url, location)
+                    if response.status_code == 303 or (
+                        response.status_code in (301, 302) and method == "POST"
+                    ):
+                        method = "GET"
+                        kwargs.pop("data", None)
+                        kwargs.pop("headers", None)
+                raise ValueError("Too many Provider SSO redirects")
+
             # Stage 1: Provider login form
-            page = self._execute_request(
+            page = sso_request(
                 "GET",
                 login_url,
-                timeout=15,
-                allow_redirects=False
+                timeout=15
             )
 
             if page is None or page.status_code != 200:
@@ -2686,6 +2722,7 @@ class QbitNode:
             if "html" not in content_type:
                 return fail("Provider login page is not HTML")
 
+            login_url = page.url
             soup = BeautifulSoup(page.text, "html.parser")
             form = None
 
@@ -2697,9 +2734,7 @@ class QbitNode:
                 action_parts = urllib.parse.urlsplit(action)
 
                 if (
-                    action_parts.hostname
-                    and action_parts.hostname.casefold()
-                    == parsed.hostname.casefold()
+                    trusted_url(action)
                     and action_parts.path == "/login.php"
                     and candidate.get("method", "get").upper() == "POST"
                 ):
@@ -2727,16 +2762,18 @@ class QbitNode:
                 form.get("action") or login_url
             )
 
-            provider_response = self._execute_request(
+            provider_response = sso_request(
                 "POST",
                 action,
                 data=fields,
                 headers={
-                    "Origin": origin,
+                    "Origin": "{}://{}".format(
+                        urllib.parse.urlsplit(action).scheme,
+                        urllib.parse.urlsplit(action).netloc
+                    ),
                     "Referer": login_url
                 },
-                timeout=20,
-                allow_redirects=True
+                timeout=20
             )
 
             if provider_response is None:
@@ -2774,14 +2811,13 @@ class QbitNode:
             # Stage 2: Dashboard SSO hand-off.
             go_url = origin + account_path + "/go/qbittorrent"
 
-            go_response = self._execute_request(
+            go_response = sso_request(
                 "GET",
                 go_url,
                 headers={
                     "Referer": origin + account_path + "/"
                 },
-                timeout=20,
-                allow_redirects=True
+                timeout=20
             )
 
             if go_response is None:
@@ -2801,7 +2837,7 @@ class QbitNode:
                 )
 
             if not any(
-                c.name == "SID"
+                c.name == "SID" or re.fullmatch(r"QBT_SID_\d+", c.name)
                 for c in self.s.cookies
             ):
                 return fail("qBittorrent SID not established")
