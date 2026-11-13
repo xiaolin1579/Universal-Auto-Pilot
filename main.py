@@ -80,14 +80,7 @@ MAPPING_FILE = os.path.join(BASE_DIR, "torrent_mapping.json")
 
 # UAP_PHASE_F_RESUME_RECLAIM_GUARDS_V1
 # Automatic resume is opt-in per node; absent/false means keep paused.
-# PURGE_AUTH_DRYRUN_PATCH_V1
-# Phase A: Read-only authorization; deletion remains disabled.
-PURGE_AUTH_DRY_RUN = True
 
-# Phase G Controlled Runtime Test: fail-closed defaults.
-PHASE_G_ALLOW_STARTUP_REANNOUNCE = False
-PHASE_G_ALLOW_NORMAL_TORRENT_ADD = False
-PHASE_G_ALLOW_MAPPING_WRITES = False
 
 # Exact tracker hostname aliases supplied and verified by operator.
 PURGE_TRACKER_HOST_ALIASES = {
@@ -511,10 +504,6 @@ def _mapping_transactional(func):
 
 def _atomic_save_mapping_file(data):
     """Atomic JSON replacement with fsync and original mode/ownership preservation."""
-    if globals().get("PHASE_G_ALLOW_MAPPING_WRITES", False) is not True:
-        raise RuntimeError(
-            "Mapping file write blocked by Phase G safety gate"
-        )
     import json
     import os
     import stat
@@ -578,9 +567,6 @@ async def load_mapping():
 
 async def save_mapping(data):
     """Persist Mapping through the shared transaction and atomic writer."""
-    if globals().get("PHASE_G_ALLOW_MAPPING_WRITES", False) is not True:
-        print("🔒 [Mapping] Save blocked by Phase G; read-only mode.")
-        return False
     if not isinstance(data, dict) or not isinstance(data.get("torrents"), list):
         raise ValueError("Invalid Mapping structure; refusing write")
 
@@ -893,9 +879,6 @@ async def add_or_update_torrent(client_data, web_data=None, node_data=None):
 
     Unknown source metadata is never promoted from observed_site.
     """
-    if globals().get("PHASE_G_ALLOW_MAPPING_WRITES", False) is not True:
-        print("🔒 [Mapper] Update blocked by Phase G; read-only mode.")
-        return False
 
     data = await load_mapping()
     torrents = data.get("torrents", [])
@@ -1501,9 +1484,6 @@ def _validate_mapping_source_zone_evidence(evidence, source_site, torrent_id, de
 @_mapping_transactional
 async def record_cross_seed_site_listings(updates):
     """Persist only exact-manifest, complete-inventory, tracker-verified listings."""
-    if globals().get("PHASE_G_ALLOW_MAPPING_WRITES", False) is not True:
-        print("🔒 [Site Listings] Persistence blocked by Phase G.")
-        return False
     from datetime import datetime, timezone
     from urllib.parse import parse_qs, urlsplit
 
@@ -1694,9 +1674,6 @@ async def record_cross_seed_known_sites(updates):
     Only known_sites is modified.
     Source provenance and torrent/tracker state are never changed.
     """
-    if globals().get("PHASE_G_ALLOW_MAPPING_WRITES", False) is not True:
-        print("🔒 [Known Sites] Persistence blocked by Phase G.")
-        return False
 
     normalized = {}
 
@@ -4220,12 +4197,6 @@ class QbitNode:
         found in this Node's live inventory and every Mapper call
         returns exactly True.
         """
-        if globals().get("PHASE_G_ALLOW_MAPPING_WRITES", False) is not True:
-            print(
-                f"🔒 [{self.name}] Mapping sync disabled by Phase G; "
-                "no Mapper calls performed."
-            )
-            return False
 
         if not self.is_connected:
             if not self.login():
@@ -4789,14 +4760,6 @@ def update_trackers(node):
         return False
 
 def safe_add_torrent(node, content, site):
-    if globals().get(
-        "PHASE_G_ALLOW_NORMAL_TORRENT_ADD", False
-    ) is not True:
-        print(
-            f"🔒 [{getattr(node, 'name', 'Unknown')}] "
-            "Normal Torrent Add blocked (Phase G)"
-        )
-        return False
 
     # ตรวจสอบก่อนว่ามันเป็น callable หรือไม่
     if hasattr(node, 'add') and callable(node.add):
@@ -5290,7 +5253,7 @@ class NodeCleaner:
         )
 
     def _hard_purge_sequence(self, t_hash):
-        """Final fail-closed authorization gate. Phase A is Dry Run only."""
+        """Final fail-closed authorization gate before deletion."""
 
         try:
             allowed, reason, live, sites = (
@@ -5319,13 +5282,6 @@ class NodeCleaner:
             f"| amount_left={live.get('amount_left')}"
         )
 
-        if globals().get("PURGE_AUTH_DRY_RUN", True) is True:
-            print(
-                f"🧪 [PURGE DRY-RUN] WOULD_ALLOW "
-                f"| {reason} | {t_hash} "
-                f"| No torrent mutation performed."
-            )
-            return False
 
         try:
             print(f"🔄 [PURGE] Starting deletion sequence: {t_hash}")
@@ -5387,7 +5343,7 @@ class NodeCleaner:
                 print(
                     f"⚠️ [{self.node.name}] "
                     "ยังไม่สามารถยืนยันพื้นที่ตามเป้าหมายได้ "
-                    "(Dry Run / Guard / API / Insufficient Space)"
+                    "(Guard / API / Insufficient Space)"
                 )
 
             return
@@ -5638,7 +5594,7 @@ class NodeCleaner:
             # เลือกเป้าหมาย
             targets = scannable_torrents[:15 if is_emergency else 6]
             
-            # 4. Authorization / Dry-Run / Purge
+            # 4. Authorization / Purge
             for t in targets:
                 print(
                     f"🔎 [PURGE CANDIDATE] "
@@ -5665,8 +5621,7 @@ class NodeCleaner:
                 f"📊 [RECLAIM RETURN AUDIT] "
                 f"free={final_free:.2f}GB "
                 f"target={target_free:.2f}GB "
-                f"ready={space_ready} "
-                f"dry_run={globals().get('PURGE_AUTH_DRY_RUN', True)}"
+                f"ready={space_ready}"
             )
 
             if not space_ready:
@@ -11701,20 +11656,10 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                         if 'safe_add_torrent' in globals():
                                             result = safe_add_torrent(node_obj, raw_bytes, site)
                                         elif hasattr(node_obj, 'add_torrent'):
-                                            if globals().get(
-                                                "PHASE_G_ALLOW_NORMAL_TORRENT_ADD",
-                                                False
-                                            ) is True:
-                                                result = await node_obj.add_torrent(
-                                                    torrent_bytes=raw_bytes,
-                                                    category=site
-                                                )
-                                            else:
-                                                print(
-                                                    f"🔒 [{node_name}] "
-                                                    "Normal Torrent Add blocked (Phase G)"
-                                                )
-                                                result = False
+                                            result = await node_obj.add_torrent(
+                                                torrent_bytes=raw_bytes,
+                                                category=site
+                                            )
 
                                         if result:
                                             size_gb_val = t_size_gb if t_size_gb is not None else 0.0
@@ -13156,9 +13101,6 @@ async def audit_cross_seed_execution_plan(matches, active_nodes):
 
 @_mapping_transactional
 async def _persist_cross_seed_linking():
-    if globals().get("PHASE_G_ALLOW_MAPPING_WRITES", False) is not True:
-        print("🔒 [Cross-Seed Linking] Persistence blocked by Phase G.")
-        return False
 
     mapping_data = await load_mapping()
     updated_mapping = process_cross_seed_linking(mapping_data)
@@ -13240,22 +13182,9 @@ async def main():
                 line = f"{icon} [{node.name}] {getattr(node, 'stat_msg', 'N/A')}"
                 print(line)
                 node_status_buffer.append(line)
-                if globals().get(
-                    "PHASE_G_ALLOW_STARTUP_REANNOUNCE", False
-                ) is True:
-                    update_trackers(node)
-                else:
-                    print(
-                        f"🔒 [{node.name}] "
-                        "Startup Re-announce disabled (Phase G)"
-                    )
+                update_trackers(node)
 
-            if (
-                active_nodes
-                and globals().get(
-                    "PHASE_G_ALLOW_STARTUP_REANNOUNCE", False
-                ) is True
-            ):
+            if active_nodes:
                 print("⏳ Waiting 5s for trackers to sync with All Trackers")
                 await asyncio.sleep(5)
 
