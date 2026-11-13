@@ -403,9 +403,9 @@ def _ensure_mapping_zone_schema(data):
             raise ValueError(f"Invalid Mapping record at index {index}")
         ci = record.get("client_info")
         if not isinstance(ci, dict) or not re.fullmatch(
-            r"[0-9A-Fa-f]{40}", str(ci.get("hash") or "")
+            r"(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})", str(ci.get("hash") or "")
         ):
-            raise ValueError(f"Invalid/missing v1 infohash at Mapping index {index}")
+            raise ValueError(f"Invalid/missing infohash at Mapping index {index}")
         record.setdefault("content_group_id", None)
         record.setdefault("source_zone_id", None)
         record.setdefault("source_zone_verified", False)
@@ -538,6 +538,22 @@ def _atomic_save_mapping_file(data):
         if os.path.exists(temp_path):
             os.unlink(temp_path)
         raise
+
+
+async def initialize_mapping():
+    """Create the first mapping explicitly; never replace an existing file."""
+    async with mapping_transaction():
+        def create():
+            try:
+                with open(MAPPING_FILE, "x", encoding="utf-8") as handle:
+                    json.dump({"torrents": []}, handle)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except FileExistsError:
+                pass
+        await asyncio.to_thread(create)
+        # Corrupt or unsupported existing data must still stop startup.
+        await load_mapping()
 
 
 async def load_mapping():
@@ -792,6 +808,7 @@ def _merge_mapping_node_location(record, node_data):
     trust_rank = {
         "successful_add_response": 1,
         "live_qbittorrent_inventory": 2,
+        "live_rtorrent_inventory": 2,
     }
 
     incoming_rank = trust_rank.get(method, 0)
@@ -828,7 +845,7 @@ def _merge_mapping_node_location(record, node_data):
         )
 
     inventory_verified = (
-        method == "live_qbittorrent_inventory"
+        method in {"live_qbittorrent_inventory", "live_rtorrent_inventory"}
     )
 
     if not matches:
@@ -5170,134 +5187,73 @@ class RtorrentNode:
         except: return False
 
     async def sync_to_mapping(self, web_data_list=None, mapper_func=None):
-        """
-        ดึงข้อมูลทอร์เรนต์ทั้งหมดจาก rTorrent แล้วจับคู่กับข้อมูลเว็บเพื่ออัปเดตลง JSON Mapping (Async)
-        """
+        """Validate the complete XML-RPC inventory before updating Mapping."""
         if not self.is_connected and not self.login():
             return False
-
-        mapping = {}
+        commands = (
+            "d.hash=", "d.name=", "d.size_bytes=", "d.completed_bytes=",
+            "d.up.total=", "d.down.total=", "d.custom1=", "d.is_open=",
+            "d.is_active=", "d.state=", "d.directory=",
+        )
+        payload = xmlrpc.client.dumps(("", "main", *commands), methodname="d.multicall2")
         try:
-            xml = (
-                '<?xml version="1.0"?>'
-                '<methodCall>'
-                '<methodName>d.multicall2</methodName>'
-                '<params>'
-                '<param><value><string></string></value></param>'
-                '<param><value><string>main</string></value></param>'
-                '<param><value><string>d.hash=</string></value></param>'
-                '<param><value><string>d.name=</string></value></param>'
-                '<param><value><string>d.size_bytes=</string></value></param>'
-                '<param><value><string>d.completed_bytes=</string></value></param>'
-                '<param><value><string>d.up.total=</string></value></param>'
-                '<param><value><string>d.down.total=</string></value></param>'
-                '<param><value><string>d.custom1=</string></value></param>'
-                '<param><value><string>d.is_open=</string></value></param>'
-                '<param><value><string>d.is_active=</string></value></param>'
-                '<param><value><string>d.state=</string></value></param>'
-                '<param><value><string>d.directory=</string></value></param>'  # 👈 1. เพิ่ม d.directory= ตรงนี้
-                '</params>'
-                '</methodCall>'
-            )
-
-            req_headers = {**getattr(self, 'headers', {}), 'Connection': 'close'}
-            r = self.s.post(self.url, data=xml, auth=self.auth, headers=req_headers, timeout=20, verify=True)
-
-            if r.status_code in [401, 403]:
-                if self.login():
-                    r = self.s.post(self.url, data=xml, auth=self.auth, headers=req_headers, timeout=20, verify=True)
-
-            if r.status_code != 200:
-                print(f"❌ [{self.name}] sync_to_mapping Error: Status Code {r.status_code}")
+            response = self.s.post(self.url, data=payload, auth=self.auth,
+                                   headers=self.headers, timeout=20, verify=True)
+            if response.status_code in (401, 403) and self.login():
+                response = self.s.post(self.url, data=payload, auth=self.auth,
+                                       headers=self.headers, timeout=20, verify=True)
+            if response.status_code != 200:
                 return False
-
-            root = ET.fromstring(r.text)
-            data = root.findall(".//value/array/data/value/array/data")
-            if not data:
+            values, _ = xmlrpc.client.loads(response.content)
+            if len(values) != 1 or not isinstance(values[0], (list, tuple)):
                 return False
-
-            for item in data:
-                values = item.findall("./value")
-                if len(values) < 11:  # 👈 2. ขยับเงื่อนไขเช็คความยาวตามจำนวนพารามิเตอร์ที่เพิ่มขึ้น (0-10 รวมเป็น 11 ตัว)
-                    continue
-
-                def safe_get_text(val_node):
-                    if val_node is None: return ""
-                    for tag in ["./string", "./i4", "./int", "./i8"]:
-                        target = val_node.find(tag)
-                        if target is not None and target.text is not None:
-                            return target.text.strip()
-                    return val_node.text.strip() if val_node.text else ""
-
-                t_hash = safe_get_text(values[0]).upper()
-                if not t_hash:
-                    continue
-
-                try:
-                    size_bytes = int(safe_get_text(values[2])) if safe_get_text(values[2]).lstrip('-').isdigit() else 0
-                    completed_bytes = int(safe_get_text(values[3])) if safe_get_text(values[3]).lstrip('-').isdigit() else 0
-                    up_total = int(safe_get_text(values[4])) if safe_get_text(values[4]).lstrip('-').isdigit() else 0
-                    down_total = int(safe_get_text(values[5])) if safe_get_text(values[5]).lstrip('-').isdigit() else 0
-                    is_open = int(safe_get_text(values[7])) == 1 if safe_get_text(values[7]).lstrip('-').isdigit() else False
-                    is_active = int(safe_get_text(values[8])) == 1 if safe_get_text(values[8]).lstrip('-').isdigit() else False
-                except Exception:
-                    size_bytes, completed_bytes, up_total, down_total = 0, 0, 0, 0
-                    is_open, is_active = False, False
-
-                ratio = (up_total / size_bytes) if size_bytes > 0 else 0.0
-
-                mapping[t_hash] = {
-                    "hash": t_hash,
-                    "name": safe_get_text(values[1]),
-                    "size_bytes": size_bytes,
-                    "completed_bytes": completed_bytes,
-                    "up_total": up_total,
-                    "down_total": down_total,
-                    "ratio": round(ratio, 4),
-                    "label": safe_get_text(values[6]),
-                    "is_open": is_open,
-                    "is_active": is_active,
-                    "state": safe_get_text(values[9]),
-                    "save_path": safe_get_text(values[10])  # 👈 3. ดึงค่า Directory มาเก็บไว้ใน mapping
-                }
-
-        except Exception as e:
-            print(f"❌ [{self.name}] Exception during sync_to_mapping: {e}")
+            inventory = {}
+            for row in values[0]:
+                if not isinstance(row, (list, tuple)) or len(row) != 11:
+                    return False
+                torrent_hash = str(row[0]).strip().upper()
+                if not re.fullmatch(r"(?:[0-9A-F]{40}|[0-9A-F]{64})", torrent_hash):
+                    return False
+                if torrent_hash in inventory:
+                    return False
+                size, completed, uploaded, downloaded = map(int, row[2:6])
+                if min(size, completed, uploaded, downloaded) < 0 or completed > size:
+                    return False
+                state = "paused" if not int(row[8]) else (
+                    "seeding" if completed == size else "downloading"
+                )
+                inventory[torrent_hash] = (
+                    {"client_type": "rtorrent", "hash": torrent_hash,
+                     "name": row[1], "size_bytes": size, "state": state,
+                     "ratio": uploaded / size if size else 0.0,
+                     "up_total": uploaded, "down_total": downloaded},
+                    {"seedbox_host": self.name, "label": row[6],
+                     "is_active": bool(int(row[8])), "save_path": row[10],
+                     "verification_method": "live_rtorrent_inventory"},
+                )
+            requests = []
+            if web_data_list is not None:
+                if not isinstance(web_data_list, (list, tuple)):
+                    return False
+                for item in web_data_list:
+                    if not isinstance(item, dict):
+                        return False
+                    torrent_hash = str(item.get("hash") or "").strip().upper()
+                    if torrent_hash not in inventory:
+                        return False
+                    requests.append((torrent_hash, item))
+            else:
+                requests = [(torrent_hash, {}) for torrent_hash in inventory]
+            mapper = mapper_func if mapper_func is not None else add_or_update_torrent
+            for torrent_hash, web_data in requests:
+                client_data, node_data = inventory[torrent_hash]
+                if await mapper(client_data=client_data, web_data=web_data,
+                                node_data=node_data) is not True:
+                    return False
+            return True
+        except Exception as exc:
+            print(f"❌ [{self.name}] Mapping sync failed: {type(exc).__name__}")
             return False
-
-        if not mapping:
-            return False
-
-        save_func = mapper_func if mapper_func else add_or_update_torrent
-
-        synced_count = 0
-        for t_hash, rt_t in mapping.items():
-            client_data = {
-                "client_type": "rtorrent",
-                "hash": rt_t['hash'],
-                "name": rt_t['name'],
-                "size_bytes": rt_t['size_bytes'],
-                "state": rt_t['state'],
-                "ratio": rt_t['ratio'],
-                "up_total": rt_t['up_total'],
-                "down_total": rt_t['down_total']
-            }
-
-            node_data = {
-                "seedbox_host": self.name,
-                "label": rt_t['label'],
-                "is_active": rt_t['is_active'],
-                "save_path": rt_t.get('save_path', '')
-            }
-
-            # ส่ง web_data เป็น {} ไปก่อน
-            if await save_func(client_data=client_data, web_data={}, node_data=node_data) is not True:
-                return False
-            synced_count += 1
-
-        if synced_count > 0:
-            print(f"🔄 [{self.name}] ซิงค์ข้อมูล rTorrent เข้า Mapping เรียบร้อยแล้ว ({synced_count} รายการ)")
-        return True
 
     def get_stats_by_site(self):
         if not self.is_connected:
@@ -14003,6 +13959,7 @@ async def _persist_cross_seed_linking():
 
 
 async def main():
+    await initialize_mapping()
     global browser_instance
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
