@@ -4455,6 +4455,865 @@ class QbitNode:
             return {}
 
 
+class RtorrentNode:
+    def __init__(self, cfg):
+        self.name, self.url = cfg["name"], cfg["url"].rstrip("/")
+        self.user, self.pw = cfg["rt_user"], cfg["rt_pass"]
+        self.quota_gb = cfg.get("quota_gb", 0)
+
+        # สร้าง Session ไว้ใช้ยาวๆ ลด Overhead การสร้าง Connection ใหม่
+        self.s = requests.Session()
+
+        self.auth = HTTPBasicAuth(self.user, self.pw)
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36',
+            'Content-Type': 'text/xml'
+        }
+        self.free_gb = 0
+        self.jobs = 0
+        self.is_connected = False
+        self.stat_msg = "Active/Total: 0/0"
+
+    def login(self):
+        try:
+            # 1. ยิงทดสอบด้วยรหัสที่มีอยู่ (เริ่มต้นด้วย BasicAuth)
+            r = self.s.post(
+                self.url,
+                data='<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName></methodCall>',
+                auth=self.auth,
+                headers=self.headers,
+                timeout=10,
+                verify=True
+            )
+
+            # 2. กรณี 401 Unauthorized
+            if r.status_code == 401:
+                auth_header = r.headers.get('WWW-Authenticate', '').lower()
+                if 'digest' in auth_header:
+                    print(f"🔄 [{self.name}] Switching to Digest Auth...")
+                    self.auth = HTTPDigestAuth(self.user, self.pw)
+                    r = self.s.post(
+                        self.url,
+                        data='<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName></methodCall>',
+                        auth=self.auth,
+                        headers=self.headers,
+                        timeout=10,
+                        verify=True
+                    )
+                else:
+                    print(f"❌ [{self.name}] Login failed: 401 Unauthorized (Basic Auth)")
+
+            # 3. ตัดสินผลการเชื่อมต่อ
+            if r.status_code == 200:
+                values, _ = xmlrpc.client.loads(r.content)
+                if not values or not isinstance(values[0], (list, tuple)):
+                    self.is_connected = False
+                    return False
+                self.is_connected = True
+                print(f"✅ [{self.name}] Login successful!")
+                return True
+            elif r.status_code == 403:
+                print(f"❌ [{self.name}] Login failed: 403 Forbidden (Check permissions/IP whitelist)")
+            else:
+                print(f"⚠️ [{self.name}] Login failed with status: {r.status_code}")
+
+            self.is_connected = False
+            return False
+
+        except requests.exceptions.Timeout:
+            print(f"⏳ [{self.name}] Login failed: Request Timed Out")
+        except requests.exceptions.ConnectionError as e:
+            print(f"❌ [{self.name}] Login failed: Connection Error ({e})")
+        except Exception as e:
+            print(f"❌ [{self.name}] Login Exception: {e}")
+
+        self.is_connected = False
+        return False
+
+    def refresh_status(self):
+        if not self.is_connected:
+            return False
+
+        try:
+            # 1. ยิง XML-RPC ดึงข้อมูล (d.is_active=, d.size_bytes=, d.bytes_done=, d.hash=)
+            xml = (
+                '<?xml version="1.0"?>'
+                '<methodCall>'
+                '<methodName>d.multicall2</methodName>'
+                '<params>'
+                '<param><value><string></string></value></param>'
+                '<param><value><string>main</string></value></param>'
+                '<param><value><string>d.is_active=</string></value></param>'
+                '<param><value><string>d.size_bytes=</string></value></param>'
+                '<param><value><string>d.bytes_done=</string></value></param>'
+                '<param><value><string>d.hash=</string></value></param>'
+                '</params>'
+                '</methodCall>'
+            )
+
+            r = None
+            for attempt in range(3):
+                try:
+                    r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=10, verify=True)
+                    break
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                    if attempt < 2:
+                        time.sleep(1.0)
+                    else:
+                        print(f"⚠️ [{self.name}] rTorrent connection timed out after 3 retries")
+                        return False
+
+            if r is None:
+                return False
+
+            if r.status_code in [401, 403]:
+                print(f"🔄 [{self.name}] Session expired, attempting re-login...")
+                if self.login():
+                    return False
+                return False
+
+            if r.status_code != 200:
+                print(f"⚠️ [{self.name}] XML-RPC returned HTTP {r.status_code}")
+                return False
+
+            soup = BeautifulSoup(r.text, "xml")
+
+            active = 0
+            total_count = 0
+            used_bytes = 0
+
+            # หาโหนดข้อมูล
+            torrent_nodes = soup.find_all("data")
+            if len(torrent_nodes) > 1:
+                for node in torrent_nodes[1:]:
+                    items = node.find_all("value", recursive=False)
+                    if len(items) >= 4:
+                        try:
+                            is_active = int(items[0].get_text().strip())
+                            bytes_done = int(items[2].get_text().strip())
+
+                            if is_active == 1:
+                                active += 1
+                            total_count += 1
+                            used_bytes += bytes_done
+                        except ValueError:
+                            pass
+
+            used_gb = used_bytes / (1024**3)
+            safety_buffer = 15.0
+
+            # 2. ดึง Disk Free space
+            xml_disk = '<?xml version="1.0"?><methodCall><methodName>network.disk_free_4gb</methodName></methodCall>'
+            real_free_gb = 0.0
+
+            try:
+                r_free = self.s.post(self.url, data=xml_disk, auth=self.auth, headers=self.headers, timeout=10, verify=True)
+                if r_free and r_free.status_code == 200:
+                    free_soup = BeautifulSoup(r_free.text, "xml")
+                    free_node = free_soup.find(["i8", "int", "i4", "value"])
+                    if free_node:
+                        real_free_gb = (int(free_node.get_text().strip()) * 4096) / (1024**3)
+            except Exception as disk_err:
+                print(f"⚠️ [{self.name}] Disk free check warning: {disk_err}")
+
+            # 3. คำนวณพื้นที่ Quota & Display Free
+            quota_free_gb = max(0.0, self.quota_gb - used_gb) if self.quota_gb > 0 else float('inf')
+
+            if self.quota_gb > 0:
+                display_free = min(quota_free_gb, real_free_gb)
+            else:
+                display_free = real_free_gb
+
+            self.free_gb = max(0.0, display_free - safety_buffer)
+
+            # 4. แสดงผลลัพธ์
+            if self.quota_gb > 0:
+                self.stat_msg = (
+                    f"FREE(Q): {quota_free_gb:.1f}GB | FREE(D): {real_free_gb:.1f}GB | "
+                    f"Total: {total_count} | Used: {used_gb:.1f}G / {self.quota_gb:.0f}G | "
+                    f"Safe: {self.free_gb:.1f}G"
+                )
+            else:
+                self.stat_msg = f"FREE: {display_free:.1f}GB | Total: {total_count} | Used: {used_gb:.1f}G | Safe: {self.free_gb:.1f}G"
+
+            return True
+
+        except Exception as e:
+            print(f"⚠️ [{self.name}] rTorrent Refresh Status Error: {e}")
+            return False
+
+    def get_all_torrents_info(self):
+        try:
+            # ⚡ เพิ่ม <param><value><string>d.directory=</string></value></param> เข้าไป
+            xml = '''<?xml version="1.0"?>
+            <methodCall>
+            <methodName>d.multicall2</methodName>
+            <params>
+                <param><value><string></string></value></param>
+                <param><value><string>main</string></value></param>
+                <param><value><string>d.hash=</string></value></param>
+                <param><value><string>d.ratio=</string></value></param>
+                <param><value><string>d.complete=</string></value></param>
+                <param><value><string>d.name=</string></value></param>
+                <param><value><string>d.size_bytes=</string></value></param>
+                <param><value><string>d.left_bytes=</string></value></param>
+                <param><value><string>d.timestamp.finished=</string></value></param>
+                <param><value><string>d.state=</string></value></param>
+                <param><value><string>d.up.rate=</string></value></param>
+                <param><value><string>d.peers_leeching=</string></value></param>
+                <param><value><string>d.creation_date=</string></value></param>
+                <param><value><string>d.directory=</string></value></param>
+            </params>
+            </methodCall>'''
+
+            # ... (โค้ดเชื่อมต่อและประมวลผล XML ปกติ) ...
+            req_headers = getattr(self, 'headers', {}).copy()
+            if "Connection" not in req_headers:
+                req_headers["Connection"] = "close"
+
+            r = self.s.post(self.url, data=xml, auth=self.auth, headers=req_headers, timeout=20, verify=True)
+            if r.status_code != 200:
+                print(f"❌ rTorrent API Error: Status Code {r.status_code}")
+                return []
+
+            root = ET.fromstring(r.text)
+            data = root.findall(".//value/array/data/value/array/data")
+
+            if not data:
+                print(f"⚠️ rTorrent return empty data list")
+                return []
+
+            results = []
+            for item in data:
+                values = item.findall("./value")
+                if len(values) < 12: continue
+
+                def safe_get_text(val_node):
+                    if val_node is None: return ""
+                    for tag in ["./string", "./i4", "./int"]:
+                        target = val_node.find(tag)
+                        if target is not None and target.text is not None:
+                            return target.text.strip()
+                    return val_node.text.strip() if val_node.text else ""
+
+                t_hash = safe_get_text(values[0]).lower()
+                if not t_hash:
+                    continue
+
+                t_ratio_str = safe_get_text(values[1])
+                t_complete_str = safe_get_text(values[2])
+                t_name = safe_get_text(values[3])
+                t_size_str = safe_get_text(values[4])
+                t_left_str = safe_get_text(values[5])
+                t_ts_finished_str = safe_get_text(values[6])
+                t_state_str = safe_get_text(values[7]) if len(values) > 7 else "1"
+                t_ts_created_str = safe_get_text(values[10])
+                t_up_rate_str = safe_get_text(values[8])
+                t_leechers_str = safe_get_text(values[9])
+
+                # 📂 ดึงค่า Directory ตามตำแหน่งดัชนี (ลำดับที่ 11 หรือค่าท้ายสุดที่เพิ่มเข้ามา)
+                t_directory = safe_get_text(values[11]) if len(values) > 11 else ""
+
+                is_complete_flag = (t_complete_str == "1")
+                left_bytes = int(t_left_str) if t_left_str.isdigit() else 0
+
+                try:
+                    ratio_val = int(t_ratio_str) / 1000.0 if t_ratio_str.isdigit() else 0.0
+                    if ratio_val < 0: ratio_val = 0.0
+                    size_bytes = int(t_size_str) if str(t_size_str).isdigit() else 0
+                    ts_finished = int(t_ts_finished_str) if t_ts_finished_str.isdigit() else 0
+                    ts_init = int(t_ts_created_str) if t_ts_created_str.isdigit() else 0
+
+                    if ts_init == 0:
+                        ts_init = int(time.time())
+                except Exception:
+                    ratio_val = 0.0
+                    size_bytes = 0
+
+                mapped_state = "seeding" if is_complete_flag else "downloading"
+                if t_state_str == "0": mapped_state = "paused"
+
+                results.append({
+                    'hash': t_hash,
+                    'ratio': ratio_val,
+                    'name': t_name,
+                    'size': size_bytes / (1024**3),
+                    'size_bytes': size_bytes,
+                    'amount_left': left_bytes,
+                    'progress': 1.0 if is_complete_flag else 0.0,
+                    'state': mapped_state,
+                    'added_on': ts_finished,
+                    'ts_finished': ts_finished,
+                    'ts_init': ts_init,
+                    'up_speed': int(t_up_rate_str) if t_up_rate_str.isdigit() else 0,
+                    'leechers': int(t_leechers_str) if t_leechers_str.isdigit() else 0,
+                    'is_rt_complete': is_complete_flag,
+                    'save_path': t_directory  # 👈 เพิ่มฟิลด์ save_path ตรงนี้เพื่อให้ส่งออกไปใช้งานต่อได้
+                })
+
+            results.sort(key=lambda x: x.get('ratio', 0), reverse=True)
+            return results
+
+        except Exception as e:
+            print(f"❌ rTorrent Fetch Info Error: {e}")
+            return []
+
+    def get_torrent_by_hash(self, t_hash):
+        all_torrents = self.get_all_torrents_info()
+        for t in all_torrents:
+            if t['hash'].lower() == t_hash.lower():
+                return t
+        return None
+
+    def is_torrent_exists(self, t_hash):
+        if not self.is_connected: self.login()
+        try:
+            # ใช้ XML-RPC ตรวจสอบชื่อไฟล์หรือ hash (ในที่นี้ใช้ hash ซึ่งแม่นยำที่สุด)
+            xml = f'<?xml version="1.0"?><methodCall><methodName>d.name</methodName><params><param><value><string>{t_hash.upper()}</string></value></param></params></methodCall>'
+            r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=10, verify=True)
+            # ถ้า rTorrent คืนค่าสำเร็จ (ไม่ error) แสดงว่ามีไฟล์อยู่
+            return r.status_code == 200 and "<fault>" not in r.text
+        except: return False
+
+    def get_downloading_size(self):
+        try:
+            auth_url = self.url.replace("://", f"://{self.user}:{self.pw}@")
+            proxy = xmlrpc.client.ServerProxy(auth_url)
+            # ดึง size และ completed เฉพาะตัวที่ยังโหลดไม่เสร็จ (view 'started')
+            response = proxy.d.multicall2("", "started", "d.size_bytes=", "d.completed_bytes=")
+
+            total_remaining = sum(int(t[0]) - int(t[1]) for t in response)
+            return total_remaining / (1024**3)
+        except:
+            return 0.0
+
+    def get_active_downloads(self):
+        """ดึงรายการที่กำลังโหลด โดยเปลี่ยนไปใช้ view 'main' เพื่อเลี่ยง Error 503"""
+        try:
+            # ผสม Auth ลงใน URL
+            auth_url = self.url.replace("://", f"://{self.user}:{self.pw}@")
+            proxy = xmlrpc.client.ServerProxy(auth_url)
+
+            # ดึงจาก view "main" ซึ่งเป็นมาตรฐานของ rTorrent ทุกเวอร์ชั่น
+            token = ""
+            # เพิ่ม d.get_complete= เพื่อเช็คว่าตัวไหนยังโหลดไม่เสร็จ
+            params = ("main", "d.hash=", "d.size_bytes=", "d.complete=")
+            response = proxy.d.multicall2(token, *params)
+
+            results = []
+            for t in response:
+                # d.complete == 0 หมายถึงกำลังดาวน์โหลด (หรือยังโหลดไม่เสร็จ)
+                if int(t[2]) == 0:
+                    results.append({
+                        'hash': t[0],
+                        'size_bytes': int(t[1]),
+                        'state': 'downloading'
+                    })
+            return results
+        except Exception as e:
+            # หากเกิด Error ให้พยายาม Login ใหม่ในรอบหน้า
+            self.is_connected = False
+            print(f"❌ [{self.name}] rTorrent Error: {e}")
+            return []
+
+    def _xml_escape(self, data):
+        """ใช้ Library มาตรฐานเพื่อความชัวร์"""
+        if not isinstance(data, str):
+            data = str(data)
+        # เพิ่มการลบอักขระควบคุม (ASCII 0-31) ที่อาจทำให้ XML พัง
+        data = "".join(ch for ch in data if ord(ch) >= 32 or ch in "\n\r\t")
+        return escape(data, {'"': '&quot;', "'": '&apos;'})
+
+    def safe_xml_escape(self, data):
+        try:
+            return self._xml_escape(data)
+        except Exception:
+            return str(data).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def add(self, content, site_name="Universal", size=None, n_cfg=None, save_path=None, skip_checking=False):
+        """
+        เมธอดหลักสำหรับส่งไฟล์ Torrent เข้า rTorrent
+        :param save_path: Path โฟลเดอร์ปลายทางสำหรับ Cross-Seed
+        :param skip_checking: หากเป็น True จะข้ามการ Recheck Hash
+        """
+        try:
+            info_hash = _extract_torrent_info_hash(content)
+        except (TypeError, ValueError, OverflowError):
+            info_hash = None
+        if not info_hash:
+            print(f"❌ [{self.name}] Invalid torrent metadata.")
+            return False
+
+        return self._add_fallback_clean(
+            content=content,
+            site_name=site_name,
+            info_hash=info_hash,
+            save_path=save_path,
+            skip_checking=skip_checking
+        )
+
+    def _add_fallback_clean(self, content, site_name, info_hash=None, save_path=None, skip_checking=False):
+        safe_site = self.safe_xml_escape(site_name)
+
+        # 1. กรณีงานมีอยู่แล้วใน Client
+        if info_hash and self._verify_torrent_in_client(info_hash):
+            print(f"ℹ️ [{self.name}] Torrent already exists -> บังคับติดป้ายค่ายเว็บและสับสวิตช์เริ่มงานซ้ำทันที...")
+            self._force_start_torrent(info_hash, safe_site)
+            return True
+
+        encoded_content = base64.b64encode(content).decode('ascii')
+
+        # 2. สร้าง Command Injection Array ตามโหมดการทำงาน
+        commands = [
+            f"d.custom1.set={safe_site}"  # ฝัง Label ประจำค่าย
+        ]
+
+        # 🎯 เพิ่มสวิตช์คำสั่งพิเศษกรณี Cross-Seed Mode
+        if save_path:
+            safe_path = self.safe_xml_escape(save_path)
+            commands.append(f'd.directory.set="{safe_path}"')
+
+        if skip_checking:
+            # ข้าม Hash Check + ตั้ง Flag งานให้พร้อม Seed
+            commands.append("d.check_hash.set=0")
+
+        # ประกอบคำสั่ง XML-RPC Parameters
+        command_params = "".join([f'<param><value><string>{cmd}</string></value></param>' for cmd in commands])
+
+        xml_payload = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<methodCall>'
+            '<methodName>load.raw_start</methodName>'
+            '<params>'
+            '<param><value><string></string></value></param>'
+            f'<param><value><base64>{encoded_content}</base64></value></param>'
+            f'{command_params}'
+            '</params>'
+            '</methodCall>'
+        ).encode('utf-8')
+
+        r = None
+
+        # 3. ยิง HTTP POST ไปยัง XML-RPC Endpoint
+        for attempt in range(3):
+            try:
+                r = self.s.post(self.url, data=xml_payload, auth=self.auth, headers=self.headers, timeout=15, verify=True)
+                break
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
+                if attempt < 2:
+                    print(f"🔄 [{self.name}] Network Timeout/Error ({net_err}) กำลังลองใหม่อีกครั้ง... (รอบที่ {attempt+1}/2)")
+                    time.sleep(1.5)
+                else:
+                    print(f"❌ [{self.name}] Exception during upload หลังพยายามครบ 3 รอบ: {net_err}")
+                    return False
+            except Exception as e:
+                print(f"❌ [{self.name}] Fatal Exception during upload: {e}")
+                return False
+
+        try:
+            if r is None or r.status_code != 200 or "fault" in r.text.lower():
+                print(f"⚠️ [{self.name}] Load failed: {r.text[:50] if r else 'No Response'}")
+                return False
+
+            print(f"✅ [{self.name}] ส่งไฟล์เข้า rTorrent สำเร็จ (Cross-Seed: {skip_checking}) -> ตรวจสอบสถานะระบบ...")
+
+            # 4. วนลูปตรวจสอบว่างานเข้าระบบแล้วหรือยัง
+            found = False
+            for i in range(25):
+                time.sleep(0.4)
+                if info_hash and self._verify_torrent_in_client(info_hash):
+                    found = True
+                    break
+
+            # 5. สั่งสตาร์ทย้ำ และยิงชุดคำสั่งปรับสถานะซ้ำกรณีดิสก์ดีเลย์
+            if info_hash:
+                if not found:
+                    print(f"⚠️ [{self.name}] Detection Delay: บอทตรวจไม่เจอในตารางหลักทันที กำลังเจาะทะลวงระบบแชร์...")
+
+                self._force_start_torrent(info_hash, safe_site)
+
+                if not found:
+                    time.sleep(1.5)
+                    print(f"🔄 [{self.name}] Burst-Emphasize: กำลังยิงชุดคำสั่งจัดการย้ำรอบที่ 2...")
+                    self._force_start_torrent(info_hash, safe_site)
+
+            return True
+
+        except Exception as e:
+            print(f"❌ [{self.name}] Exception during response parsing: {e}")
+            return False
+
+    def _force_start_torrent(self, info_hash, safe_site=None):
+        """[SUPER UPGRADED]: ชุดคอมโบสั่งติดป้ายค่ายเว็บ + บังคับรัน + ดึงเพียร์ จบในที่เดียวแบบนิ่งสนิท"""
+        if not info_hash: return
+        target_hash = info_hash.strip().lower()
+
+        # ปรับขยับเอาคำสั่งยัดทาสก์และเปิดเปิดดึงนำร่อง
+        sequence = ['view.add_task', 'd.open', 'd.custom1.set', 'd.start', 'd.tracker_announce']
+
+        for method in sequence:
+            try:
+                if method == 'd.custom1.set' and not safe_site:
+                    continue
+
+                if method == 'view.add_task':
+                    xml_cmd = (
+                        f'<?xml version="1.0"?><methodCall><methodName>view.add_task</methodName>'
+                        f'<params><param><value><string>main</string></value></param>'
+                        f'<param><value><string>{target_hash}</string></value></param></params></methodCall>'
+                    )
+                elif method == 'd.custom1.set':
+                    xml_cmd = (
+                        f'<?xml version="1.0"?><methodCall><methodName>d.custom1.set</methodName>'
+                        f'<params><param><value><string>{target_hash}</string></value></param>'
+                        f'<param><value><string>{safe_site}</string></value></param></params></methodCall>'
+                    )
+                else:
+                    xml_cmd = (
+                        '<?xml version="1.0" encoding="UTF-8"?>'
+                        '<methodCall><methodName>{}</methodName>'
+                        '<params><param><value><string>{}</string></value></param></params>'
+                        '</methodCall>'
+                    ).format(method, target_hash)
+
+                req_headers = {**getattr(self, 'headers', {}), 'Content-Type': 'text/xml'}
+                self.s.post(self.url, data=xml_cmd.encode('utf-8'), auth=self.auth, headers=req_headers, timeout=5, verify=True)
+                time.sleep(0.1)
+            except Exception as e:
+                print(f"⚠️ [{self.name}] _force_start ({method}) failed: {e}")
+
+    def _verify_torrent_in_client(self, info_hash):
+        """[UPGRADED]: เช็กการมีอยู่จริงของงานผ่าน XML-RPC เดี่ยว (d.name) เบาเครื่องและแม่นยำ 100%"""
+        if not info_hash: return False
+        target_hash = info_hash.strip().lower()
+
+        xml_check = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<methodCall>'
+            '<methodName>d.name</methodName>'
+            '<params>'
+            f'<param><value><string>{target_hash}</string></value></param>'
+            '</params>'
+            '</methodCall>'
+        ).encode('utf-8')
+
+        try:
+            req_headers = {**getattr(self, 'headers', {}), 'Content-Type': 'text/xml; charset=utf-8'}
+            r = self.s.post(self.url, data=xml_check, auth=self.auth, headers=req_headers, timeout=6, verify=True)
+
+            if r.status_code == 200 and "fault" not in r.text.lower():
+                if "value" in r.text.lower() and len(r.text) > 80:
+                    return True
+        except Exception as e:
+            print(f"⚠️ [{self.name}] _verify_torrent_in_client เกิดข้อผิดพลาดเน็ตเวิร์ก: {e}")
+
+        return False
+
+    def _sweeper_force_start(self):
+        """ระบบกวาดงานค้างอัตโนมัติ"""
+        # d.multicall2 จะกวาดงานที่ status = stopped ทั้งหมดในครั้งเดียว
+        # d.is_active=0 หมายถึงกวาดเฉพาะงานที่หยุดทำงานอยู่ (Stopped)
+        xml_sweep = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<methodCall><methodName>d.multicall2</methodName>'
+            '<params>'
+            '<param><value><string></string></value></param>' # target: all
+            '<param><value><string>main</string></value></param>' # view: main
+            '<param><value><string>d.is_active=0</string></value></param>' # condition: inactive
+            '<param><value><string>d.open=</string></value></param>'       # command: open
+            '<param><value><string>d.start=</string></value></param>'      # command: start
+            '<param><value><string>d.resume=</string></value></param>'    # command: resume
+            '</params></methodCall>'
+        ).encode('utf-8')
+
+        try:
+            self.s.post(self.url, data=xml_sweep, auth=self.auth, headers=self.headers, timeout=5, verify=True)
+        except:
+            pass
+
+    def delete_torrent(self, t_hash):
+        """Hard Delete: หยุดและลบข้อมูลในคำสั่งเดียว (Atomic Operation)"""
+        #สิ่งที่ต้องเพิ่มใน .rtorrent.rc
+        #ให้เพิ่มบรรทัดนี้ไว้ก่อนบรรทัด # -- END HERE --:
+        #method.set_key = event.download.erased, delete_tied, "execute={rm,-rf,--,$d.base_path=}"
+        try:
+            # รวม d.stop และ d.erase เข้าเป็นก้อนเดียว
+            xml = f'''<?xml version="1.0"?>
+            <methodCall>
+              <methodName>system.multicall</methodName>
+              <params>
+                <param><value><array><data>
+                  <value><struct>
+                    <member><name>methodName</name><value><string>d.stop</string></value></member>
+                    <member><name>params</name><value><array><data><value><string>{t_hash}</string></value></data></array></value></member>
+                  </struct></value>
+                  <value><struct>
+                    <member><name>methodName</name><value><string>d.erase</string></value></member>
+                    <member><name>params</name><value><array><data><value><string>{t_hash}</string></value></data></array></value></member>
+                  </struct></value>
+                </data></array></value></param>
+              </params>
+            </methodCall>'''
+
+            r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, verify=True, timeout=10)
+            return r.status_code == 200
+        except Exception as e:
+            print(f"❌ [{self.name}] Delete Error: {e}")
+            return False
+
+    def _execute_multicall(self, calls):
+        """ตัวกลางส่งคำสั่งแบบ Batch (system.multicall)"""
+        # สร้างส่วนของ array ของคำสั่ง
+        data_parts = []
+        for call in calls:
+            data_parts.append(f'''
+                <value><struct>
+                    <member><name>methodName</name><value><string>{call['methodName']}</string></value></member>
+                    <member><name>params</name><value><array><data>
+                        <value><string>{call['params'][0]}</string></value>
+                    </data></array></value></member>
+                </struct></value>''')
+
+        xml = f'''<?xml version="1.0"?>
+        <methodCall>
+            <methodName>system.multicall</methodName>
+            <params><param><value><array><data>{"".join(data_parts)}</data></array></value></param></params>
+        </methodCall>'''
+
+        try:
+            r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, verify=True, timeout=10)
+            return r.status_code == 200
+        except Exception as e:
+            print(f"❌ [{self.name}] Batch Operation Error: {e}")
+            return False
+
+    def stop_torrent(self, target_hashes):
+        """สั่ง Stop งานหลายตัวพร้อมกันผ่าน system.multicall"""
+        if not target_hashes: return False
+
+        # สร้างรายการคำสั่ง stop สำหรับทุก hash
+        calls = []
+        for t_hash in target_hashes:
+            calls.append({
+                "methodName": "d.stop",
+                "params": [t_hash]
+            })
+
+        return self._execute_multicall(calls)
+
+    def reannounce_torrent(self, target_hashes):
+        """สั่ง Re-announce งานเฉพาะกลุ่มผ่าน system.multicall"""
+        if not target_hashes: return False
+
+        calls = []
+        for t_hash in target_hashes:
+            calls.append({
+                "methodName": "d.tracker_announce",
+                "params": [t_hash]
+            })
+
+        return self._execute_multicall(calls)
+
+    def reannounce_all(self):
+        if not self.is_connected and not self.login(): return False
+        try:
+            # ใช้ multicall2 สั่ง d.tracker_announce ทุกตัวในหน้าหลัก (main) พร้อมกัน
+            xml = (
+                '<?xml version="1.0"?>'
+                '<methodCall>'
+                '<methodName>d.multicall2</methodName>'
+                '<params>'
+                '<param><value><string></string></value></param>'
+                '<param><value><string>main</string></value></param>'
+                '<param><value><string>d.tracker_announce=</string></value></param>'
+                '</params>'
+                '</methodCall>'
+            )
+            self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=15, verify=True)
+            return True
+        except: return False
+
+    async def sync_to_mapping(self, web_data_list=None, mapper_func=None):
+        """
+        ดึงข้อมูลทอร์เรนต์ทั้งหมดจาก rTorrent แล้วจับคู่กับข้อมูลเว็บเพื่ออัปเดตลง JSON Mapping (Async)
+        """
+        if not self.is_connected and not self.login():
+            return False
+
+        mapping = {}
+        try:
+            xml = (
+                '<?xml version="1.0"?>'
+                '<methodCall>'
+                '<methodName>d.multicall2</methodName>'
+                '<params>'
+                '<param><value><string></string></value></param>'
+                '<param><value><string>main</string></value></param>'
+                '<param><value><string>d.hash=</string></value></param>'
+                '<param><value><string>d.name=</string></value></param>'
+                '<param><value><string>d.size_bytes=</string></value></param>'
+                '<param><value><string>d.completed_bytes=</string></value></param>'
+                '<param><value><string>d.up.total=</string></value></param>'
+                '<param><value><string>d.down.total=</string></value></param>'
+                '<param><value><string>d.custom1=</string></value></param>'
+                '<param><value><string>d.is_open=</string></value></param>'
+                '<param><value><string>d.is_active=</string></value></param>'
+                '<param><value><string>d.state=</string></value></param>'
+                '<param><value><string>d.directory=</string></value></param>'  # 👈 1. เพิ่ม d.directory= ตรงนี้
+                '</params>'
+                '</methodCall>'
+            )
+
+            req_headers = {**getattr(self, 'headers', {}), 'Connection': 'close'}
+            r = self.s.post(self.url, data=xml, auth=self.auth, headers=req_headers, timeout=20, verify=True)
+
+            if r.status_code in [401, 403]:
+                if self.login():
+                    r = self.s.post(self.url, data=xml, auth=self.auth, headers=req_headers, timeout=20, verify=True)
+
+            if r.status_code != 200:
+                print(f"❌ [{self.name}] sync_to_mapping Error: Status Code {r.status_code}")
+                return False
+
+            root = ET.fromstring(r.text)
+            data = root.findall(".//value/array/data/value/array/data")
+            if not data:
+                return False
+
+            for item in data:
+                values = item.findall("./value")
+                if len(values) < 11:  # 👈 2. ขยับเงื่อนไขเช็คความยาวตามจำนวนพารามิเตอร์ที่เพิ่มขึ้น (0-10 รวมเป็น 11 ตัว)
+                    continue
+
+                def safe_get_text(val_node):
+                    if val_node is None: return ""
+                    for tag in ["./string", "./i4", "./int", "./i8"]:
+                        target = val_node.find(tag)
+                        if target is not None and target.text is not None:
+                            return target.text.strip()
+                    return val_node.text.strip() if val_node.text else ""
+
+                t_hash = safe_get_text(values[0]).upper()
+                if not t_hash:
+                    continue
+
+                try:
+                    size_bytes = int(safe_get_text(values[2])) if safe_get_text(values[2]).lstrip('-').isdigit() else 0
+                    completed_bytes = int(safe_get_text(values[3])) if safe_get_text(values[3]).lstrip('-').isdigit() else 0
+                    up_total = int(safe_get_text(values[4])) if safe_get_text(values[4]).lstrip('-').isdigit() else 0
+                    down_total = int(safe_get_text(values[5])) if safe_get_text(values[5]).lstrip('-').isdigit() else 0
+                    is_open = int(safe_get_text(values[7])) == 1 if safe_get_text(values[7]).lstrip('-').isdigit() else False
+                    is_active = int(safe_get_text(values[8])) == 1 if safe_get_text(values[8]).lstrip('-').isdigit() else False
+                except Exception:
+                    size_bytes, completed_bytes, up_total, down_total = 0, 0, 0, 0
+                    is_open, is_active = False, False
+
+                ratio = (up_total / size_bytes) if size_bytes > 0 else 0.0
+
+                mapping[t_hash] = {
+                    "hash": t_hash,
+                    "name": safe_get_text(values[1]),
+                    "size_bytes": size_bytes,
+                    "completed_bytes": completed_bytes,
+                    "up_total": up_total,
+                    "down_total": down_total,
+                    "ratio": round(ratio, 4),
+                    "label": safe_get_text(values[6]),
+                    "is_open": is_open,
+                    "is_active": is_active,
+                    "state": safe_get_text(values[9]),
+                    "save_path": safe_get_text(values[10])  # 👈 3. ดึงค่า Directory มาเก็บไว้ใน mapping
+                }
+
+        except Exception as e:
+            print(f"❌ [{self.name}] Exception during sync_to_mapping: {e}")
+            return False
+
+        if not mapping:
+            return False
+
+        save_func = mapper_func if mapper_func else add_or_update_torrent
+
+        synced_count = 0
+        for t_hash, rt_t in mapping.items():
+            client_data = {
+                "client_type": "rtorrent",
+                "hash": rt_t['hash'],
+                "name": rt_t['name'],
+                "size_bytes": rt_t['size_bytes'],
+                "state": rt_t['state'],
+                "ratio": rt_t['ratio'],
+                "up_total": rt_t['up_total'],
+                "down_total": rt_t['down_total']
+            }
+
+            node_data = {
+                "seedbox_host": self.name,
+                "label": rt_t['label'],
+                "is_active": rt_t['is_active'],
+                "save_path": rt_t.get('save_path', '')
+            }
+
+            # ส่ง web_data เป็น {} ไปก่อน
+            if await save_func(client_data=client_data, web_data={}, node_data=node_data) is not True:
+                return False
+            synced_count += 1
+
+        if synced_count > 0:
+            print(f"🔄 [{self.name}] ซิงค์ข้อมูล rTorrent เข้า Mapping เรียบร้อยแล้ว ({synced_count} รายการ)")
+        return True
+
+    def get_stats_by_site(self):
+        if not self.is_connected:
+            self.login()
+
+        try:
+
+            # 1. สร้าง Proxy เชื่อมต่อหลังบ้าน
+            auth_url = self.url.replace("://", f"://{self.user}:{self.pw}@")
+            proxy = xmlrpc.client.ServerProxy(auth_url)
+
+            # 2. 🛡️ [ULTIMATE CORE FIX]: เปลี่ยนเป็นคำสั่ง Standard rTorrent API สายตรงทั้งหมด 100%
+            # d.custom1=           (ดึง Label ชื่อเว็บ)
+            # d.up.total=          (ดึงยอดอัปโหลดรวมหน่วย Bytes)
+            # d.up.rate=           (ดึงความเร็วอัปโหลดปัจจุบัน Bytes/s) <- แก้ไขจาก d.get_up_rate=
+            # d.down.total=        (ดึงยอดดาวน์โหลดรวมหน่วย Bytes)
+            response = proxy.d.multicall2("", "main", "d.custom1=", "d.up.total=", "d.up.rate=", "d.down.total=")
+
+            site_stats = {}
+            for t in response:
+                # ล้างชื่อ Site และปรับเป็นตัวพิมพ์ใหญ่ทั้งหมด (Upper Case)
+                raw_site = t[0] if t[0] else "Uncategorized"
+                site = unquote(raw_site).strip().upper()
+
+                # แมตช์ชื่อคีย์หลักให้ตรงกับระบบรายงานผล
+                if "BEARBIT" in site: site = "BEARBIT"
+                if "TORRENTDD" in site: site = "TORRENTDD"
+
+                total_up = int(t[1])
+                up_speed = int(t[2])  # รับค่าจาก d.up.rate มาคำนวณสปีดปัจจุบัน
+                total_dl = int(t[3])
+
+                if site not in site_stats:
+                    site_stats[site] = {
+                        'total_up_bytes': 0,
+                        'total_dl_bytes': 0,
+                        'current_speed_bytes': 0,
+                        'count': 0
+                    }
+
+                site_stats[site]['total_up_bytes'] += total_up
+                site_stats[site]['total_dl_bytes'] += total_dl
+                site_stats[site]['current_speed_bytes'] += up_speed
+                site_stats[site]['count'] += 1
+
+            return site_stats
+        except Exception as e:
+            self.is_connected = False
+            print(f"⚠️ [{self.name}] rTorrent Stats Error: {e}")
+            return {}
+
+
 def _bencode_value_end(data, pos):
     """คืนตำแหน่ง byte ถัดจากค่า bencode หนึ่งค่า"""
     if pos >= len(data):
