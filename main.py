@@ -46,6 +46,8 @@ import functools
 from pathlib import Path
 import traceback
 import urllib.parse
+from torrent_store import MappingStore
+from client_registry import ClientAdapter, ClientRegistry
 
 print = functools.partial(print, flush=True)
 
@@ -214,43 +216,29 @@ def get_db_path(site_key):
         os.makedirs(DB_DIR)
     return os.path.join(DB_DIR, f"{site_key}_link_db.json")
 
+def _mapping_store():
+    return MappingStore(MAPPING_FILE)
+
+
+async def _store_call(method, *args):
+    # Queue local async writers before allocating workers that could otherwise
+    # all block on a file lock held by a mapping transaction awaiting a worker.
+    async with mapping_lock:
+        return await asyncio.to_thread(getattr(_mapping_store(), method), *args)
+
+
 def load_db(site_key):
-    """โหลดข้อมูลจากไฟล์ database ของไซต์นั้นๆ"""
-    db_path = get_db_path(site_key)
-    if not os.path.exists(db_path):
-        return {}
-    with open(db_path, 'r', encoding='utf-8') as f:
-        try:
-            return json.load(f)
-        except json.JSONDecodeError:
-            return {}
+    """Compatibility view; shared mapping is now the only runtime state store."""
+    return _mapping_store().site_view(site_key)
+
 
 def save_db(site_key, data):
-    """บันทึกข้อมูลลงไฟล์ database ของไซต์นั้นๆ"""
-    db_path = get_db_path(site_key)
-    with open(db_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    _mapping_store().save_site_view(site_key, data)
+
 
 def load_all_db():
-    """
-    โหลดข้อมูลจากทุกไฟล์ {site}_link_db.json ในโฟลเดอร์ DB_DIR
-    คืนค่าเป็น Dict: { 'site_key': { 'hash': {ข้อมูลไฟล์} } }
-    """
-    all_dbs = {}
-    if not os.path.exists(DB_DIR):
-        print(f"⚠️ ไม่พบโฟลเดอร์ฐานข้อมูล: {DB_DIR}")
-        return all_dbs
+    return _mapping_store().site_views()
 
-    for filename in os.listdir(DB_DIR):
-        if filename.endswith("_link_db.json"):
-            # ดึง site_key ออกมาจากชื่อไฟล์ (เช่น "thabit_link_db.json" -> "thabit")
-            site_key = filename.replace("_link_db.json", "")
-            
-            # โหลดข้อมูลผ่านฟังก์ชัน load_db เดิมที่มีอยู่
-            data = load_db(site_key)
-            all_dbs[site_key] = data
-            
-    return all_dbs
 
 # เพิ่ม Lock ไว้ที่ระดับ Global
 db_lock = asyncio.Lock()
@@ -258,7 +246,7 @@ db_lock = asyncio.Lock()
 async def async_save_db(site_key, data):
     """เวอร์ชัน Async ที่ปลอดภัยต่อการเขียนไฟล์พร้อมกัน"""
     async with db_lock:
-        await asyncio.to_thread(save_db, site_key, data)
+        await _store_call("save_site_view", site_key, data)
 
 async def async_load_db(site_key):
     """เวอร์ชัน Async สำหรับโหลดข้อมูล"""
@@ -486,11 +474,21 @@ async def mapping_transaction():
         return
 
     async with mapping_lock:
-        token = _mapping_transaction_owner.set(current_task)
+        store = _mapping_store()
+        handle = None
         try:
-            yield
+            while handle is None:
+                handle = store.try_lock()
+                if handle is None:
+                    await asyncio.sleep(0.02)
+            token = _mapping_transaction_owner.set(current_task)
+            try:
+                yield
+            finally:
+                _mapping_transaction_owner.reset(token)
         finally:
-            _mapping_transaction_owner.reset(token)
+            if handle is not None:
+                store.unlock(handle)
 
 
 def _mapping_transactional(func):
@@ -503,82 +501,18 @@ def _mapping_transactional(func):
 
 
 def _atomic_save_mapping_file(data):
-    """Atomic JSON replacement with fsync and original mode/ownership preservation."""
-    import json
-    import os
-    import stat
-    import tempfile
-
-    mapping_path = os.path.realpath(
-        os.path.abspath(os.fspath(MAPPING_FILE))
-    )
-    mapping_dir = os.path.dirname(mapping_path) or "."
-    original_stat = os.stat(mapping_path)
-    fd, temp_path = tempfile.mkstemp(prefix="torrent_mapping.", suffix=".tmp", dir=mapping_dir)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=4, ensure_ascii=False)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if original_stat:
-            os.chown(temp_path, original_stat.st_uid, original_stat.st_gid)
-            os.chmod(temp_path, stat.S_IMODE(original_stat.st_mode))
-        else:
-            os.chmod(temp_path, 0o644)
-        os.replace(temp_path, mapping_path)
-        try:
-            dir_fd = os.open(mapping_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            pass
-    except Exception:
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
-        raise
+    _mapping_store().write(data)
 
 
 async def initialize_mapping():
-    """Create the first mapping explicitly; never replace an existing file."""
-    async with mapping_transaction():
-        def create():
-            try:
-                with open(MAPPING_FILE, "x", encoding="utf-8") as handle:
-                    json.dump({"torrents": []}, handle)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-            except FileExistsError:
-                pass
-        await asyncio.to_thread(create)
-        # Corrupt or unsupported existing data must still stop startup.
-        await load_mapping()
+    await _store_call("initialize", DB_DIR, CFG.get("NODES", []))
+    await load_mapping()
 
 
 async def load_mapping():
-    """Load Mapping fail-closed and add in-memory schema defaults."""
-    def _load():
-        mapping_path = os.path.realpath(
-            os.path.abspath(os.fspath(MAPPING_FILE))
-        )
-
-        if not os.path.isfile(mapping_path):
-            raise RuntimeError(
-                "Mapping file missing or not a regular file; "
-                f"refusing empty fallback: {mapping_path}"
-            )
-
-        try:
-            with open(mapping_path, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Mapping read/JSON failure; refusing empty fallback: {exc}"
-            ) from exc
-        return _ensure_mapping_zone_schema(data)
-
-    return await asyncio.to_thread(_load)
+    def read():
+        return _ensure_mapping_zone_schema(_mapping_store().read())
+    return await asyncio.to_thread(read)
 
 
 async def save_mapping(data):
@@ -809,6 +743,7 @@ def _merge_mapping_node_location(record, node_data):
         "successful_add_response": 1,
         "live_qbittorrent_inventory": 2,
         "live_rtorrent_inventory": 2,
+        "live_client_inventory": 2,
     }
 
     incoming_rank = trust_rank.get(method, 0)
@@ -845,7 +780,7 @@ def _merge_mapping_node_location(record, node_data):
         )
 
     inventory_verified = (
-        method in {"live_qbittorrent_inventory", "live_rtorrent_inventory"}
+        method in {"live_qbittorrent_inventory", "live_rtorrent_inventory", "live_client_inventory"}
     )
 
     if not matches:
@@ -853,6 +788,7 @@ def _merge_mapping_node_location(record, node_data):
             "seedbox_host": host,
             "save_path": save_path,
             "inventory_verified": inventory_verified,
+            "present": True,
             "verification_method": method,
         }
         locations.append(location)
@@ -876,6 +812,7 @@ def _merge_mapping_node_location(record, node_data):
 
         location["verification_method"] = method
         location["inventory_verified"] = inventory_verified
+        location["present"] = True
         location["seedbox_host"] = host
         location["save_path"] = save_path
 
@@ -5711,7 +5648,7 @@ def _storage_file(base, relative):
     return _storage_path(posixpath.join(_storage_path(base), relative))
 
 
-def _read_storage_inventory(node):
+def _read_builtin_storage_inventory(node):
     """Read all jobs and file references; any incomplete response blocks data deletion."""
     result = []
     if isinstance(node, QbitNode):
@@ -5767,6 +5704,18 @@ def _read_storage_inventory(node):
     return result
 
 
+CLIENTS = ClientRegistry()
+CLIENTS.register(ClientAdapter("qbit", QbitNode, QbitNode, _read_builtin_storage_inventory,
+                               close=lambda node: node.s.close()))
+CLIENTS.register(ClientAdapter("rtorrent", RtorrentNode, RtorrentNode, _read_builtin_storage_inventory,
+                               purge_reader=lambda node, torrent_hash: node.get_purge_snapshot(torrent_hash),
+                               supports_keep_files=False, close=lambda node: node.s.close()))
+
+
+def _read_storage_inventory(node):
+    return CLIENTS.adapter_for(node).storage_reader(node)
+
+
 class NodeCleaner:
     _PROTECTED_CACHE_STORAGE = None
 
@@ -5802,121 +5751,25 @@ class NodeCleaner:
 
     @classmethod
     def get_global_protected_set(cls):
-        """โหลดและแคชข้อมูล Hash ในระดับ Class จาก Unified DB ของทุกเว็บไซต์"""
-        if cls._PROTECTED_CACHE_STORAGE is None:
-            all_dbs = load_all_db()  
-            cls._PROTECTED_CACHE_STORAGE = set()
-            for db_name, db_data in all_dbs.items():
-                for data in db_data.values():
-                    # ตรวจสอบสถานะที่ต้องป้องกันจากโครงสร้าง Unified DB
-                    if data.get("status") == "PROTECTED":
-                        h = data.get("hash")
-                        if h and h != "UNKNOWN":
-                            cls._PROTECTED_CACHE_STORAGE.add(h.lower())
-        return cls._PROTECTED_CACHE_STORAGE
-    
+        data = _mapping_store().read()
+        return {r["infohash"] for r in data["site_records"].values()
+                if r.get("infohash") and (r.get("manual_hold") or
+                    any(o.get("status") == "required" for o in r["obligations"].values()))}
+
     @classmethod
     def update_protected_cache_item(cls, t_hash, status):
-        """
-        อัปเดตเฉพาะรายการที่มีการเปลี่ยนแปลง (Incremental Update)
-        ไม่ต้องโหลด DB ใหม่ทั้งหมด
-        """
-        if cls._PROTECTED_CACHE_STORAGE is None:
-            # ถ้ายังไม่มี Cache เลย ให้สั่งโหลดใหม่แบบปกติ
-            cls.get_global_protected_set()
-            return
-
-        h = t_hash.lower()
-        if status == "PROTECTED":
-            cls._PROTECTED_CACHE_STORAGE.add(h)
-        elif h in cls._PROTECTED_CACHE_STORAGE:
-            cls._PROTECTED_CACHE_STORAGE.remove(h)
+        # Compatibility only: protection is read from the persisted ledger.
+        cls.clear_cache()
 
     def _update_db_status(self, t_hash, new_status):
-        target = str(t_hash or "").strip().lower()
-        if not target:
-            print("⚠️ [DB Sync] ปฏิเสธการอัปเดต: hash ว่าง")
-            return
-
-        matches = []
-        for db_name, db in load_all_db().items():
-            if not isinstance(db, dict):
-                continue
-
-            for key, record in db.items():
-                if not isinstance(record, dict):
-                    continue
-
-                record_hash = str(record.get("hash") or "").strip().lower()
-                key_hash = str(key or "").strip().lower()
-
-                if target == record_hash or target == key_hash:
-                    matches.append((db_name, db, record))
-
-        # Fail closed: ไม่อัปเดตหากไม่มี record หรือพบหลาย record
-        if len(matches) != 1:
-            print(
-                f"⚠️ [DB Sync] ไม่ได้อัปเดตสถานะ {target}: "
-                f"พบ matching records={len(matches)}; ต้องเป็น 1"
-            )
-            return
-
-        db_name, db, record = matches[0]
-        record["status"] = new_status
-        record["deleted_at"] = get_now().strftime("%Y-%m-%d %H:%M")
-
-        save_db(db_name, db)
-        NodeCleaner.update_protected_cache_item(target, new_status)
-
-        print(
-            f"🚀 [DB Sync] อัปเดต {target} "
-            f"ใน DB={db_name} เป็น {new_status}"
-        )
+        if new_status == "DELETED":
+            _mapping_store().record_removal(t_hash, self.node.name, deleted_files=True)
 
     def check_torrent_permission(self, t_hash):
-        target = str(t_hash or "").strip().lower()
-        if not target:
+        try:
+            return _mapping_store().protection_status(t_hash)
+        except (RuntimeError, ValueError):
             return "UNKNOWN"
-
-        matches = []
-
-        # ใช้ DB ปัจจุบันโดยตรง ไม่พึ่ง Protected Cache ที่อาจล้าสมัย
-        for db_name, db in load_all_db().items():
-            if not isinstance(db, dict):
-                continue
-
-            for key, record in db.items():
-                if not isinstance(record, dict):
-                    continue
-
-                record_hash = str(record.get("hash") or "").strip().lower()
-                key_hash = str(key or "").strip().lower()
-
-                if target == record_hash or target == key_hash:
-                    status = str(record.get("status") or "").strip().upper()
-                    matches.append((db_name, str(key), status or "UNKNOWN"))
-
-        if not matches:
-            return "NOT_FOUND"
-
-        # หากพบสถานะ PROTECTED ที่ใดก็ตาม ต้องปฏิเสธการลบ
-        if any(status == "PROTECTED" for _, _, status in matches):
-            return "PROTECTED"
-
-        # Hash เดียวกันปรากฏหลาย records: ไม่เดาว่า record ใดเป็นเจ้าของสถานะ
-        if len(matches) != 1:
-            print(
-                f"🔒 [GUARD] Ambiguous DB records for {target}: "
-                f"{len(matches)} matches; refusing deletion"
-            )
-            return "AMBIGUOUS"
-
-        db_name, record_key, status = matches[0]
-        print(
-            f"🔎 [Permission] hash={target} "
-            f"DB={db_name} key={record_key} status={status}"
-        )
-        return status
 
     def _get_node_free_gb(self):
         try:
@@ -5985,14 +5838,17 @@ class NodeCleaner:
             return False, "INVALID_HASH", None, []
 
         # 1. Verify fresh live inventory through the client's native API.
-        rtorrent = isinstance(self.node, RtorrentNode)
-        if rtorrent:
-            inventory, rt_trackers = self.node.get_purge_snapshot(target)
+        adapter = CLIENTS.adapter_for(self.node)
+        native_snapshot = adapter.purge_reader is not None
+        if native_snapshot:
+            inventory, rt_trackers = adapter.purge_reader(self.node, target)
             error = "RTORRENT_RPC_UNAVAILABLE"
-        else:
+        elif adapter.client_type == "qbit":
             inventory, error = self._purge_qbit_get_json(
                 "/api/v2/torrents/info", {"hashes": target}
             )
+        else:
+            return False, "CLIENT_SNAPSHOT_UNAVAILABLE", None, []
 
         if not isinstance(inventory, list):
             return False, f"INVENTORY_{error}", None, []
@@ -6023,7 +5879,7 @@ class NodeCleaner:
             return False, "AMOUNT_LEFT_NOT_ZERO", live, []
 
         # 2. Read live Tracker associations.
-        if rtorrent:
+        if native_snapshot:
             tracker_rows = rt_trackers
         else:
             tracker_rows, error = self._purge_qbit_get_json(
@@ -6174,69 +6030,14 @@ class NodeCleaner:
 
             known_sites.add(canonical)
 
-        # 5. Strictly inspect the BEARBIT DB.
-        # A missing/corrupt DB cannot be interpreted as no obligation.
-        db_dir = globals().get("DB_DIR")
-
-        if not db_dir or not os.path.isdir(db_dir):
-            return False, "BEARBIT_DB_DIRECTORY_UNAVAILABLE", live, sorted(tracker_sites)
-
+        # H&R/Quest use the same central ledger as Cross-Seed and client sync.
+        # No legacy DB or stale cached Boolean may authorize removal.
         try:
-            db_files = [
-                os.path.join(db_dir, filename)
-                for filename in os.listdir(db_dir)
-                if filename.casefold() == "bearbit_link_db.json"
-            ]
-        except Exception:
-            return False, "BEARBIT_DB_DIRECTORY_READ_ERROR", live, sorted(tracker_sites)
-
-        if len(db_files) != 1:
-            return False, "BEARBIT_DB_FILE_MISSING_OR_AMBIGUOUS", live, sorted(tracker_sites)
-
-        try:
-            with open(db_files[0], "r", encoding="utf-8") as handle:
-                bearbit_db = json.load(handle)
-        except Exception:
-            return False, "BEARBIT_DB_READ_ERROR", live, sorted(tracker_sites)
-
-        if not isinstance(bearbit_db, dict):
-            return False, "BEARBIT_DB_INVALID", live, sorted(tracker_sites)
-
-        bearbit_matches = []
-
-        for key, item in bearbit_db.items():
-            if not isinstance(item, dict):
-                continue
-
-            key_hash = str(key or "").strip().lower()
-            item_hash = str(item.get("hash") or "").strip().lower()
-
-            if target == key_hash or target == item_hash:
-                bearbit_matches.append(item)
-
-        if len(bearbit_matches) > 1:
-            return False, "BEARBIT_DB_AMBIGUOUS", live, sorted(tracker_sites)
-
-        bearbit_related = (
-            "BEARBIT" in tracker_sites
-            or source_site == "BEARBIT"
-            or source_bearbit_hint
-            or "BEARBIT" in known_sites
-            or bool(bearbit_matches)
-        )
-
-        if bearbit_related:
-            if not bearbit_matches:
-                return False, "BEARBIT_RECORD_MISSING", live, sorted(tracker_sites)
-
-            # Phase A deliberately keeps all BEARBIT-associated torrents
-            # blocked until Phase B can prove a fresh successful H&R/Quest sync.
-            return (
-                False,
-                "BEARBIT_REQUIRES_PHASE_B_SYNC",
-                live,
-                sorted(tracker_sites),
-            )
+            protection = _mapping_store().protection_status(target, tracker_sites | known_sites)
+        except (RuntimeError, ValueError):
+            protection = "UNKNOWN"
+        if protection != "NORMAL":
+            return False, f"CENTRAL_OBLIGATIONS_{protection}", live, sorted(tracker_sites)
 
         # 6. General authorization for recognized non-BEARBIT sites.
         general_sites = tracker_sites - {"BEARBIT"}
@@ -6279,7 +6080,7 @@ class NodeCleaner:
             for config in clients:
                 if config is own[0] or storage_key(config) != key:
                     continue
-                peer = RtorrentNode(config) if config.get("type") == "rtorrent" else QbitNode(config)
+                peer = CLIENTS.create(config)
                 peers.append(peer)
                 if not peer.login():
                     return False
@@ -6295,7 +6096,7 @@ class NodeCleaner:
             return False
         finally:
             for peer in peers:
-                peer.s.close()
+                CLIENTS.close(peer)
 
     def _hard_purge_sequence(self, t_hash):
         """Final fail-closed authorization gate before deletion."""
@@ -6318,7 +6119,7 @@ class NodeCleaner:
             return False
 
         delete_files = self._can_delete_data(t_hash)
-        if not delete_files and isinstance(self.node, RtorrentNode):
+        if not delete_files and not CLIENTS.adapter_for(self.node).supports_keep_files:
             print(f"🔒 [{self.node.name}] Shared or unverified data; keeping rTorrent job and files")
             return False
 
@@ -6343,13 +6144,15 @@ class NodeCleaner:
             # Re-read references after stopping; never rely on a pre-stop snapshot.
             if delete_files:
                 delete_files = self._can_delete_data(t_hash)
-                if not delete_files and isinstance(self.node, RtorrentNode):
+                if not delete_files and not CLIENTS.adapter_for(self.node).supports_keep_files:
                     return False
             success = self.node.delete_torrent(t_hash, delete_files=delete_files)
 
             if success:
                 if delete_files:
                     self._update_db_status(t_hash, "DELETED")
+                else:
+                    _mapping_store().record_removal(t_hash, self.node.name, deleted_files=False)
                 print(f"✅ [PURGE] Removed job: {t_hash}; delete_files={delete_files}")
                 return True
 
@@ -7951,7 +7754,7 @@ async def download_torrent_smart(tab, details_url, download_url):
     import aiohttp
     cookies = {c.name: c.value for c in await tab.send(uc.cdp.network.get_cookies())}
     
-    async with aiohttp.ClientSession(cookies=cookies) as session:
+    async with aiohttp.ClientSession(cookies=cookies, trust_env=True) as session:
         headers = {
             'User-Agent': await tab.evaluate("navigator.userAgent"),
             'Referer': final_dl_url,
@@ -8080,21 +7883,78 @@ def format_site_stats_report(all_nodes):
     
 # ========================= BearBit STATUS =========================
 
+def _obligation_page_valid(kind, content, url=None, base_url=None):
+    expected_path = '/myhr.php' if kind == 'hr' else '/mybonus.php'
+    if url and base_url:
+        actual, expected = urlsplit(url), urlsplit(base_url)
+        if actual.hostname != expected.hostname or actual.path != expected_path:
+            return False
+    soup = BeautifulSoup(content, 'lxml')
+    # Current collectors enumerate one page only. Pagination is not an empty/full
+    # snapshot and must never release tasks omitted from the first page.
+    for link in soup.select('a[href]'):
+        parsed = urlsplit(link['href'])
+        if parsed.path in ('', expected_path, expected_path.lstrip('/')):
+            query = urllib.parse.parse_qs(parsed.query)
+            if any(key in query for key in ('page', 'p', 'offset')) or 'next' in link.get('rel', []):
+                return False
+    authenticated = soup.select_one('a[href*="logout"]') is not None
+    if not authenticated:
+        return False
+    if kind == "hr":
+        if soup.select_one('td.empty, div.vipbox'):
+            return True
+        return bool(soup.select_one('table.t a[href*="details.php?id="]'))
+    lists = soup.select('ul.bbx-qlist')
+    return bool(lists) and all(not ul.select('li') or ul.select_one('a[href*="details.php?id="]') for ul in lists)
+
+
+async def _obligation_page_url(page):
+    # nodriver's cached Tab.url may still be empty after navigation.
+    evaluate = getattr(page, "evaluate", None)
+    if callable(evaluate):
+        url = await evaluate("window.location.href")
+        if not isinstance(url, str) or not url:
+            raise ValueError("Current obligation page URL unavailable")
+        return url
+    return getattr(page, "url", None)
+
+
+async def _record_obligation_failure(site, kind):
+    await _store_call("record_failure", site, kind)
+
+
+async def _record_obligation_observation(site, kind, current_ids):
+    await _store_call("record_observation", site, kind, current_ids)
+
+
 async def sync_hr_with_web(site_key, page, base_url, ctx):
-    print(f"🔄 [{site_key}] เริ่มต้นกระบวนการ Sync H&R (Unified DB)...")
+    print(f"🔄 [{site_key}] Sync H&R into shared mapping...")
+    await _record_obligation_failure(site_key, "hr")
     await page.get(f"{base_url.rstrip('/')}/myhr.php")
     await asyncio.sleep(2)
     
-    content = await page.get_content()
+    try:
+        content = await page.get_content()
+        current_url = await _obligation_page_url(page)
+    except Exception:
+        await _record_obligation_failure(site_key, "hr")
+        raise
+    if not _obligation_page_valid("hr", content, current_url, base_url):
+        await _record_obligation_failure(site_key, "hr")
+        print(f"🛡️ [{site_key}] Unverified hr page; protection retained")
+        return
     
     # 🛑 ตรวจจับหน้ากำลังอัพเดทข้อมูล
     if "ระบบกำลัง อัพเดทข้อมูล" in content or "กรุณารอสักครู่" in content:
         print(f"⚠️ [{site_key}] เว็บกำลังอยู่ในระหว่างอัพเดทข้อมูล ข้ามการ Sync รอบนี้ไปก่อน")
         await send_notify(f"⚠️ <b>Sync H&R: {site_key}</b>\nเว็บกำลังอยู่ในระหว่างอัพเดทข้อมูล กรุณารอสักครู่...")
+        await _record_obligation_failure(site_key, "hr")
         return
         
     soup = BeautifulSoup(content, 'lxml')
     db = await async_load_db(site_key)
+    db.scope = "hr"
 
     is_empty = soup.find('td', class_='empty') is not None
     is_vip = soup.find('div', class_='vipbox') is not None
@@ -8251,6 +8111,8 @@ async def sync_hr_with_web(site_key, page, base_url, ctx):
 
     # เรียกใช้ฟังก์ชันแยก cleanup ของ H&R ที่เราคุยกัน
     completed_count = await perform_hr_cleanup(site_key, db, current_ids_on_web)
+    await async_save_db(site_key, db)
+    await _record_obligation_observation(site_key, "hr", current_ids_on_web)
     stats["completed"] = completed_count
 
     # ส่ง Notify
@@ -8259,21 +8121,33 @@ async def sync_hr_with_web(site_key, page, base_url, ctx):
     print(f"📧 [{site_key}] สรุปผลเรียบร้อย: {stats}")
 
 async def sync_seed_quest_with_web(site_key, page, base_url, ctx):
-    print(f"🔄 [{site_key}] เริ่มต้นกระบวนการ Sync Seed Quest (Strict Parser)...")
+    print(f"🔄 [{site_key}] Sync Seed Quest into shared mapping...")
+    await _record_obligation_failure(site_key, "quest_seed")
     await page.get(f"{base_url.rstrip('/')}/mybonus.php")
     await asyncio.sleep(2)
     
     # ดึง Content ล่าสุดหลังจากกาง details แล้ว
-    content = await page.get_content()
+    try:
+        content = await page.get_content()
+        current_url = await _obligation_page_url(page)
+    except Exception:
+        await _record_obligation_failure(site_key, "quest_seed")
+        raise
+    if not _obligation_page_valid("quest_seed", content, current_url, base_url):
+        await _record_obligation_failure(site_key, "quest_seed")
+        print(f"🛡️ [{site_key}] Unverified quest_seed page; protection retained")
+        return
     
     # 🛑 ตรวจจับหน้ากำลังอัพเดทข้อมูล
     if "ระบบกำลัง อัพเดทข้อมูล" in content or "กรุณารอสักครู่" in content:
         print(f"⚠️ [{site_key}] เว็บกำลังอยู่ในระหว่างอัพเดทข้อมูล ข้ามการ Sync รอบนี้ไปก่อน")
         await send_notify(f"⚠️ <b>SEED QUEST SYNC: {site_key}</b>\nเว็บกำลังอยู่ในระหว่างอัพเดทข้อมูล กรุณารอสักครู่...")
+        await _record_obligation_failure(site_key, "quest_seed")
         return
 
     soup = BeautifulSoup(content, 'lxml')
     db = await async_load_db(site_key)
+    db.scope = "quest_seed"
 
     stats = {"total": 0, "scanned": 0, "active": 0, "inactive": 0}
     current_ids_on_web = []
@@ -8422,6 +8296,9 @@ async def sync_seed_quest_with_web(site_key, page, base_url, ctx):
 
     completed_count = await perform_quest_cleanup(site_key, db, current_ids_on_web)
     
+    await async_save_db(site_key, db)
+    await _record_obligation_observation(site_key, "quest_seed", current_ids_on_web)
+
     summary_msg = f"🎯 <b>SEED QUEST SYNC: {site_key}</b>\n📋 Total Active: `{stats['total']}`\n🟢 Active Box: `{stats['active']}`\n🔴 Inactive Box: `{stats['inactive']}`\n⚪ Unverified Box: `{stats.get('unverified', 0)}`\n🔍 Scanned Hash: `{stats['scanned']}`\n✅ Completed Cleaned: `{completed_count}`"
     await send_notify(summary_msg)
     print(f"📧 [{site_key}] สรุปผล Seed Quest เรียบร้อย: {stats}")
@@ -10220,6 +10097,10 @@ def build_cross_seed_targets(
                 })
 
         targets.append({
+            "obligation_listing_ids": [
+                key for key, listing in mapping_data.get("site_records", {}).items()
+                if str(listing.get("infohash") or "").upper() == source_hash
+            ],
             "keyword": keyword,
             "target_size_bytes": actual_size,
             "source_hash": source_hash,
@@ -14164,8 +14045,9 @@ async def _persist_cross_seed_linking():
 
 
 async def main():
+    global CFG, browser_instance
+    CFG = load_full_config()
     await initialize_mapping()
-    global browser_instance
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, handle_exit, sig)
@@ -14185,7 +14067,6 @@ async def main():
     while not stop_event.is_set():
         try:
             if stop_event.is_set(): break
-            global CFG
             CFG = load_full_config()
             SET = CFG.get('SETTING', {})
             global_clean = CFG.get('GLOBAL_CLEAN', {})
@@ -14201,7 +14082,7 @@ async def main():
                 if not n_cfg.get('enable'): 
                     continue
                 
-                node = RtorrentNode(n_cfg) if n_cfg.get("type") == "rtorrent" else QbitNode(n_cfg)
+                node = CLIENTS.create(n_cfg)
 
                 if node.login():
                     node.refresh_status()

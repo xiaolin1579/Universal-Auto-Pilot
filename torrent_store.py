@@ -1,0 +1,333 @@
+"""Shared JSON mapping repository. No client SDK or application imports.
+
+Atomic replacements protect readers. A sidecar OS lock serializes read/modify/write
+transactions across processes; callers must keep the lock for the whole transaction.
+"""
+from contextlib import contextmanager
+from copy import deepcopy
+from datetime import datetime, timezone, timedelta
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import tempfile
+import time
+
+SCHEMA_VERSION = 2
+KINDS = ('hr', 'quest_seed')
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+def stamp(value=None):
+    return (value or utcnow()).isoformat(timespec='seconds')
+
+
+def infohash(value):
+    value = str(value or '').strip().lower()
+    return value if re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})', value) else None
+
+
+def fresh(observation, now=None):
+    try:
+        checked = datetime.fromisoformat(observation['checked_at'])
+        expires = datetime.fromisoformat(observation['expires_at'])
+        now = now or utcnow()
+        return checked <= now < expires
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+class SiteView(dict):
+    """Legacy parser view with a baseline, so concurrent kinds merge field changes."""
+    def __init__(self, records):
+        super().__init__(records)
+        self.baseline = deepcopy(records)
+
+
+class MappingStore:
+    def __init__(self, path):
+        self.path = Path(path).resolve()
+        self.lock_path = self.path.with_name(self.path.name + '.lock')
+
+    def try_lock(self):
+        handle = open(self.lock_path, 'a+b')
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                if self.lock_path.stat().st_size == 0:
+                    handle.write(b'0'); handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except (BlockingIOError, OSError) as exc:
+            handle.close()
+            if getattr(exc, 'errno', None) not in (11, 13, 35, 36):
+                raise
+            return None
+
+    @staticmethod
+    def unlock(handle):
+        # Closing releases flock/msvcrt locks, including on exceptional exits.
+        handle.close()
+
+    @contextmanager
+    def transaction(self):
+        handle = None
+        while handle is None:
+            handle = self.try_lock()
+            if handle is None:
+                time.sleep(0.02)
+        try:
+            yield
+        finally:
+            self.unlock(handle)
+
+    @staticmethod
+    def normalize(data):
+        if not isinstance(data, dict) or not isinstance(data.get('torrents'), list):
+            raise ValueError('Invalid mapping root')
+        version = data.get('schema_version', 1)
+        if type(version) is not int or version not in (1, SCHEMA_VERSION):
+            raise ValueError('Unsupported mapping schema version')
+        for key in ('site_records', 'site_sync', 'clients', 'migrations'):
+            if key not in data:
+                data[key] = {}
+            if not isinstance(data[key], dict):
+                raise ValueError('Invalid mapping ' + key)
+        hashes = []
+        for torrent in data['torrents']:
+            if not isinstance(torrent, dict) or not isinstance(torrent.get('client_info'), dict):
+                raise ValueError('Invalid torrent record')
+            value = infohash(torrent['client_info'].get('hash'))
+            if not value or value in hashes:
+                raise ValueError('Invalid or duplicate torrent hash')
+            hashes.append(value)
+        for key, row in data['site_records'].items():
+            if not isinstance(row, dict) or not isinstance(row.get('legacy_state'), dict):
+                raise ValueError('Invalid site record: ' + str(key))
+            if not isinstance(row.get('obligations'), dict):
+                raise ValueError('Invalid obligations: ' + str(key))
+            if (not isinstance(row.get('site'), str) or not isinstance(row.get('torrent_id'), str)
+                    or key != row['site'] + ':' + row['torrent_id']
+                    or (row.get('infohash') is not None and not infohash(row['infohash']))):
+                raise ValueError('Invalid site identity')
+            for kind, observation in row['obligations'].items():
+                if (kind not in KINDS or not isinstance(observation, dict)
+                        or observation.get('status') not in ('required', 'clear', 'unknown')):
+                    raise ValueError('Invalid obligation evidence')
+        for site, kinds in data['site_sync'].items():
+            if not isinstance(kinds, dict) or any(not isinstance(v, dict) for v in kinds.values()):
+                raise ValueError('Invalid site synchronization evidence')
+        data['schema_version'] = SCHEMA_VERSION
+        return data
+
+    def read(self):
+        try:
+            with self.path.open(encoding='utf-8') as handle:
+                return self.normalize(json.load(handle))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError('Mapping unavailable or invalid; refusing empty fallback') from exc
+
+    def write(self, data):
+        """Caller holds transaction lock. Never replace malformed/future schema data."""
+        self.normalize(data)
+        original = self.path.stat() if self.path.exists() else None
+        fd, temp = tempfile.mkstemp(prefix=self.path.name + '.', suffix='.tmp', dir=self.path.parent)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                json.dump(data, handle, ensure_ascii=False, indent=4)
+                handle.write('\n'); handle.flush(); os.fsync(handle.fileno())
+            os.chmod(temp, stat.S_IMODE(original.st_mode) if original else 0o600)
+            if original and hasattr(os, 'chown'):
+                current = os.stat(temp)
+                if (current.st_uid, current.st_gid) != (original.st_uid, original.st_gid):
+                    os.chown(temp, original.st_uid, original.st_gid)
+            os.replace(temp, self.path)
+            if os.name != 'nt':
+                directory = os.open(self.path.parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+
+    def update(self, mutation):
+        with self.transaction():
+            data = self.read()
+            result = mutation(data)
+            self.write(data)
+            return result
+
+    def initialize(self, legacy_dir=None, clients=()):
+        with self.transaction():
+            if not self.path.exists():
+                self.write({'torrents': []})
+            data = self.read()
+            if 'central_site_records_v1' not in data['migrations']:
+                legacy = {}
+                if legacy_dir and Path(legacy_dir).is_dir():
+                    # Read and validate ALL files before writing any imported state.
+                    for path in sorted(Path(legacy_dir).glob('*_link_db.json')):
+                        rows = json.loads(path.read_text(encoding='utf-8'))
+                        if not isinstance(rows, dict) or any(not isinstance(v, dict) for v in rows.values()):
+                            raise ValueError('Invalid legacy DB: ' + path.name)
+                        legacy[path.name[:-len('_link_db.json')]] = rows
+                if self.path.exists():
+                    backup = self.path.with_name(self.path.name + '.pre-central.bak')
+                    if not backup.exists():
+                        # Exclusive creation preserves the first recoverable snapshot.
+                        with backup.open('xb') as handle:
+                            os.chmod(backup, 0o600)
+                            handle.write(self.path.read_bytes()); handle.flush(); os.fsync(handle.fileno())
+                for site, rows in legacy.items():
+                    self._merge_view(data, site, rows)
+                data['migrations']['central_site_records_v1'] = {'completed_at': stamp(), 'legacy_sites': sorted(legacy)}
+            for client in clients:
+                name = str(client.get('name') or '').strip()
+                if name:
+                    # No passwords, session cookies, URL credentials or tokens.
+                    data['clients'][name] = {'client_type': client.get('type'),
+                                             'storage_id': client.get('storage_id'),
+                                             'config_ref': name}
+            self.write(data)
+
+    def site_view(self, site):
+        site = str(site).upper()
+        return SiteView({r['torrent_id']: deepcopy(r['legacy_state'])
+                         for r in self.read()['site_records'].values() if r['site'] == site})
+
+    @staticmethod
+    def _merge_view(data, site, records):
+        site = str(site).upper()
+        baseline = getattr(records, 'baseline', {})
+        if not isinstance(records, dict):
+            raise ValueError('Invalid site state')
+        for tid, state in records.items():
+            if not isinstance(state, dict):
+                raise ValueError('Invalid site entry')
+            tid = str(tid)
+            key = site + ':' + tid
+            record = data['site_records'].setdefault(key, {'site': site, 'torrent_id': tid,
+                       'infohash': None, 'legacy_state': {}, 'obligations': {}})
+            previous = baseline.get(tid, {})
+            changes = {k: deepcopy(v) for k, v in state.items() if k not in previous or previous[k] != v}
+            scope = getattr(records, 'scope', None)
+            if scope == 'hr':
+                changes = {k: v for k, v in changes.items() if not k.startswith('seed_quest') and k != 'seed_state'}
+            elif scope == 'quest_seed':
+                changes = {k: v for k, v in changes.items() if not k.startswith('hr')}
+
+            new_hash = infohash(changes.get('hash'))
+            if new_hash:
+                if record['infohash'] and record['infohash'] != new_hash:
+                    raise ValueError('Conflicting hash for site listing ' + key)
+                record['infohash'] = new_hash
+            record['legacy_state'].update(changes)
+            # A partial parser write may add protection, but never release it.
+            for kind, field in (('hr', 'hr'), ('quest_seed', 'seed_quest')):
+                if record['legacy_state'].get(field) is True:
+                    old = record['obligations'].get(kind, {})
+                    if old.get('status') != 'required':
+                        record['obligations'][kind] = {'status': 'required', 'checked_at': None,
+                            'expires_at': None, 'verification_method': 'legacy_protection'}
+            if state.get('status') == 'PROTECTED' and not state.get('hr') and not state.get('seed_quest'):
+                record['manual_hold'] = True
+
+    def save_site_view(self, site, records):
+        self.update(lambda data: self._merge_view(data, site, records))
+
+    def site_views(self):
+        result = {}
+        for record in self.read()['site_records'].values():
+            result.setdefault(record['site'], {})[record['torrent_id']] = deepcopy(record['legacy_state'])
+        return result
+
+    def record_observation(self, site, kind, current_ids, ttl_seconds=900):
+        """Only call after a complete authenticated page parse, including empty pages."""
+        if kind not in KINDS or ttl_seconds <= 0:
+            raise ValueError('Invalid obligation observation')
+        site = str(site).upper(); ids = {str(v) for v in current_ids}; now = utcnow()
+        def apply(data):
+            existing_ids = {r['torrent_id'] for r in data['site_records'].values() if r['site'] == site}
+            if not ids <= existing_ids:
+                raise ValueError('Observation has unrecorded site listings')
+            evidence = {'checked_at': stamp(now), 'expires_at': stamp(now + timedelta(seconds=ttl_seconds)),
+                        'verification_method': 'authenticated_complete_site_page', 'status': 'ok'}
+            data['site_sync'].setdefault(site, {})[kind] = evidence
+            field = 'hr' if kind == 'hr' else 'seed_quest'
+            for r in data['site_records'].values():
+                if r['site'] != site:
+                    continue
+                required = r['torrent_id'] in ids and r['legacy_state'].get(field) is True
+                r['obligations'][kind] = {**evidence, 'status': 'required' if required else 'clear'}
+        self.update(apply)
+
+    def record_failure(self, site, kind):
+        if kind not in KINDS:
+            raise ValueError('Invalid obligation kind')
+        def apply(data):
+            previous = data['site_sync'].setdefault(str(site).upper(), {}).setdefault(kind, {})
+            previous.update(status='failed', last_failure_at=stamp())
+        self.update(apply)
+
+    def set_manual_hold(self, site, torrent_id, enabled, reason=''):
+        if type(enabled) is not bool:
+            raise ValueError('Manual hold must be Boolean')
+        key = str(site).upper() + ':' + str(torrent_id)
+        def apply(data):
+            record = data['site_records'][key]
+            record.update(manual_hold=enabled, manual_hold_reason=str(reason),
+                          manual_hold_updated_at=stamp())
+        self.update(apply)
+
+    def protection_status(self, torrent_hash, required_sites=()):
+        target = infohash(torrent_hash)
+        if not target:
+            return 'UNKNOWN'
+        data = self.read()
+        rows = [r for r in data['site_records'].values() if r.get('infohash') == target]
+        sites = {str(s).upper() for s in required_sites}
+        sites.update(r['site'] for r in rows)
+        if any(r.get('manual_hold') or any(o.get('status') == 'required' for o in r['obligations'].values()) for r in rows):
+            return 'PROTECTED'
+        if not rows:
+            return 'UNKNOWN' if sites else 'NOT_FOUND'
+        for site in sites:
+            linked = [r for r in rows if r['site'] == site]
+            if not linked:
+                return 'UNKNOWN'
+            # Unresolved protected site listings may refer to this hash.
+            if any(r['site'] == site and not r.get('infohash') and
+                   (r.get('manual_hold') or any(o.get('status') == 'required' for o in r['obligations'].values()))
+                   for r in data['site_records'].values()):
+                return 'UNKNOWN'
+            for kind in KINDS:
+                sync = data['site_sync'].get(site, {}).get(kind, {})
+                if sync.get('status') != 'ok' or not fresh(sync):
+                    return 'UNKNOWN'
+                if any(r['obligations'].get(kind, {}).get('status') != 'clear' or
+                       not fresh(r['obligations'][kind]) for r in linked):
+                    return 'UNKNOWN'
+        return 'NORMAL'
+
+    def record_removal(self, torrent_hash, node_name, deleted_files):
+        target = infohash(torrent_hash)
+        def apply(data):
+            for record in data['torrents']:
+                if infohash(record.get('client_info', {}).get('hash')) != target:
+                    continue
+                for loc in record.get('node_locations', []):
+                    if loc.get('seedbox_host') == node_name:
+                        loc.update(present=False, inventory_verified=False, removed_at=stamp())
+                record['last_client_action'] = {'node': node_name, 'action': 'removed',
+                    'deleted_files': bool(deleted_files), 'confirmed_at': stamp()}
+        self.update(apply)

@@ -171,3 +171,7 @@ debug_error.html
 /profiles
 torrent_mapping.json
 .cross_seed_keyword_probe_done
+
+# Shared mapping transaction and migration artifacts
+torrent_mapping.json.lock
+torrent_mapping.json.pre-central.bak
