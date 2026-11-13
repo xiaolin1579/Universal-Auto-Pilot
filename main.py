@@ -1,5 +1,5 @@
 from fake_useragent import UserAgent
-from urllib.parse import urljoin, unquote
+from urllib.parse import urljoin, unquote, urlsplit
 import xmlrpc.client
 import logging
 import aiohttp
@@ -4513,6 +4513,7 @@ class RtorrentNode:
         self.name, self.url = cfg["name"], cfg["url"].rstrip("/")
         self.user, self.pw = cfg["rt_user"], cfg["rt_pass"]
         self.quota_gb = cfg.get("quota_gb", 0)
+        self.allow_space_reclaim = cfg.get("allow_space_reclaim", True) is True
 
         # สร้าง Session ไว้ใช้ยาวๆ ลด Overhead การสร้าง Connection ใหม่
         self.s = requests.Session()
@@ -5084,6 +5085,63 @@ class RtorrentNode:
         except:
             pass
 
+    def get_purge_snapshot(self, t_hash):
+        """Read fresh completion and tracker evidence; never mutate torrents."""
+        target = str(t_hash or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", target):
+            return None, None
+
+        def read(method, params):
+            response = self.s.post(
+                self.url, data=xmlrpc.client.dumps(params, methodname=method),
+                auth=self.auth, headers=self.headers, timeout=12, verify=True,
+                allow_redirects=False,
+            )
+            if response.status_code != 200:
+                raise ValueError("rTorrent RPC unavailable")
+            values, _ = xmlrpc.client.loads(response.content)
+            if len(values) != 1 or not isinstance(values[0], (list, tuple)):
+                raise ValueError("Invalid rTorrent RPC result")
+            return values[0]
+
+        try:
+            rows = read("d.multicall2", ("", "main", "d.hash=", "d.complete=", "d.left_bytes="))
+            inventory = []
+            for row in rows:
+                if not isinstance(row, (list, tuple)) or len(row) != 3:
+                    raise ValueError("Incomplete rTorrent inventory")
+                torrent_hash = str(row[0]).strip().lower()
+                if not re.fullmatch(r"[0-9a-f]{40}", torrent_hash):
+                    raise ValueError("Invalid rTorrent hash")
+                complete, left = int(row[1]), int(row[2])
+                if complete not in (0, 1) or left < 0:
+                    raise ValueError("Invalid rTorrent completion")
+                inventory.append({"hash": torrent_hash, "progress": float(complete),
+                                  "amount_left": left})
+            if sum(item["hash"] == target for item in inventory) != 1:
+                return inventory, []
+            rows = read("t.multicall", (target.upper(), "", "t.url="))
+            trackers = []
+            for row in rows:
+                if not isinstance(row, (list, tuple)) or len(row) != 1 or not isinstance(row[0], str):
+                    raise ValueError("Invalid rTorrent tracker result")
+                trackers.append({"url": row[0]})
+            return inventory, trackers
+        except Exception:
+            return None, None
+
+    @staticmethod
+    def _multicall_succeeded(response, count):
+        if response.status_code != 200:
+            return False
+        values, _ = xmlrpc.client.loads(response.content)
+        return (
+            len(values) == 1 and isinstance(values[0], (list, tuple))
+            and len(values[0]) == count
+            and all(isinstance(row, (list, tuple)) and len(row) == 1
+                    for row in values[0])
+        )
+
     def delete_torrent(self, t_hash):
         """Hard Delete: หยุดและลบข้อมูลในคำสั่งเดียว (Atomic Operation)"""
         #สิ่งที่ต้องเพิ่มใน .rtorrent.rc
@@ -5109,7 +5167,7 @@ class RtorrentNode:
             </methodCall>'''
 
             r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, verify=True, timeout=10)
-            return r.status_code == 200
+            return self._multicall_succeeded(r, 2)
         except Exception as e:
             print(f"❌ [{self.name}] Delete Error: {e}")
             return False
@@ -5135,7 +5193,7 @@ class RtorrentNode:
 
         try:
             r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, verify=True, timeout=10)
-            return r.status_code == 200
+            return self._multicall_succeeded(r, len(calls))
         except Exception as e:
             print(f"❌ [{self.name}] Batch Operation Error: {e}")
             return False
@@ -5143,6 +5201,8 @@ class RtorrentNode:
     def stop_torrent(self, target_hashes):
         """สั่ง Stop งานหลายตัวพร้อมกันผ่าน system.multicall"""
         if not target_hashes: return False
+        if isinstance(target_hashes, str):
+            target_hashes = [target_hashes]
 
         # สร้างรายการคำสั่ง stop สำหรับทุก hash
         calls = []
@@ -5157,6 +5217,8 @@ class RtorrentNode:
     def reannounce_torrent(self, target_hashes):
         """สั่ง Re-announce งานเฉพาะกลุ่มผ่าน system.multicall"""
         if not target_hashes: return False
+        if isinstance(target_hashes, str):
+            target_hashes = [target_hashes]
 
         calls = []
         for t_hash in target_hashes:
@@ -5829,7 +5891,7 @@ class NodeCleaner:
         Phase A authorization.
 
         - Requires one exact Mapping record.
-        - Requires a fresh complete qBittorrent inventory result.
+        - Requires a fresh complete inventory result from the native client API.
         - Requires recognized live tracker associations.
         - BEARBIT remains blocked until Phase B freshness verification.
         - Does not mutate Mapping, DB, trackers or torrents.
@@ -5840,11 +5902,15 @@ class NodeCleaner:
         if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", target):
             return False, "INVALID_HASH", None, []
 
-        # 1. Verify live qBittorrent inventory.
-        inventory, error = self._purge_qbit_get_json(
-            "/api/v2/torrents/info",
-            {"hashes": target},
-        )
+        # 1. Verify fresh live inventory through the client's native API.
+        rtorrent = isinstance(self.node, RtorrentNode)
+        if rtorrent:
+            inventory, rt_trackers = self.node.get_purge_snapshot(target)
+            error = "RTORRENT_RPC_UNAVAILABLE"
+        else:
+            inventory, error = self._purge_qbit_get_json(
+                "/api/v2/torrents/info", {"hashes": target}
+            )
 
         if not isinstance(inventory, list):
             return False, f"INVENTORY_{error}", None, []
@@ -5875,10 +5941,12 @@ class NodeCleaner:
             return False, "AMOUNT_LEFT_NOT_ZERO", live, []
 
         # 2. Read live Tracker associations.
-        tracker_rows, error = self._purge_qbit_get_json(
-            "/api/v2/torrents/trackers",
-            {"hash": target},
-        )
+        if rtorrent:
+            tracker_rows = rt_trackers
+        else:
+            tracker_rows, error = self._purge_qbit_get_json(
+                "/api/v2/torrents/trackers", {"hash": target}
+            )
 
         if not isinstance(tracker_rows, list) or not tracker_rows:
             return False, f"TRACKER_API_{error}", live, []
@@ -6138,7 +6206,8 @@ class NodeCleaner:
             print(f"🔄 [PURGE] Starting deletion sequence: {t_hash}")
 
             self.node.reannounce_torrent(t_hash)
-            self.node.stop_torrent(t_hash)
+            if not self.node.stop_torrent(t_hash):
+                return False
 
             success = self.node.delete_torrent(t_hash)
 
@@ -6406,27 +6475,26 @@ class NodeCleaner:
                 leechers = float(t.get('leechers', 0))
                 is_stagnant = (upspeed == 0 and leechers == 0)
 
-                # --- เช็คเวลาที่โหลดเสร็จแล้ว (Completion Time) ---
-                # qBittorrent มักใช้ 'completion_on', ถ้าไม่มีให้ fallback ไปใช้เวลาปัจจุบันหรือเวลาแอด
-                ts_completed = t.get('completion_on', t.get('completed_on', 0))
-                if ts_completed == 0 and is_completed:
-                    # ถ้า API ไม่ส่งเวลาเสร็จมา แต่สถานะบอกว่าเสร็จแล้ว ให้ประเมินว่าเพิ่งเสร็จ หรือใช้เวลาแอดแทน
-                    ts_completed = ts_init 
-                
-                # เช็คว่าโหลดเสร็จมาแล้วอย่างน้อย 1 ชั่วโมง (3600 วินาที) หรือไม่
-                has_matured_after_complete = is_completed and ((current_ts - ts_completed) >= 3600)
+                # Use the normalized completion timestamp, never the add time.
+                try:
+                    ts_completed = float(t.get('ts_finished') or t.get('completion_on')
+                                         or t.get('completed_on') or 0)
+                except (TypeError, ValueError, OverflowError):
+                    ts_completed = 0.0
+                has_matured_after_complete = (
+                    is_completed and ts_completed > 0
+                    and current_ts - ts_completed >= 3600
+                )
 
                 t['_calculated_size_gb'] = t_size_gb
                 t['_calculated_ratio'] = t_ratio
 
                 if is_completed:
-                    # เงื่อนไขการลบใหม่: 
-                    # - โหมดฉุกเฉิน (ขนาดถึงเกณฑ์) OR
-                    # - (โหลดเสร็จมาแล้ว >= 1 ชม. AND เรโช >= 1.0 AND ขนาด >= 1.0 GB) OR
-                    # - (ไฟล์นิ่งสนิท AND ขนาด >= 1.0 GB)
-                    can_remove_completed = (is_emergency and t_size_gb >= 1.0) or \
-                                           (has_matured_after_complete and t_ratio >= 1.0 and t_size_gb >= 1.0) or \
-                                           (is_stagnant and t_size_gb >= 1.0)
+                    # Require a verified completion age of at least one hour,
+                    # even for stagnant jobs and emergency reclaim.
+                    can_remove_completed = has_matured_after_complete and t_size_gb >= 1.0 and (
+                        is_emergency or t_ratio >= 1.0 or is_stagnant
+                    )
         
                     if can_remove_completed:
                         scannable_torrents.append(t)
