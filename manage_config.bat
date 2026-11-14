@@ -207,16 +207,22 @@ pause
 goto menu
 
 :global_clean
+call :require_legacy_node_editor
+if errorlevel 1 goto shared_nodes_editor_blocked
 cls
 echo --- Global Clean Settings ---
 set /p g_en="Enable Global Clean (true/false): "
 set /p g_ratio="Min Ratio: "
 set /p g_min_t="Min Seeding Time (Min): "
 set /p g_max_t="Max Seeding Time (Min): "
+call :require_legacy_node_editor
+if errorlevel 1 goto shared_nodes_editor_blocked
 python -c "import json; d=json.load(open('config.json', encoding='utf-8')); g=d.get('GLOBAL_CLEAN', {}); g['enable']=(True if '%g_en%'.lower()=='true' else False) if '%g_en%' else g.get('enable', True); g['min_ratio']=float('%g_ratio%') if '%g_ratio%' else g.get('min_ratio', 1.0); g['min_time']=int('%g_min_t%') if '%g_min_t%' else g.get('min_time', 360); g['max_time']=int('%g_max_t%') if '%g_max_t%' else g.get('max_time', 1440); d['GLOBAL_CLEAN']=g; json.dump(d, open('config.json', 'w', encoding='utf-8'), indent=2)"
 goto menu
 
 :node
+call :require_legacy_node_editor
+if errorlevel 1 goto shared_nodes_editor_blocked
 cls
 echo --- Node Management ---
 python -c "import json; d=json.load(open('config.json', encoding='utf-8')); [print(f'{i}: {n[\"name\"]} (Clean: {n.get(\"clean_settings\", {}).get(\"enable\")})') for i, n in enumerate(d.get('NODES', []))]"
@@ -227,6 +233,8 @@ if "%op%"=="d" goto node_del
 goto menu
 
 :node_add
+call :require_legacy_node_editor
+if errorlevel 1 goto shared_nodes_editor_blocked
 cls
 echo --- Add New Node ---
 set /p n_name="Name: "
@@ -253,6 +261,8 @@ if /i "%nc_en%"=="true" (
     set /p nc_max_t="   > Max Time (Minutes): "
 )
 
+call :require_legacy_node_editor
+if errorlevel 1 goto shared_nodes_editor_blocked
 python -c "import json, os; \
 d=json.load(open('config.json', encoding='utf-8')); \
 node = { \
@@ -273,6 +283,8 @@ json.dump(d, open('config.json', 'w', encoding='utf-8'), indent=2, ensure_ascii=
 goto menu
 
 :node_edit
+call :require_legacy_node_editor
+if errorlevel 1 goto shared_nodes_editor_blocked
 cls
 echo --- Edit Node ---
 set /p idx="Enter Index to Edit (0, 1, 2...): "
@@ -299,6 +311,8 @@ if /i "%nc_en%"=="true" (
     set /p nc_max_t="   > Max Time (Enter to skip): "
 )
 
+call :require_legacy_node_editor
+if errorlevel 1 goto shared_nodes_editor_blocked
 python -c "import json, os; \
 d=json.load(open('config.json', encoding='utf-8')); \
 idx=int('%idx%'); \
@@ -325,6 +339,22 @@ pause
 goto menu
 
 :node_del
+call :require_legacy_node_editor
+if errorlevel 1 goto shared_nodes_editor_blocked
 set /p idx="Enter Index to Delete: "
+call :require_legacy_node_editor
+if errorlevel 1 goto shared_nodes_editor_blocked
 python -c "import json; d=json.load(open('config.json', encoding='utf-8')); d['NODES'].pop(%idx%); json.dump(d, open('config.json', 'w', encoding='utf-8'), indent=2)"
+goto menu
+
+:require_legacy_node_editor
+python -c "import json, sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); from node_config import uses_shared_nodes; raw=json.loads(Path('config.json').read_text(encoding='utf-8')); sys.exit(1 if uses_shared_nodes(raw) else 0)" "%~dp0." 2>nul
+if errorlevel 1 exit /b 1
+exit /b 0
+
+:shared_nodes_editor_blocked
+echo [!] เมนู Node/Cleaner นี้รองรับ config แบบเดิมเท่านั้น และต้องอ่าน config ได้สำเร็จ
+echo [!] กรุณาแก้ CREDENTIALS/STORAGES/CLEANER/NODES ใน JSON โดยตรง
+echo [!] ตรวจสอบด้วย node_config.load_config ก่อนใช้งาน
+pause
 goto menu

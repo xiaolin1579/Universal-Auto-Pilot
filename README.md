@@ -83,19 +83,22 @@ Linux ใช้หลัง `source venv/bin/activate` ส่วน Windows ใ�
 python -c "import json; from pathlib import Path; json.loads(Path('config.json').read_text(encoding='utf-8')); print('JSON OK')"
 ```
 
-โครงสร้าง config **ยังใช้ `NODES` รูปแบบเดิม**:
+โปรแกรมอ่านได้ทั้ง **`NODES` เดิม** และ **รูปแบบ references** ที่ใช้บัญชี/ดิสก์ร่วมกัน
+ดูตัวอย่าง [nodes.example.json](nodes.example.json) และวิธีย้ายใน
+[NODE_CONFIG.md](docs/NODE_CONFIG.md) ตารางต่อไปนี้อธิบายส่วนตั้งค่าของระบบ:
 
 | ส่วนตั้งค่า | หน้าที่ |
 |---|---|
 | `SITE` | บัญชีเว็บไซต์ สวิตช์เปิดใช้ และรายการโซนใน `target_urls` |
 | `SETTING` | รอบค้นหา ขนาดไฟล์ จำนวนงาน และการใช้ Xvfb |
 | `NODES` | ชื่อ/type/URL ของ client บัญชี โควตา และค่าพื้นที่ของแต่ละโหนด |
+| `CREDENTIALS` / `STORAGES` / `CLEANER` | บัญชี ดิสก์ และนโยบายร่วมสำหรับ node รูปแบบ references |
 | `GLOBAL_CLEAN` / `NODES[].clean_settings` | สวิตช์กลางและเงื่อนไข Cleaner ของแต่ละโหนด |
 | `CROSS_SEED_EXECUTION` | อนุญาตเพิ่ม tracker หรือเพิ่มงาน hash ใหม่จาก Cross-Seed |
 | `AUTO_UPLOAD` | กฎเส้นทางอัปโหลด หมวดปลายทาง และสวิตช์แต่ละขั้นตอน |
 | `TELEGRAM_CONFIG` / `DISCORD_CONFIG` / `LINE_CONFIG` | การแจ้งเตือนและรีโมทตามช่องทางที่รองรับ |
 
-`NODES[].type` ใช้ `qbit` หรือ `rtorrent` พร้อมบัญชี `qb_user`/`qb_pass`
+ในรูปแบบเดิม `NODES[].type` ใช้ `qbit` หรือ `rtorrent` พร้อมบัญชี `qb_user`/`qb_pass`
 หรือ `rt_user`/`rt_pass` ตามชนิด client โดย `nginx` ใช้เปิด HTTP Basic Auth
 สำหรับ qBittorrent ที่อยู่หลัง reverse proxy ส่วน OnlyOneSeedbox ใช้
 `provider_sso`, `provider_user` และ `provider_pass` สำหรับล็อกอินผ่านผู้ให้บริการ
@@ -103,6 +106,8 @@ python -c "import json; from pathlib import Path; json.loads(Path('config.json')
 เปิดเฉพาะเว็บไซต์ โซน และโหนดที่จะใช้งาน ก่อนเปิดการลบหรือเผยแพร่ให้ตรวจเงื่อนไข
 ในแต่ละส่วนด้านล่าง สามารถแก้ config ผ่าน `manage_config.sh` หรือ
 `manage_config.bat` สำหรับเมนูที่สคริปต์รองรับ ส่วนค่าขั้นสูงแก้ใน JSON โดยตรง
+เมนู Node/Global Cleaner ของสคริปต์รองรับ config เดิมเท่านั้น หากใช้ references
+ให้แก้ JSON แล้วตรวจด้วย `python node_config.py config.json`
 
 ## เริ่มใช้งาน
 
@@ -209,9 +214,10 @@ Cleaner ตรวจ H&R/Quest, manual hold และงานอัปโหล
 หากยังมี Cross-Seed จะเก็บไฟล์ไว้ และ rTorrent ที่ไม่สามารถรับประกันการลบเฉพาะงาน
 จะระงับการลบงานนั้น
 
-`GLOBAL_CLEAN.enable` เป็นสวิตช์กลาง ส่วน `clean_settings` ใช้ตั้งเงื่อนไขของ node
+สำหรับ config เดิม `GLOBAL_CLEAN.enable` เป็นสวิตช์กลาง ส่วน `clean_settings` ใช้ตั้งเงื่อนไขของ node
 และ `allow_space_reclaim` ควบคุมการคืนพื้นที่ ดูกติกาภาระการ seed และการป้องกันไฟล์
 ใน [TORRENT_MAPPING.md](docs/TORRENT_MAPPING.md)
+รูปแบบ references ใช้ `CLEANER` และนโยบายร่วมตาม [NODE_CONFIG.md](docs/NODE_CONFIG.md)
 
 ## ไฟล์และเอกสารสำคัญ
 
@@ -227,12 +233,14 @@ Cleaner ตรวจ H&R/Quest, manual hold และงานอัปโหล
 | [upload_sites.py](upload_sites.py) / [upload_client.py](upload_client.py) | ตัวอ่านเว็บ/ฟอร์มและคำสั่ง client สำหรับอัปโหลด |
 | [torrent_metainfo.py](torrent_metainfo.py) | อ่าน metainfo ตรวจ payload และสร้าง variant |
 | [storage_telemetry.py](storage_telemetry.py) | ตัวอ่านพื้นที่ Swizzin แบบ quota ก่อน mount |
+| [node_config.py](node_config.py) / [nodes.example.json](nodes.example.json) | ตัวอ่านและตัวอย่าง config โหนดแบบใช้ข้อมูลร่วมกัน |
 | `torrent_mapping.json` | ข้อมูล torrent, site records, H&R/Quest, ตำแหน่งไฟล์ และ upload jobs |
 | `stats_history.json` / `stats_cache.json` | สถิติและข้อมูลสำหรับรายงาน |
 | [docs/TORRENT_MAPPING.md](docs/TORRENT_MAPPING.md) | schema การย้ายข้อมูล ภาระการ seed และการเพิ่ม client |
 | [docs/AUTO_UPLOAD.md](docs/AUTO_UPLOAD.md) | ตั้งค่าและใช้งาน Auto Upload/Cross-Seed |
 | [docs/UPLOAD_CATEGORY_RULES.md](docs/UPLOAD_CATEGORY_RULES.md) | ตารางจับคู่หมวด BearBit กับเว็บปลายทาง |
 | [docs/STORAGE.md](docs/STORAGE.md) | กติกาเลือก quota/mount และการตั้งค่าพื้นที่ |
+| [docs/NODE_CONFIG.md](docs/NODE_CONFIG.md) | การอ้างบัญชี/ดิสก์ นโยบาย Cleaner และการย้าย config |
 
 สำรอง `torrent_mapping.json` ก่อนย้ายหรือแก้ข้อมูล โครงสร้างปัจจุบันเป็น schema 2
 และเก็บข้อมูลเดิมไว้ร่วมกับ `site_records`, `upload_jobs` และ `content_groups`

@@ -1,0 +1,66 @@
+{
+  "CREDENTIALS": {
+    "readyidc": {
+      "username": "YOUR_USERNAME",
+      "password": "YOUR_PASSWORD"
+    }
+  },
+  "STORAGES": {
+    "readyidc-data": {
+      "disk_type": "SSD",
+      "quota_gib": 80,
+      "safety_buffer_gib": 2,
+      "telemetry": {
+        "type": "swizzin",
+        "via_node": "readyidc-qbit",
+        "mount": "/"
+      }
+    }
+  },
+  "CLEANER": {
+    "enable": false,
+    "defaults": {
+      "enable": false,
+      "allow_space_reclaim": false,
+      "policy": "standard"
+    },
+    "policies": {
+      "standard": {
+        "min_ratio": 0.5,
+        "min_time_minutes": 120,
+        "max_time_minutes": 720
+      },
+      "conservative": {
+        "min_ratio": 1.5,
+        "min_time_minutes": 720,
+        "max_time_minutes": 1440
+      }
+    }
+  },
+  "NODES": [
+    {
+      "id": "readyidc-qbit",
+      "name": "ReadyIDC",
+      "type": "qbit",
+      "enable": false,
+      "url": "https://seedbox.example/qbittorrent/",
+      "storage_id": "readyidc-data",
+      "auth": {
+        "http_basic": {"credential_ref": "readyidc"},
+        "session": {"type": "qbit", "credential_ref": "readyidc"}
+      }
+    },
+    {
+      "id": "readyidc-rtorrent",
+      "name": "ReadyIDC_rTorrent",
+      "type": "rtorrent",
+      "enable": false,
+      "url": "https://seedbox.example/rutorrent/plugins/httprpc/action.php",
+      "storage_id": "readyidc-data",
+      "auth": {
+        "http_basic": {"credential_ref": "readyidc"}
+      },
+      "cleaner": {"policy": "conservative"}
+    }
+  ]
+}

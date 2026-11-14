@@ -9,9 +9,34 @@ get_val() {
     python3 -c "import json, os; d=json.load(open('$CONFIG_FILE')) if os.path.exists('$CONFIG_FILE') else {}; print(d$1)" 2>/dev/null || echo "0"
 }
 
+require_legacy_node_editor() {
+    python3 - "$CONFIG_FILE" "$(dirname "${BASH_SOURCE[0]}")" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, sys.argv[2])
+try:
+    from node_config import uses_shared_nodes
+    path = Path(sys.argv[1])
+    raw = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+    if not isinstance(raw, dict):
+        raise ValueError('Invalid config object')
+    shared = uses_shared_nodes(raw)
+except Exception:
+    print('อ่านรูปแบบ config ไม่สำเร็จ จึงไม่เปิดเมนูแก้ Node/Cleaner')
+    raise SystemExit(1)
+if shared:
+    print('เมนู Node/Cleaner นี้รองรับ config แบบเดิมเท่านั้น')
+    print('กรุณาแก้ CREDENTIALS/STORAGES/CLEANER/NODES ใน JSON โดยตรง')
+    print('ตรวจสอบด้วย node_config.load_config ก่อนใช้งาน')
+    raise SystemExit(1)
+PY
+}
+
 update_json() {
     python3 -c "
-import json, os
+import json, os, sys
 # ถ้าไม่มีไฟล์ให้สร้าง dict เปล่าขึ้นมาเป็นโครงสร้างเริ่มต้น
 if not os.path.exists('$CONFIG_FILE'):
     d = {'BEARBIT':{}, 'TORRENTDD':{}, 'NODES':[], 'SETTING':{}, 'TELEGRAM_CONFIG':{}}
@@ -19,11 +44,17 @@ else:
     with open('$CONFIG_FILE', 'r', encoding='utf-8') as f:
         d = json.load(f)
 
+if sys.argv[1] == 'legacy_nodes':
+    sys.path.insert(0, sys.argv[2])
+    from node_config import uses_shared_nodes
+    if uses_shared_nodes(d):
+        raise SystemExit('config เปลี่ยนเป็นรูปแบบใหม่แล้ว กรุณาแก้ CREDENTIALS/STORAGES/CLEANER/NODES ใน JSON โดยตรง')
+
 $1  # รันคำสั่งแก้ไขที่ส่งมา
 
 with open('$CONFIG_FILE', 'w', encoding='utf-8') as f:
     json.dump(d, f, indent=2, ensure_ascii=False)
-"
+" "${2:-}" "$(dirname "${BASH_SOURCE[0]}")"
 }
 
 while true; do
@@ -251,6 +282,10 @@ if os.getenv('F_VAL')!='0': s['MIN_FREE_PERCENT']=int(os.getenv('F_VAL'))"
             echo -e "${GREEN}✅ Update Filter Success!${NC}"; sleep 1 ;;
 
         4)
+            if ! require_legacy_node_editor; then
+                read -r -p "กด Enter เพื่อกลับเมนู..."
+                continue
+            fi
             read -p "Global Clean Enable (true/false): " g_en; read -p "Min Ratio: " g_r; read -p "Min Time: " g_mi; read -p "Max Time: " g_ma
             export G_EN="$g_en" G_R="$g_r" G_MI="$g_mi" G_MA="$g_ma"
             update_json "
@@ -259,9 +294,13 @@ if os.getenv('G_EN'): g['enable']=(True if os.getenv('G_EN').lower()=='true' els
 if os.getenv('G_R'): g['min_ratio']=float(os.getenv('G_R'))
 if os.getenv('G_MI'): g['min_time']=int(os.getenv('G_MI'))
 if os.getenv('G_MA'): g['max_time']=int(os.getenv('G_MA'))
-d['GLOBAL_CLEAN']=g" ;;
+d['GLOBAL_CLEAN']=g" legacy_nodes ;;
 
 		5)
+            if ! require_legacy_node_editor; then
+                read -r -p "กด Enter เพื่อกลับเมนู..."
+                continue
+            fi
             echo "--- Node Management ---"
             # ส่วนที่เพิ่ม: แสดงรายชื่อ Node ปัจจุบันทันทีที่เข้าเมนู
             echo "📋 Current Nodes:"
@@ -330,7 +369,7 @@ if os.getenv('N_TYPE') == 'rtorrent':
     new_node.update({'rt_user': os.getenv('N_USER'), 'rt_pass': os.getenv('N_PASS')})
 else:
     new_node.update({'qb_user': os.getenv('N_USER'), 'qb_pass': os.getenv('N_PASS')})
-d['NODES'].append(new_node)"
+d['NODES'].append(new_node)" legacy_nodes &&
     echo "✅ Added node: $n_name" ;;
 
 2)
@@ -376,18 +415,18 @@ for node in d['NODES']:
         print(f'✅ Updated node: {node[\"name\"]}')
 if not target_found:
     print('❌ Node not found!')
-" ;;
+" legacy_nodes ;;
                 3)
                     # --- DELETE NODE ---
                     read -p "Enter Node Name to Delete: " del_name
                     export DEL_NAME="$del_name"
-                    update_json "d['NODES'] = [n for n in d['NODES'] if n['name'] != os.getenv('DEL_NAME')]"
+                    update_json "d['NODES'] = [n for n in d['NODES'] if n['name'] != os.getenv('DEL_NAME')]" legacy_nodes &&
                     echo "🗑️ Deleted node: $del_name" ;;
 
                 4)
                     # --- CLEAR ALL ---
                     read -p "Clear all nodes? (y/n): " confirm
-                    [[ "$confirm" == "y" ]] && update_json "d['NODES'] = []" && echo "🗑️ All nodes cleared." ;;
+                    [[ "$confirm" == "y" ]] && update_json "d['NODES'] = []" legacy_nodes && echo "🗑️ All nodes cleared." ;;
 
                 *) echo "Invalid option" ;;
             esac

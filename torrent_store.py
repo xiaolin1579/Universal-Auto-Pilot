@@ -228,6 +228,8 @@ class MappingStore:
                     data['clients'][name] = {'client_type': client.get('type'),
                                              'storage_id': client.get('storage_id'),
                                              'config_ref': name}
+                    if client.get('id'):
+                        data['clients'][name]['client_id'] = client['id']
             self.write(data)
 
     def site_view(self, site):

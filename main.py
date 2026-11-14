@@ -51,6 +51,7 @@ from client_registry import ClientAdapter, ClientRegistry
 from cross_seed_search import search_keywords, search_zones
 from upload_client import QbitUploadClient
 from storage_telemetry import parse_size_gib, read_swizzin_storage_stats
+from node_config import load_config as load_node_config
 # Metainfo parsing is shared with the auto-upload worker.
 from torrent_metainfo import (
     _bencode_value_end, _decode_bencode_value, _torrent_text,
@@ -109,8 +110,7 @@ def load_full_config():
         sys.exit(1)
         
     try:
-        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        return load_node_config(CONFIG_PATH)
     except json.JSONDecodeError as e:
         print(f"❌ Error: ไฟล์ {CONFIG_PATH} มีรูปแบบ JSON ไม่ถูกต้อง (Syntax Error: {e})")
         sys.exit(1)
@@ -2511,6 +2511,18 @@ class ForcedCloseAdapter(HTTPAdapter):
 
 # ========================= NODE CLASSES =========================
 
+def _read_shared_storage(reader, mount):
+    # Swizzin panel telemetry may use a different origin/account from this
+    # client. A separate transport prevents client cookies/auth leaking across.
+    # A truthy no-op also suppresses requests' implicit .netrc authentication.
+    auth = lambda prepared: prepared
+    if reader.get("http_basic_user") is not None:
+        auth = (reader["http_basic_user"], reader["http_basic_pass"])
+    return read_swizzin_storage_stats(
+        reader["url"], functools.partial(requests.request, auth=auth), mount=mount
+    )
+
+
 def _clear_storage_telemetry(node):
     node.storage_source = None
     for prefix in ("storage", "quota"):
@@ -2538,6 +2550,8 @@ class QbitNode:
         self.storage_safety_buffer_gb = cfg.get(
             "storage_safety_buffer_gb", 15.0
         )
+        self.storage_reader = cfg.get("_storage_reader")
+        self.client_id = cfg.get("id")
         self.allow_space_reclaim = cfg.get("allow_space_reclaim", True) is True
 
         # Provider quota telemetry (GiB, binary units).
@@ -2548,9 +2562,10 @@ class QbitNode:
         self.preallocated_downloads_accounted_in_free_space = cfg.get("preallocated_downloads_accounted_in_free_space") is True
         self.provider_user = str(cfg.get("provider_user") or "").strip()
         self.provider_pw = str(cfg.get("provider_pass") or "")
+        self.provider_auth_origin = str(cfg.get("provider_auth_origin") or "").rstrip("/")
 
         self.auth = (
-            (self.user, self.pw)
+            (cfg.get("http_basic_user", self.user), cfg.get("http_basic_pass", self.pw))
             if cfg.get("nginx") and not self.provider_sso
             else None
         )
@@ -2646,6 +2661,9 @@ class QbitNode:
                 or parsed.hostname.endswith(".onlyoneseedbox.opik.net")
             ):
                 trusted_origins.add("https://onlyoneseedbox.opik.net")
+
+            if self.provider_auth_origin and self.provider_auth_origin not in trusted_origins:
+                return fail("Configured Provider origin is not trusted for this node")
 
             def trusted_url(url):
                 target = urllib.parse.urlsplit(url)
@@ -3045,6 +3063,8 @@ class QbitNode:
     _parse_swizzin_size_gib = staticmethod(parse_size_gib)
 
     def _get_swizzin_storage_stats(self):
+        if self.storage_reader is not None:
+            return _read_shared_storage(self.storage_reader, self.storage_mount)
         return read_swizzin_storage_stats(
             self.url, self._execute_request, mount=self.storage_mount
         )
@@ -4358,6 +4378,8 @@ class RtorrentNode:
         self.storage_api = str(cfg.get("storage_api") or "").strip().lower()
         self.storage_mount = str(cfg.get("storage_mount") or "/").strip() or "/"
         self.storage_safety_buffer_gb = cfg.get("storage_safety_buffer_gb", 15.0)
+        self.storage_reader = cfg.get("_storage_reader")
+        self.client_id = cfg.get("id")
         _clear_storage_telemetry(self)
 
         # สร้าง Session ไว้ใช้ยาวๆ ลด Overhead การสร้าง Connection ใหม่
@@ -4374,6 +4396,8 @@ class RtorrentNode:
         self.stat_msg = "Active/Total: 0/0"
 
     def _get_swizzin_storage_stats(self):
+        if self.storage_reader is not None:
+            return _read_shared_storage(self.storage_reader, self.storage_mount)
         def request(method, url, **kwargs):
             return self.s.request(method, url, auth=self.auth, **kwargs)
         return read_swizzin_storage_stats(self.url, request, mount=self.storage_mount)
@@ -5414,13 +5438,12 @@ class NodeCleaner:
         nested = raw_cfg.get("clean_settings")
         if isinstance(nested, dict):
             self.clean_settings = nested
-            self.node_enable = raw_cfg.get(
-                "enable", raw_cfg.get("ENABLE")
-            )
         else:
             # Some call sites pass clean_settings directly.
             self.clean_settings = raw_cfg
-            self.node_enable = None
+        self.node_enable = self.clean_settings.get(
+            "enable", self.clean_settings.get("ENABLE")
+        )
 
         self.global_cfg = global_clean_cfg or {}
         self.site_key = getattr(self.node, "site_key", "UNKNOWN")
