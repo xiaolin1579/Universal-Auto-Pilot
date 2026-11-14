@@ -50,6 +50,7 @@ from torrent_store import MappingStore, UPLOAD_HOLD_STATES
 from client_registry import ClientAdapter, ClientRegistry
 from cross_seed_search import search_keywords, search_zones
 from upload_client import QbitUploadClient
+from storage_telemetry import parse_size_gib, read_swizzin_storage_stats
 # Metainfo parsing is shared with the auto-upload worker.
 from torrent_metainfo import (
     _bencode_value_end, _decode_bencode_value, _torrent_text,
@@ -2510,6 +2511,20 @@ class ForcedCloseAdapter(HTTPAdapter):
 
 # ========================= NODE CLASSES =========================
 
+def _clear_storage_telemetry(node):
+    node.storage_source = None
+    for prefix in ("storage", "quota"):
+        for field in ("free", "total", "used"):
+            setattr(node, f"{prefix}_{field}_gb", None)
+
+
+def _apply_storage_telemetry(node, storage):
+    node.storage_source = storage["source"]
+    for field in ("free", "total", "used"):
+        setattr(node, f"storage_{field}_gb", storage[f"{field}_gb"])
+        setattr(node, f"quota_{field}_gb", storage.get(f"quota_{field}_gb"))
+
+
 class QbitNode:
     def __init__(self, cfg):
         self.name, self.url = cfg["name"], cfg["url"].rstrip("/")
@@ -2527,9 +2542,7 @@ class QbitNode:
 
         # Provider quota telemetry (GiB, binary units).
         # None means no verified provider quota sample yet.
-        self.quota_total_gb = None
-        self.quota_used_gb = None
-        self.quota_free_gb = None
+        _clear_storage_telemetry(self)
         
         self.provider_sso = cfg.get("provider_sso") is True
         self.preallocated_downloads_accounted_in_free_space = cfg.get("preallocated_downloads_accounted_in_free_space") is True
@@ -3028,117 +3041,13 @@ class QbitNode:
                 f"{type(e).__name__}: {e}"
             )
             return False
-    @staticmethod
-    def _parse_swizzin_size_gib(value):
-        """Parse a dashboard size such as '10.64 GiB' into binary GiB."""
-        if not isinstance(value, str):
-            raise TypeError("Swizzin size must be a string with a unit")
-
-        match = re.fullmatch(
-            r"\s*(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB|KIB|MIB|GIB|TIB)\s*",
-            value,
-            flags=re.IGNORECASE,
-        )
-        if not match:
-            raise ValueError(f"Invalid Swizzin size: {value!r}")
-
-        amount = float(match.group(1))
-        unit = match.group(2).upper()
-        multipliers = {
-            "B": 1,
-            "KB": 1000,
-            "MB": 1000 ** 2,
-            "GB": 1000 ** 3,
-            "TB": 1000 ** 4,
-            "KIB": 1024,
-            "MIB": 1024 ** 2,
-            "GIB": 1024 ** 3,
-            "TIB": 1024 ** 4,
-        }
-        byte_value = amount * multipliers[unit]
-        if not (0.0 <= byte_value < float("inf")):
-            raise ValueError("Swizzin size is outside the valid range")
-        return byte_value / (1024 ** 3)
+    # Keep the existing parser/reader API while sharing telemetry with rTorrent.
+    _parse_swizzin_size_gib = staticmethod(parse_size_gib)
 
     def _get_swizzin_storage_stats(self):
-        """Read and validate ReadyIDC Swizzin quota and root-disk telemetry."""
-        parsed = urllib.parse.urlsplit(self.url)
-        if not parsed.scheme or not parsed.netloc:
-            raise ValueError("Invalid qBittorrent URL for Swizzin API")
-
-        origin = f"{parsed.scheme}://{parsed.netloc}"
-        headers = {
-            "Accept": "application/json",
-            "Referer": origin + "/",
-        }
-
-        def get_json(endpoint):
-            response = self._execute_request(
-                "GET",
-                origin + endpoint,
-                headers=headers,
-                timeout=15,
-                allow_redirects=False,
-            )
-            if response is None:
-                raise RuntimeError(f"Swizzin {endpoint} network failure")
-            if response.status_code != 200:
-                raise RuntimeError(
-                    f"Swizzin {endpoint} HTTP {response.status_code}"
-                )
-            content_type = str(
-                response.headers.get("Content-Type", "")
-            ).casefold()
-            if "json" not in content_type:
-                raise ValueError(f"Swizzin {endpoint} response is not JSON")
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise TypeError(f"Swizzin {endpoint} payload is invalid")
-            return payload
-
-        quota_payload = get_json("/stats/quota")
-        disk_payload = get_json("/stats/disk")
-
-        quota = quota_payload.get("quota")
-        storage_mount = str(getattr(self, "storage_mount", "/") or "/").strip()
-        if (
-            not storage_mount.startswith("/")
-            or ".." in storage_mount.split("/")
-        ):
-            raise ValueError("Swizzin storage_mount must be a safe absolute mount path")
-        root_disk = disk_payload.get(storage_mount)
-        if not isinstance(quota, dict):
-            raise ValueError("Swizzin quota object is missing")
-        if not isinstance(root_disk, dict):
-            raise ValueError(
-                f"Swizzin configured mount {storage_mount!r} is missing"
-            )
-
-        quota_free = self._parse_swizzin_size_gib(quota.get("diskfree"))
-        quota_total = self._parse_swizzin_size_gib(quota.get("disktotal"))
-        quota_used = self._parse_swizzin_size_gib(quota.get("diskused"))
-        disk_free = self._parse_swizzin_size_gib(root_disk.get("diskfree"))
-        disk_total = self._parse_swizzin_size_gib(root_disk.get("disktotal"))
-        disk_used = self._parse_swizzin_size_gib(root_disk.get("diskused"))
-
-        if quota_total <= 0 or disk_total <= 0:
-            raise ValueError("Swizzin reported a zero or invalid total capacity")
-        if not (0 <= quota_free <= quota_total and 0 <= quota_used <= quota_total):
-            raise ValueError("Swizzin quota values are out of range")
-        if not (0 <= disk_free <= disk_total and 0 <= disk_used <= disk_total):
-            raise ValueError(
-                f"Swizzin mount {storage_mount!r} values are out of range"
-            )
-
-        return {
-            "quota_free_gb": quota_free,
-            "quota_total_gb": quota_total,
-            "quota_used_gb": quota_used,
-            "disk_free_gb": disk_free,
-            "disk_total_gb": disk_total,
-            "disk_used_gb": disk_used,
-            "disk_mount": storage_mount,
-        }
+        return read_swizzin_storage_stats(
+            self.url, self._execute_request, mount=self.storage_mount
+        )
 
     def _get_provider_quota_bytes(self, retry_auth=True):
         """
@@ -3255,11 +3164,8 @@ class QbitNode:
 
             self.stat_msg = f"API ERROR: {message}"
             self.free_gb = 0.0
-            if getattr(self, "storage_api", "") == "swizzin":
-                # Never retain a stale provider quota sample after a failed refresh.
-                self.quota_total_gb = None
-                self.quota_used_gb = None
-                self.quota_free_gb = None
+            # A failed refresh must never leave the previous quota/mount sample.
+            _clear_storage_telemetry(self)
             return False
 
         if not self.is_connected:
@@ -3403,31 +3309,19 @@ class QbitNode:
                         disconnect=False
                     )
 
-                quota_free_gb = storage["quota_free_gb"]
-                quota_total_gb = storage["quota_total_gb"]
-                used_gb = storage["quota_used_gb"]
-                swizzin_disk_free_gb = storage["disk_free_gb"]
-
-                self.quota_used_gb = used_gb
-                self.quota_total_gb = quota_total_gb
-                self.quota_free_gb = quota_free_gb
-
-                # Use the most conservative of account quota, configured
-                # Swizzin mount, and qBittorrent maindata disk-free readings.
-                display_free = min(
-                    quota_free_gb,
-                    swizzin_disk_free_gb,
-                    real_disk_free_gb,
-                )
-
+                _apply_storage_telemetry(self, storage)
+                # Quota is authoritative when present. Mount telemetry is only a
+                # fallback; client disk free remains a physical-space ceiling.
+                display_free = min(storage["free_gb"], real_disk_free_gb)
+                source_label = "Q" if storage["source"] == "quota" else "M"
+                mount_label = (f"Mount: {storage['disk_mount']} | "
+                               if storage["source"] == "mount" else "")
                 self.stat_msg = (
-                    f"FREE(Q): {quota_free_gb:.2f}GiB | "
-                    f"FREE(D): {swizzin_disk_free_gb:.2f}GiB | "
-                    f"Mount: {storage['disk_mount']} | "
-                    f"FREE(QBT): {real_disk_free_gb:.2f}GiB | "
+                    f"Source: {storage['source']} | "
+                    f"FREE({source_label}): {storage['free_gb']:.2f}GiB | "
+                    f"{mount_label}FREE(QBT): {real_disk_free_gb:.2f}GiB | "
                     f"Total: {active_count} | "
-                    f"Used: {used_gb:.2f}GiB / "
-                    f"{quota_total_gb:.2f}GiB | "
+                    f"Used: {storage['used_gb']:.2f}GiB / {storage['total_gb']:.2f}GiB | "
                     f"Safe: {max(0.0, display_free - safety_buffer):.2f}GiB"
                 )
 
@@ -3451,9 +3345,12 @@ class QbitNode:
                     total_bytes - used_bytes
                 ) / (1024 ** 3)
 
-                self.quota_used_gb = used_gb
-                self.quota_total_gb = quota_total_gb
-                self.quota_free_gb = quota_free_gb
+                _apply_storage_telemetry(self, {
+                    "source": "quota", "used_gb": used_gb,
+                    "total_gb": quota_total_gb, "free_gb": quota_free_gb,
+                    "quota_used_gb": used_gb, "quota_total_gb": quota_total_gb,
+                    "quota_free_gb": quota_free_gb,
+                })
 
                 display_free = min(
                     quota_free_gb,
@@ -4458,6 +4355,10 @@ class RtorrentNode:
         self.user, self.pw = cfg["rt_user"], cfg["rt_pass"]
         self.quota_gb = cfg.get("quota_gb", 0)
         self.allow_space_reclaim = cfg.get("allow_space_reclaim", True) is True
+        self.storage_api = str(cfg.get("storage_api") or "").strip().lower()
+        self.storage_mount = str(cfg.get("storage_mount") or "/").strip() or "/"
+        self.storage_safety_buffer_gb = cfg.get("storage_safety_buffer_gb", 15.0)
+        _clear_storage_telemetry(self)
 
         # สร้าง Session ไว้ใช้ยาวๆ ลด Overhead การสร้าง Connection ใหม่
         self.s = requests.Session()
@@ -4471,6 +4372,11 @@ class RtorrentNode:
         self.jobs = 0
         self.is_connected = False
         self.stat_msg = "Active/Total: 0/0"
+
+    def _get_swizzin_storage_stats(self):
+        def request(method, url, **kwargs):
+            return self.s.request(method, url, auth=self.auth, **kwargs)
+        return read_swizzin_storage_stats(self.url, request, mount=self.storage_mount)
 
     def login(self):
         try:
@@ -4529,6 +4435,9 @@ class RtorrentNode:
         return False
 
     def refresh_status(self):
+        self.free_gb = 0.0
+        _clear_storage_telemetry(self)
+        self.stat_msg = "API UNKNOWN: Storage refresh not completed"
         if not self.is_connected:
             return False
 
@@ -4598,7 +4507,9 @@ class RtorrentNode:
                             pass
 
             used_gb = used_bytes / (1024**3)
-            safety_buffer = 15.0
+            safety_buffer = float(self.storage_safety_buffer_gb)
+            if not (0.0 <= safety_buffer < float("inf")):
+                raise ValueError("Invalid storage safety buffer")
 
             # 2. ดึง Disk Free space
             xml_disk = '<?xml version="1.0"?><methodCall><methodName>network.disk_free_4gb</methodName></methodCall>'
@@ -4614,7 +4525,27 @@ class RtorrentNode:
             except Exception as disk_err:
                 print(f"⚠️ [{self.name}] Disk free check warning: {disk_err}")
 
-            # 3. คำนวณพื้นที่ Quota & Display Free
+            # Provider usage covers shared files and other clients too. Never
+            # estimate provider quota by summing torrent sizes when configured.
+            if self.storage_api == "swizzin":
+                storage = self._get_swizzin_storage_stats()
+                _apply_storage_telemetry(self, storage)
+                display_free = min(storage["free_gb"], real_free_gb)
+                self.free_gb = max(0.0, display_free - safety_buffer)
+                source_label = "Q" if storage["source"] == "quota" else "M"
+                mount_label = (f"Mount: {storage['disk_mount']} | "
+                               if storage["source"] == "mount" else "")
+                self.stat_msg = (
+                    f"Source: {storage['source']} | "
+                    f"FREE({source_label}): {storage['free_gb']:.2f}GiB | "
+                    f"{mount_label}FREE(RT): {real_free_gb:.2f}GiB | "
+                    f"Total: {total_count} | "
+                    f"Used: {storage['used_gb']:.2f}GiB / {storage['total_gb']:.2f}GiB | "
+                    f"Safe: {self.free_gb:.2f}GiB"
+                )
+                return True
+
+            # 3. คำนวณพื้นที่ Quota & Display Free สำหรับ node เดิมที่ไม่มี provider
             quota_free_gb = max(0.0, self.quota_gb - used_gb) if self.quota_gb > 0 else float('inf')
 
             if self.quota_gb > 0:
@@ -4637,6 +4568,9 @@ class RtorrentNode:
             return True
 
         except Exception as e:
+            self.free_gb = 0.0
+            _clear_storage_telemetry(self)
+            self.stat_msg = f"API ERROR: Storage refresh failed ({type(e).__name__})"
             print(f"⚠️ [{self.name}] rTorrent Refresh Status Error: {e}")
             return False
 
@@ -8878,9 +8812,9 @@ def get_node_dynamic_cap(node, disk_type):
 
     # --- [ปรับปรุง Space Factor: สายเปย์] ---
     # ยอมให้รับงานหนักได้จนถึงพื้นที่เหลือ 30%
-    quota_basis_gb = getattr(
-        node, "quota_total_gb", None
-    )
+    quota_basis_gb = getattr(node, "storage_total_gb", None)
+    if quota_basis_gb is None:
+        quota_basis_gb = getattr(node, "quota_total_gb", None)
 
     if (
         isinstance(quota_basis_gb, bool)
