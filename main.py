@@ -48,6 +48,7 @@ import traceback
 import urllib.parse
 from torrent_store import MappingStore
 from client_registry import ClientAdapter, ClientRegistry
+from cross_seed_search import search_keywords, search_zones
 
 print = functools.partial(print, flush=True)
 
@@ -10102,6 +10103,7 @@ def build_cross_seed_targets(
                 if str(listing.get("infohash") or "").upper() == source_hash
             ],
             "keyword": keyword,
+            "search_keywords": search_keywords(keyword),
             "target_size_bytes": actual_size,
             "source_hash": source_hash,
             "source_site": source_site,
@@ -10963,6 +10965,12 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
     site_page = None
     dl_session = None
     cross_seed_matches = []  # สำหรับโหมด Cross-Seed
+    cross_seed_input = cross_seed_target
+    cross_seed_mode = cross_seed_target is not None
+    if cross_seed_mode and (not isinstance(cross_seed_input, (dict, list, tuple)) or not cross_seed_input):
+        return []
+    matched_search_groups = set()
+    checked_search_candidates = set()
 
     target_sites_cfg = [s for s in CFG.get('SITE', []) if s.get('enable', True)]
     print(f"📡 Detected Sites: {[s['name'] for s in target_sites_cfg]}")
@@ -11048,7 +11056,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                 except Exception as cookie_err:
                     print(f"⚠️ [{site}] Cookie sync issue: {cookie_err}")
 
-                if cross_seed_target:
+                if cross_seed_mode:
                     print(
                         f"🛡️ [{site}] Cross-Seed search mode: "
                         "skipping get_site_stats() and its maintenance actions."
@@ -11076,156 +11084,29 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                     print(f"❌ [{site}] ไม่มี base_url ใน config")
                     continue
 
-                #Normalize Cross-Seed input: รองรับ dict และ list[dict]
-                if cross_seed_target:
-                    if isinstance(cross_seed_target, dict):
-                        cross_seed_targets = [cross_seed_target]
-                    elif isinstance(cross_seed_target, (list, tuple)):
-                        cross_seed_targets = [
-                            item for item in cross_seed_target
-                            if isinstance(item, dict)
-                        ]
-                    else:
-                        cross_seed_targets = []
-
-                    target_zones = []
-
-                    site_key = str(site or "").strip().lower()
-                    is_bearbit = any(
-                        name in site_key for name in ("bearbit", "siambit")
+                if cross_seed_mode:
+                    target_zones = search_zones(
+                        site_cfg, cross_seed_input, _build_mapping_target_zone_meta,
+                        max_queries=SET.get("CROSS_SEED_MAX_QUERIES", 3),
                     )
-
-                    if is_bearbit:
-                        # ใช้โซนที่เปิดใช้งานใน config ปัจจุบัน
-                        configured_zones = [
-                            zone
-                            for zone in (site_cfg.get("target_urls") or [])
-                            if isinstance(zone, dict)
-                            and zone.get("enable", True)
-                            and str(zone.get("url") or "").strip()
-                        ]
-
-                        # Fallback หาก config ไม่มีรายการโซน
-                        if not configured_zones:
-                            configured_zones = [
-                                {
-                                    "name": "โซนปกติ (No 18+)",
-                                    "url": "viewno18sbx.php",
-                                    "enable": True,
-                                },
-                                {
-                                    "name": "โซนพิเศษ",
-                                    "url": "viewbrsb.php",
-                                    "enable": True,
-                                },
-                            ]
-
-                        # สร้าง Search target แยกตาม keyword และแต่ละโซน
-                        for item in cross_seed_targets:
-                            keyword = str(item.get("keyword") or "").strip()
-
-                            if not keyword:
-                                print(f"⚠️ [{site}] ข้าม Cross-Seed: keyword ว่าง")
-                                continue
-
-                            base_params = dict(item.get("search_params") or {})
-                            base_params.setdefault("search_keyword", keyword)
-
-                            for zone in configured_zones:
-                                zone_params = dict(base_params)
-
-                                # ใช้ URL ของโซนเป็นตัวกำหนด path สำหรับ Search
-                                zone_params["target_path"] = zone["url"]
-
-                                target_zones.append({
-                                    "name": (
-                                        f"Cross-Seed Search [{keyword}] "
-                                        f"— {zone.get('name', 'Zone')}"
-                                    ),
-                                    "search_params": zone_params,
-                                    "cross_seed_meta": item,
-                                    "target_zone_meta": _build_mapping_target_zone_meta(site_cfg, zone),
-                                })
-
-                    elif any(
-                        name in site_key for name in ("bitsuse", "dedbit")
-                    ):
-                        configured_zones = [
-                            zone
-                            for zone in (site_cfg.get("target_urls") or [])
-                            if isinstance(zone, dict)
-                            and zone.get("enable", True)
-                            and str(zone.get("url") or "").strip()
-                        ]
-
-                        if not configured_zones:
-                            fallback_path = (
-                                "bs_browse.php"
-                                if "bitsuse" in site_key
-                                else "browse.php"
-                            )
-                            configured_zones = [{
-                                "name": "Browse search",
-                                "url": fallback_path,
-                                "enable": True,
-                            }]
-
-                        for item in cross_seed_targets:
-                            keyword = str(item.get("keyword") or "").strip()
-                            if not keyword:
-                                print(
-                                    f"⚠️ [{site}] ข้าม Cross-Seed: keyword ว่าง"
-                                )
-                                continue
-
-                            base_params = dict(item.get("search_params") or {})
-                            base_params.setdefault("search_keyword", keyword)
-
-                            for zone in configured_zones:
-                                zone_params = dict(base_params)
-                                zone_params["target_path"] = zone["url"]
-
-                                target_zones.append({
-                                    "name": (
-                                        f"Cross-Seed Search [{keyword}] "
-                                        f"— {zone.get('name', 'Browse')}"
-                                    ),
-                                    "search_params": zone_params,
-                                    "cross_seed_meta": item,
-                                    "target_zone_meta": _build_mapping_target_zone_meta(site_cfg, zone),
-                                })
-
-                    else:
-                        # Tracker อื่นคง flow เดิมไว้
-                        for item in cross_seed_targets:
-                            keyword = str(item.get("keyword") or "").strip()
-
-                            if not keyword:
-                                print(f"⚠️ [{site}] ข้าม Cross-Seed: keyword ว่าง")
-                                continue
-
-                            params = dict(item.get("search_params") or {})
-                            params.setdefault("search_keyword", keyword)
-
-                            target_zones.append({
-                                "name": f"Cross-Seed Search [{keyword}]",
-                                "search_params": params,
-                                "cross_seed_meta": item,
-                            })
-
                 else:
-                    # Normal scan ไม่เปลี่ยนพฤติกรรมเดิม
                     target_zones = site_cfg.get("target_urls", [])
 
                 for target_item in target_zones:
                     if stop_event.is_set():
                         break
 
+                    search_group = None
+                    if cross_seed_mode and isinstance(target_item, dict):
+                        cross_seed_target = target_item["cross_seed_meta"]
+                        search_group = (site, target_item["search_group"])
+                        if search_group in matched_search_groups:
+                            continue
                     added_in_zone = []
                     full_nodes_in_zone = []
                     count_skip = 0
                     cross_seed_matches_before_zone = (
-                        len(cross_seed_matches) if cross_seed_target else 0
+                        len(cross_seed_matches) if cross_seed_mode else 0
                     )
                     target_zone_meta = (
                         target_item.get("target_zone_meta")
@@ -11233,7 +11114,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                         else None
                     )
                     source_zone_meta = None
-                    if not cross_seed_target and isinstance(target_item, dict):
+                    if not cross_seed_mode and isinstance(target_item, dict):
                         source_zone_meta = _validate_mapping_target_zone_meta(
                             _build_mapping_target_zone_meta(site_cfg, target_item)
                         )
@@ -11245,7 +11126,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
 
                     # Cross-seed skipping is zone-scoped. known_sites and hash
                     # history are observations, not proof of a listing in this zone.
-                    if cross_seed_target and isinstance(target_item, dict):
+                    if cross_seed_mode and isinstance(target_item, dict):
                         _zone_for_skip = _validate_mapping_target_zone_meta(
                             target_zone_meta
                         )
@@ -11375,191 +11256,6 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                             )
                             continue
 
-                        # One-shot diagnostic: compare BEARBIT keyword variants.
-                        import os as _kw_os
-                        from urllib.parse import (
-                            parse_qsl as _kw_parse_qsl,
-                            urlencode as _kw_urlencode,
-                            urlunsplit as _kw_urlunsplit,
-                        )
-
-                        _kw_marker = _kw_os.path.join(
-                            _kw_os.path.dirname(_kw_os.path.abspath(__file__)),
-                            ".cross_seed_keyword_probe_done",
-                        )
-
-                        if (
-                            cross_seed_target
-                            and any(
-                                token in str(site or "").lower()
-                                for token in ("bearbit", "siambit")
-                            )
-                            and urlsplit(target_url).path.rsplit("/", 1)[-1]
-                                == "viewno18sbx.php"
-                            and not _kw_os.path.exists(_kw_marker)
-                        ):
-                            _kw_parts = urlsplit(target_url)
-                            _kw_pairs = _kw_parse_qsl(
-                                _kw_parts.query,
-                                keep_blank_values=True,
-                            )
-                            _kw_full = next(
-                                (
-                                    value for key, value in _kw_pairs
-                                    if key == "search"
-                                ),
-                                "",
-                            )
-                            _kw_no_ext = re.sub(
-                                r"\.(?:mp4|mkv|avi|mov|wmv|iso|zip|rar)$",
-                                "",
-                                _kw_full,
-                                flags=re.I,
-                            ).strip()
-                            _kw_code = _kw_no_ext.split()[0] if _kw_no_ext else ""
-
-                            _kw_queries = []
-                            for _kw_value in (
-                                _kw_full,
-                                _kw_no_ext,
-                                _kw_code,
-                            ):
-                                if _kw_value and _kw_value not in _kw_queries:
-                                    _kw_queries.append(_kw_value)
-
-                            print(
-                                f"[Cross-Seed Keyword Probe] "
-                                f"target={display_zone!r} "
-                                f"variants={_kw_queries!r}"
-                            )
-
-                            try:
-                                for _kw_value in _kw_queries:
-                                    _kw_new_pairs = [
-                                        (key, value)
-                                        for key, value in _kw_pairs
-                                        if key != "search"
-                                    ]
-                                    _kw_new_pairs.append(("search", _kw_value))
-
-                                    _kw_test_url = _kw_urlunsplit((
-                                        _kw_parts.scheme,
-                                        _kw_parts.netloc,
-                                        _kw_parts.path,
-                                        _kw_urlencode(_kw_new_pairs),
-                                        _kw_parts.fragment,
-                                    ))
-
-                                    try:
-                                        await site_page.get(_kw_test_url)
-                                        await asyncio.sleep(2.5)
-
-                                        _kw_html = await site_page.get_content() or ""
-                                        _kw_soup = BeautifulSoup(
-                                            _kw_html, "html.parser"
-                                        )
-                                        _kw_body = re.sub(
-                                            r"\s+",
-                                            " ",
-                                            _kw_soup.get_text(" ", strip=True),
-                                        )
-
-                                        _kw_detail_rx = re.compile(
-                                            r"(?:^|/)details(?:new)?\.php\?id=\d+(?:[&#]|$)",
-                                            re.I,
-                                        )
-                                        _kw_details = _kw_soup.find_all(
-                                            "a", href=_kw_detail_rx
-                                        )
-
-                                        _kw_non_profile_links = []
-                                        for _kw_a in _kw_soup.find_all(
-                                            "a", href=True
-                                        ):
-                                            _kw_href = str(
-                                                _kw_a.get("href", "")
-                                            )
-                                            if not re.search(
-                                                r"details|detail|download|torrent|topic|file",
-                                                _kw_href,
-                                                re.I,
-                                            ):
-                                                continue
-                                            if re.search(
-                                                r"userdetails|bookmarks|bonuslog",
-                                                _kw_href,
-                                                re.I,
-                                            ):
-                                                continue
-
-                                            _kw_non_profile_links.append((
-                                                _kw_href.split("?", 1)[0][:120],
-                                                _kw_a.get_text(" ", strip=True)[:60],
-                                            ))
-                                            if len(_kw_non_profile_links) >= 8:
-                                                break
-
-                                        _kw_no_result = []
-                                        for _kw_phrase in (
-                                            "ไม่พบ",
-                                            "ไม่มีรายการ",
-                                            "ไม่มีข้อมูล",
-                                            "No torrents found",
-                                        ):
-                                            _kw_pos = _kw_body.casefold().find(
-                                                _kw_phrase.casefold()
-                                            )
-                                            if _kw_pos >= 0:
-                                                _kw_no_result.append(
-                                                    _kw_body[
-                                                        max(0, _kw_pos - 100):
-                                                        _kw_pos + 180
-                                                    ]
-                                                )
-
-                                        _kw_title = (
-                                            _kw_soup.title.get_text(" ", strip=True)
-                                            if _kw_soup.title else "(no title)"
-                                        )
-
-                                        print(
-                                            f"[Cross-Seed Keyword Probe] "
-                                            f"query={_kw_value!r} "
-                                            f"title={_kw_title!r} "
-                                            f"html_chars={len(_kw_html)} "
-                                            f"details_links={len(_kw_details)} "
-                                            f"tr_count={len(_kw_soup.find_all('tr'))} "
-                                            f"no_result_context={_kw_no_result!r} "
-                                            f"other_links={_kw_non_profile_links!r}"
-                                        )
-
-                                    except Exception as _kw_exc:
-                                        print(
-                                            f"[Cross-Seed Keyword Probe] "
-                                            f"query={_kw_value!r} "
-                                            f"ERROR={type(_kw_exc).__name__}: "
-                                            f"{_kw_exc}"
-                                        )
-
-                            finally:
-                                try:
-                                    with open(
-                                        _kw_marker, "w", encoding="utf-8"
-                                    ) as _kw_file:
-                                        _kw_file.write(
-                                            f"Completed {datetime.now().isoformat()}\n"
-                                        )
-                                except OSError as _kw_marker_exc:
-                                    print(
-                                        "[Cross-Seed Keyword Probe] "
-                                        f"Marker write failed: {_kw_marker_exc}"
-                                    )
-
-                            print(
-                                "[Cross-Seed Keyword Probe] "
-                                "จบการทดสอบ จะกลับไป URL ค้นหาปกติ"
-                            )
-
                         print(
                             f"\n🌐 [{site}] Navigating Zone: "
                             f"[{display_zone}] -> {target_url}"
@@ -11657,196 +11353,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                         )
                         continue
 
-                    # ---------------------------------------------------------
-                    # BEARBIT Cross-Seed fallback search (fail-closed)
-                    # ใช้เมื่อคำค้นหาหลักไม่มี torrent detail links เท่านั้น
-                    # ส่งผลที่พบเข้า parser/preflight เดิม ไม่มีการเพิ่ม torrent ที่นี่
-                    # ---------------------------------------------------------
-                    try:
-                        from urllib.parse import (
-                            parse_qsl as _fb_parse_qsl,
-                            urlencode as _fb_urlencode,
-                            urlsplit as _fb_urlsplit,
-                            urlunsplit as _fb_urlunsplit,
-                        )
-
-                        _fb_site_key = str(site or "").strip().lower()
-                        _fb_path = _fb_urlsplit(target_url).path.rsplit(
-                            "/", 1
-                        )[-1]
-
-                        _fb_enabled = (
-                            bool(cross_seed_target)
-                            and any(
-                                token in _fb_site_key
-                                for token in ("bearbit", "siambit")
-                            )
-                            and _fb_path in {
-                                "viewno18sbx.php",
-                                "viewbrsb.php",
-                            }
-                        )
-
-                        _fb_detail_rx = re.compile(
-                            r"(?:^|/)(?:bs_)?details(?:new)?"
-                            r"\.php\?id=\d+(?:[&#]|$)",
-                            re.I,
-                        )
-
-                        _fb_existing_details = (
-                            soup.find_all("a", href=_fb_detail_rx)
-                            if soup else []
-                        )
-
-                        if _fb_enabled and not _fb_existing_details:
-                            _fb_parts = _fb_urlsplit(target_url)
-                            _fb_pairs = _fb_parse_qsl(
-                                _fb_parts.query,
-                                keep_blank_values=True,
-                            )
-                            _fb_original_search = next(
-                                (
-                                    value for key, value in _fb_pairs
-                                    if key == "search"
-                                ),
-                                "",
-                            ).strip()
-
-                            # รองรับรหัสนำหน้า เช่น CAD-031, MIDA-846,
-                            # GVG-954 โดยตัดส่วน suffix ที่ต่อด้วย _ หรือ [
-                            _fb_code_match = re.match(
-                                r"^\s*([A-Za-z]{2,12}-\d{2,6})"
-                                r"(?=$|[^A-Za-z0-9])",
-                                _fb_original_search,
-                                re.I,
-                            )
-                            _fb_fallbacks = []
-
-                            if _fb_code_match:
-                                _fb_code = _fb_code_match.group(1).strip()
-                                if (
-                                    _fb_code
-                                    and _fb_code.casefold()
-                                    != _fb_original_search.casefold()
-                                ):
-                                    _fb_fallbacks.append(_fb_code)
-
-                            if _fb_fallbacks:
-                                print(
-                                    "[Cross-Seed Fallback] "
-                                    f"[{site}] primary search has no detail "
-                                    f"links; trying {_fb_fallbacks!r} "
-                                    f"on {_fb_path}"
-                                )
-
-                            for _fb_keyword in _fb_fallbacks:
-                                _fb_new_pairs = [
-                                    (key, value)
-                                    for key, value in _fb_pairs
-                                    if key != "search"
-                                ]
-                                _fb_new_pairs.append(("search", _fb_keyword))
-
-                                _fb_test_url = _fb_urlunsplit((
-                                    _fb_parts.scheme,
-                                    _fb_parts.netloc,
-                                    _fb_parts.path,
-                                    _fb_urlencode(_fb_new_pairs),
-                                    _fb_parts.fragment,
-                                ))
-
-                                try:
-                                    await site_page.get(_fb_test_url)
-                                    await asyncio.sleep(2.5)
-
-                                    _fb_html = (
-                                        await site_page.get_content() or ""
-                                    )
-                                    if not _fb_html.strip():
-                                        print(
-                                            "[Cross-Seed Fallback] "
-                                            f"[{site}] keyword={_fb_keyword!r} "
-                                            "returned empty HTML"
-                                        )
-                                        continue
-
-                                    _fb_soup = BeautifulSoup(
-                                        _fb_html, "html.parser"
-                                    )
-
-                                    if is_cloudflare(_fb_soup):
-                                        print(
-                                            "[Cross-Seed Fallback] "
-                                            f"[{site}] Cloudflare detected; "
-                                            "rejecting fallback page"
-                                        )
-                                        continue
-
-                                    _fb_text = _fb_soup.get_text(
-                                        " ", strip=True
-                                    )
-                                    if (
-                                        "ไม่สามารถเปิดลิงก์จากภายนอกได้"
-                                        in _fb_text
-                                    ):
-                                        print(
-                                            "[Cross-Seed Fallback] "
-                                            f"[{site}] external-link error; "
-                                            "rejecting fallback page"
-                                        )
-                                        continue
-
-                                    _fb_found = _fb_soup.find_all(
-                                        "a", href=_fb_detail_rx
-                                    )
-                                    print(
-                                        "[Cross-Seed Fallback] "
-                                        f"[{site}] keyword={_fb_keyword!r} "
-                                        f"details_links={len(_fb_found)}"
-                                    )
-
-                                    # เปลี่ยนไปใช้ผล fallback เฉพาะเมื่อพบ
-                                    # detail links จริง แล้วใช้ parser เดิมต่อ
-                                    if _fb_found:
-                                        soup = _fb_soup
-                                        page_source = _fb_html
-                                        target_url = _fb_test_url
-                                        print(
-                                            "[Cross-Seed Fallback] "
-                                            f"[{site}] accepted fallback "
-                                            f"keyword={_fb_keyword!r}; "
-                                            "continuing with existing parser"
-                                        )
-                                        break
-
-                                except Exception as _fb_exc:
-                                    print(
-                                        "[Cross-Seed Fallback] "
-                                        f"[{site}] keyword={_fb_keyword!r} "
-                                        f"failed: {type(_fb_exc).__name__}: "
-                                        f"{_fb_exc}"
-                                    )
-                        elif _fb_enabled:
-                            print(
-                                "[Cross-Seed Fallback] "
-                                f"[{site}] primary search already has "
-                                f"{len(_fb_existing_details)} detail links; "
-                                "no fallback needed"
-                            )
-
-                    except Exception as _fb_outer_exc:
-                        # ความผิดพลาดใน fallback ต้องไม่ทำให้ parser
-                        # เดิมล้ม หรือยกเลิก fail-closed
-                        print(
-                            "[Cross-Seed Fallback] "
-                            f"[{site}] safely skipped: "
-                            f"{type(_fb_outer_exc).__name__}: "
-                            f"{_fb_outer_exc}"
-                        )
-
-                    # ---------------------------------------------------------
-                    # 4. ROW EXTRACT & PARSING
-                    # ---------------------------------------------------------
+                    # Each planned query uses the existing parser and exact preflight.
                     all_details = soup.find_all("a", href=re.compile(r"(?:^|/)(?:bs_)?details(?:new)?\.php\?id=\d+(?:[&#]|$)", re.I))
                     if not all_details:
                         _cs_debug_count = 0
@@ -11908,7 +11415,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                             if _cs_row_text:
                                 print(f"[Cross-Seed Row Inventory] row={_cs_i} text={_cs_row_text!r}")
                     rows = []
-                    if cross_seed_target:
+                    if cross_seed_mode:
                         page_title = soup.title.get_text(" ", strip=True) if soup.title else "(no title)"
                         preview = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))[:180]
                         tr_count = len(soup.find_all("tr"))
@@ -11917,7 +11424,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                             f"title={page_title!r} details_links={len(all_details)} "
                             f"tr_count={tr_count} preview={preview!r}"
                         )
-                    if cross_seed_target:
+                    if cross_seed_mode:
                         for link_i, link in enumerate(all_details[:8], 1):
                             ancestor_tags = []
                             parent = link.parent
@@ -11940,7 +11447,8 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                     for a in all_details:
                         if stop_event.is_set(): 
                             break
-                        if len(a.get_text(strip=True)) <= 5: 
+                        link_title = a.get_text(strip=True)
+                        if not link_title or (not cross_seed_input and len(link_title) <= 5):
                             continue
                         parent_tr = a.find_parent("tr")
                         if parent_tr and parent_tr not in rows:
@@ -11951,7 +11459,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                 continue
                             rows.append(parent_tr)
 
-                    if cross_seed_target:
+                    if cross_seed_mode:
                         print(f"🔎 [Cross-Seed Parse Debug] [{site}] candidate_rows={len(rows)}")
                     for row in rows:
                         if stop_event.is_set(): 
@@ -11964,7 +11472,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                 'Referer': target_url
                             }
                             data = await extract_torrent_data(row, base_url, dl_session, extract_headers)
-                            if cross_seed_target:
+                            if cross_seed_mode:
                                 is_dict = isinstance(data, dict)
                                 extracted_id = bool(is_dict and data.get('id'))
                                 has_download = bool(is_dict and data.get('download_url'))
@@ -11975,6 +11483,11 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                 continue
 
                             t_id = str(data['id'])
+                            if cross_seed_mode:
+                                candidate_key = (search_group, t_id)
+                                if candidate_key in checked_search_candidates:
+                                    continue
+                                checked_search_candidates.add(candidate_key)
                             raw_title = data.get('title', 'Unknown')
                             download_url = data['download_url']
                             details_url = data['details_url']
@@ -12061,7 +11574,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                             )
 
                             # CROSS-SEED MATCHING MODE
-                            if cross_seed_target:
+                            if cross_seed_mode:
                                 source_site_key = re.sub(
                                     r"[^a-z0-9]+",
                                     "",
@@ -12116,6 +11629,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                             f"ID={t_id}: {_cs_preflight.get('error', 'Unknown error')}"
                                         )
                                         continue
+                                    matched_search_groups.add(search_group)
                                     cross_seed_matches.append({
                                         "torrent_id": t_id,
                                         "site_name": site,
@@ -12674,7 +12188,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                         summary_msg.append(condition_text)
                         summary_msg.append(f"🌐 Scanning: [{display_zone}] {target_url if 'target_url' in locals() else ''}\n")
 
-                        if cross_seed_target:
+                        if cross_seed_mode:
                             zone_match_count = (
                                 len(cross_seed_matches) - cross_seed_matches_before_zone
                             )
@@ -12731,7 +12245,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
     # =========================================================================
     # 🏁 สรุปผลการสแกนทั้งหมด (ทำงานเมื่อวนครบทุก Site แล้ว)
     # =========================================================================
-    if 'cross_seed_target' in locals() and cross_seed_target:
+    if cross_seed_mode:
         print(f"\n🎯 [Cross-Seed Summary] พบรายการที่ตรงกันทั้งหมด {len(cross_seed_matches)} รายการ")
         return cross_seed_matches
 
