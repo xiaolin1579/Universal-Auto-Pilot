@@ -93,7 +93,7 @@ H&R/Quest ของ BearBit ส่วนเว็บไซต์อื่นต�
 
 ## การค้นหาชื่อไฟล์ Cross-Seed
 
-`cross_seed_search.py` สร้างคำค้นสำรองให้ BearBit, Bitsuse และ Dedbit โดยใช้ตัวอ่าน
+`cross_seed_search.py` สร้างคำค้นสำรองให้ BearBit, Bitsuse, Dedbit และ TorrentDD โดยใช้ตัวอ่าน
 ผลลัพธ์และ preflight ชุดเดิม ตัวอย่าง `Other.Mommy.2026.1080p.AMZN.WEB-DL.mkv`
 จะลองชื่อเต็มที่ตัดนามสกุลแล้ว ตามด้วย `Other Mommy 2026` และ `Other Mommy`
 สำหรับซีรีส์จะคงรหัสตอนหรือซีซัน เช่น `S02E03` ไว้ ส่วนรหัสไฟล์ เช่น `CAD-031`
@@ -110,6 +110,11 @@ candidate ID เดิมจะผ่าน preflight เพียงครั�
 การค้นหาชื่อสั้นอย่าง `Up` รองรับได้ แต่ชื่อเพียงอย่างเดียวไม่ใช่หลักฐานว่าเป็นไฟล์เดียวกัน
 ทุก match ยังต้องผ่านการตรวจขนาดและ manifest ตามเงื่อนไขเดิม การเพิ่ม torrent
 หรือ tracker ยังคงขึ้นกับค่าที่เปิดใช้งานและการตรวจขั้นถัดไป
+
+TorrentDD ใช้ `torrentdd_cross_seed.py` อ่านตารางผลค้นหาและ File List ใน modal
+ของหน้ารายละเอียด โดยผูก URL/โซน/ID ก่อนส่งเข้า preflight และ audit เดิม
+ไม่เพิ่ม schema ใหม่ อ่านวิธีค้นหาและข้อจำกัด execution ใน
+[TORRENTDD_CROSS_SEED.md](TORRENTDD_CROSS_SEED.md)
 
 ## การเพิ่มโปรแกรมบิทชนิดใหม่
 

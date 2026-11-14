@@ -86,7 +86,7 @@ def search_zones(site_config, targets, zone_metadata, max_queries=3):
             zone = {'name': 'Browse', 'url': zone}
         if isinstance(zone, dict) and zone.get('enable', True) and str(zone.get('url') or '').strip():
             zones.append(zone)
-    site = str(site_config.get('name') or '').casefold()
+    site = str(site_config.get('name') or '').strip().casefold()
     # Explicitly disabled zones must never be re-enabled by a default.
     if not configured:
         if 'bearbit' in site or 'siambit' in site:
@@ -107,10 +107,12 @@ def search_zones(site_config, targets, zone_metadata, max_queries=3):
             controls = parse_qs(urlsplit(zone['url']).query)
             url_filters = {key: controls[key][-1] for key in ('incldead', 'searchin', 'sortby') if key in controls}
             cats = [key[1:] for key, values in controls.items() if re.fullmatch(r'c\d+', key) and values[-1] == '1']
+            if site == 'torrentdd' and 'cate' in controls:
+                cats = controls['cate'][-1].split(',')
             if cats:
                 url_filters['selected_cats'] = cats
             if 'freeload' in controls:
-                url_filters['freeload'] = controls['freeload'][-1] == '1'
+                url_filters['freeload'] = controls['freeload'][-1] == ('yes' if site == 'torrentdd' else '1')
             params = {**url_filters, **zone_params, **target_params}
             raw_keyword = params.get('search_keyword')
             if not str(raw_keyword or '').strip():

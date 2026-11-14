@@ -11,7 +11,7 @@ Cross-Seed โดยใช้ `torrent_mapping.json` เป็นฐานข้
 - **ขอบคุณและโหวต** ตามฟังก์ชันที่เว็บไซต์รองรับ
 - **Torrent mapping กลาง** เชื่อมรายการเว็บไซต์กับ infohash ตำแหน่งไฟล์บน client
   ภาระ H&R/Quest Seed ความสัมพันธ์ Cross-Seed และคิวอัปโหลด
-- **Cross-Seed** ค้นหาในโซนที่เปิดไว้ของ BearBit, Bitsuse และ Dedbit พร้อมลองคำค้น
+- **Cross-Seed** ค้นหาในโซนที่เปิดไว้ของ BearBit, Bitsuse, Dedbit และ TorrentDD พร้อมลองคำค้น
   สำรองที่คงรหัสตอน/รหัสไฟล์ และตรวจ manifest ก่อนเพิ่มงาน
 - **Auto Upload และ Cross-Seed** จาก BearBit โซนปกติไป Dedbit และโซนพิเศษไป Bitsuse
   ใช้รายละเอียดจากต้นฉบับ สร้าง infohash แยก และตรวจไฟล์ก่อนเริ่ม seed
@@ -165,6 +165,10 @@ Cross-Seed สำหรับค้นหางานที่มีอยู่
 }
 ```
 
+TorrentDD รองรับค้นหาแยกโซนปกติ/พิเศษ พร้อมหมวด `cate` และ `freeload=yes`
+ตัวอ่านตรวจ File List จากหน้ารายละเอียดก่อนส่งเข้า preflight เดิม
+ดูขั้นตอนและข้อจำกัดการเพิ่มงานใน [TORRENTDD_CROSS_SEED.md](docs/TORRENTDD_CROSS_SEED.md)
+
 Auto Upload ใช้ไฟล์ที่โหลดครบแล้วจาก BearBit สร้างรายการใหม่บนเว็บปลายทาง:
 
 | โซนต้นทาง | เว็บปลายทาง |
@@ -237,6 +241,7 @@ Cleaner ตรวจ H&R/Quest, manual hold และงานอัปโหล
 | [client_registry.py](client_registry.py) | จุดลงทะเบียน adapter สำหรับโปรแกรมบิท |
 | [torrent_store.py](torrent_store.py) | อ่านและอัปเดต mapping กลางแบบ transaction |
 | [cross_seed_search.py](cross_seed_search.py) | คำค้นสำรองและการเลือกโซน Cross-Seed |
+| [torrentdd_cross_seed.py](torrentdd_cross_seed.py) | ค้นหา อ่าน File List และดาวน์โหลด metainfo ของ TorrentDD |
 | [auto_upload_cli.py](auto_upload_cli.py) | คำสั่งตรวจ เตรียม เผยแพร่ และกู้สถานะอัปโหลด |
 | [auto_upload.py](auto_upload.py) / [upload_runner.py](upload_runner.py) | คิวอัปโหลดและการเชื่อมกับรอบบอท |
 | [upload_sites.py](upload_sites.py) / [upload_client.py](upload_client.py) | ตัวอ่านเว็บ/ฟอร์มและคำสั่ง client สำหรับอัปโหลด |
@@ -251,6 +256,7 @@ Cleaner ตรวจ H&R/Quest, manual hold และงานอัปโหล
 | [docs/UPLOAD_CATEGORY_RULES.md](docs/UPLOAD_CATEGORY_RULES.md) | ตารางจับคู่หมวด BearBit กับเว็บปลายทาง |
 | [docs/STORAGE.md](docs/STORAGE.md) | กติกาเลือก quota/mount และการตั้งค่าพื้นที่ |
 | [docs/NODE_CONFIG.md](docs/NODE_CONFIG.md) | การอ้างบัญชี/ดิสก์ นโยบาย Cleaner และการย้าย config |
+| [docs/TORRENTDD_CROSS_SEED.md](docs/TORRENTDD_CROSS_SEED.md) | การค้นหาและ preflight สำหรับ TorrentDD |
 
 สำรอง `torrent_mapping.json` ก่อนย้ายหรือแก้ข้อมูล โครงสร้างปัจจุบันเป็น schema 2
 และเก็บข้อมูลเดิมไว้ร่วมกับ `site_records`, `upload_jobs` และ `content_groups`

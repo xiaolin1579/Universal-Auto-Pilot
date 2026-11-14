@@ -52,6 +52,7 @@ from cross_seed_search import search_keywords, search_zones
 from upload_client import QbitUploadClient
 from storage_telemetry import parse_size_gib, read_swizzin_storage_stats
 from node_config import load_config as load_node_config
+import torrentdd_cross_seed
 # Metainfo parsing is shared with the auto-upload worker.
 from torrent_metainfo import (
     _bencode_value_end, _decode_bencode_value, _torrent_text,
@@ -7201,50 +7202,7 @@ async def _extract_unlimitz_logic(row, base_url, dl_session, headers, checked_ca
     }
 
 async def _extract_torrentdd_logic(row, base_url, dl_session, headers, checked_cache):
-    # --- Logic เดิม ---
-    t_id, title, details_url = None, "Unknown File", None
-    
-    title_tag = row.find("a", href=re.compile(r"details\.php\?id=\d+"))
-    if title_tag:
-        title = title_tag.get_text(strip=True)
-        t_id = re.search(r"id=(\d+)", title_tag['href']).group(1)
-        details_url = f"{base_url.rstrip('/')}/details.php?id={t_id}"
-
-    # --- เพิ่ม: การดึงเวลาที่ถูกต้องจาก span class="text-muted" ---
-    date_tag = row.find("span", class_="text-muted")
-    raw_date = date_tag.get_text(strip=True) if date_tag else None
-
-    # ดึง Stats จาก div.dp-show-2
-    stats = row.find("div", class_="dp-show-2")
-    spans = stats.find_all("span") if stats else []
-    completed = extract_digit(spans[2]) if len(spans) > 2 else 0
-    seeders = extract_digit(spans[0]) if len(spans) > 0 else 0
-    leechers = extract_digit(spans[1]) if len(spans) > 1 else 0
-
-    # ดึง Size จาก div.dp-show-1
-    size_span = row.find("span", class_="text-info")
-    size_str = size_span.get_text(strip=True).replace("ขนาด:", "").strip() if size_span else "0 B"
-
-    # ดึง Download URL จากปุ่ม button (onclick)
-    btn = row.find("button", onclick=True)
-    download_url = None
-    if btn:
-        match = re.search(r"'(.*?)'", btn['onclick'])
-        if match:
-            url = match.group(1)
-            download_url = url if url.startswith('http') else f"{base_url.rstrip('/')}/{url.lstrip('/')}"
-
-    return { 
-        "id": t_id, 
-        "title": title, 
-        "seeders": seeders, 
-        "leechers": leechers, 
-        "completed": completed, 
-        "size_str": size_str, 
-        "raw_date": raw_date,
-        "download_url": download_url, 
-        "details_url": details_url 
-    }
+    return torrentdd_cross_seed.extract_row(row, base_url)
 
 async def _extract_bearbit_logic(row, base_url, dl_session, headers, checked_cache):    
     t_id, title, details_url, download_url = None, "Unknown File", None, None
@@ -7415,6 +7373,9 @@ class ResponseWrapper:
         self.headers = {} # ถ้าต้องใช้ headers ให้ดึงมาใส่ด้วย
 
 async def download_torrent_smart(tab, details_url, download_url):
+    if any((urlsplit(str(url or "")).hostname or "").casefold()
+           in {"torrentdd.com", "www.torrentdd.com"} for url in (details_url, download_url)):
+        return await torrentdd_cross_seed.download_candidate(tab, details_url, download_url)
     # 1. เข้าลิงค์ Download
     await tab.get(download_url)
     await asyncio.sleep(3)
@@ -9183,11 +9144,17 @@ def build_search_url(
     quality_options=None,
     target_path=None,
 ):
-    """Build verified GET search URLs for BearBit, BITSUSE and DEDBIT."""
+    """Build tracker-specific GET search URLs from verified browse controls."""
     from urllib.parse import urlencode, urlsplit
     import re as _re
 
     site_key = str(site_name or "").strip().lower()
+
+    if site_key == "torrentdd":
+        return torrentdd_cross_seed.build_search_url(
+            search_keyword, selected_cats=selected_cats,
+            freeload=freeload, target_path=target_path,
+        )
 
     is_bearbit = any(name in site_key for name in ("bearbit", "siambit"))
     is_bitsuse = "bitsuse" in site_key
@@ -9854,6 +9821,9 @@ async def _read_cross_seed_filelist(browser_tab, site, torrent_id, details_url):
     units are both considered when the site labels units ambiguously).
     """
     from urllib.parse import urlsplit, urlunsplit, urlencode
+
+    if str(site or "").strip().casefold() == "torrentdd":
+        return await torrentdd_cross_seed.read_filelist(browser_tab, torrent_id, details_url)
 
     torrent_id = str(torrent_id or "").strip()
     if not re.fullmatch(r"\d+", torrent_id):
@@ -11048,6 +11018,10 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                         if "ไม่สามารถเปิดลิงก์จากภายนอกได้" in final_text:
                             continue
 
+                        if str(site).strip().casefold() == "torrentdd":
+                            current_url = await site_page.evaluate('window.location.href')
+                            torrentdd_cross_seed.validate_search_page(soup, current_url, target_url)
+
                         # -----------------------------------------------------
                         # สำคัญ:
                         # ต่อจากตรงนี้ให้ใช้โค้ดเดิมในส่วน 4. PARSE RESULTS
@@ -11153,7 +11127,11 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                 f'href={link_href!r} text={link_text!r} '
                                 f'ancestors={ancestor_tags}'
                             )
-                    for a in all_details:
+                    if str(site).strip().casefold() == "torrentdd":
+                        # Match each TorrentDD listing inside its result table;
+                        # userdetails.php links and sidebar widgets are not torrents.
+                        rows = torrentdd_cross_seed.search_rows(soup)
+                    for a in ([] if str(site).strip().casefold() == "torrentdd" else all_details):
                         if stop_event.is_set(): 
                             break
                         link_title = a.get_text(strip=True)
