@@ -52,11 +52,15 @@ def search_keywords(value, limit=3):
     title = normalized[:technical.start()] if technical else normalized
     title = re.sub(r'[\[\]()]', ' ', title)
     title = re.sub(r'\s+', ' ', title).strip(' -')
-    episode = _EPISODE.search(title)
+    episode = _EPISODE.search(normalized)
     years = [m for m in _YEAR.finditer(title) if title[:m.start()].strip(' -')]
     if episode:
-        # Keep episode/season specificity even in the broadest query.
-        add(title[:episode.end()])
+        # Quality tags can precede the episode; retain it after stripping those tags.
+        prefix = title[:episode.start()] if episode.start() < len(title) else title
+        prefix = re.sub(r'\s+', ' ', prefix).strip(' -')
+        add(prefix + ' ' + episode.group())
+        if years:
+            add(prefix[:years[-1].start()].strip(' -') + ' ' + episode.group())
     elif years:
         year = years[-1]
         add(title[:year.end()])

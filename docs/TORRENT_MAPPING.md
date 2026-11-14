@@ -28,7 +28,9 @@ Cross-Seed ไว้ ใน schema 2 จะเพิ่มข้อมูลร�
   },
   "site_sync": {},
   "clients": {},
-  "migrations": {}
+  "migrations": {},
+  "upload_jobs": {},
+  "content_groups": {}
 }
 ```
 
@@ -150,3 +152,14 @@ OPENBLAS_NUM_THREADS=2 OMP_NUM_THREADS=2 venv/bin/python -m unittest discover -s
 การเขียนร่วมกันของ Cross-Seed กับข้อมูลเว็บไซต์ การเรียกตัวอ่านจริงด้วย HTML จำลอง
 การบันทึกผลลบงาน และการลงทะเบียน client เพิ่มเติม โดยไม่ส่งแจ้งเตือนหรือเปลี่ยนแปลง
 torrent บนเซิร์ฟเวอร์จริง
+
+## คิวอัปโหลดและ variant
+
+`upload_jobs` บันทึกสถานะเตรียม/ส่ง/ยืนยัน/recheck ของ BearBit → Dedbit/Bitsuse
+และป้องกันไฟล์จาก Cleaner ระหว่างดำเนินการ ส่วน `content_groups` เชื่อม hash
+ที่มี payload ตรงกันจาก layout และ piece hashes อ่านวิธีตั้งค่าและความหมายสถานะได้ที่
+[AUTO_UPLOAD.md](AUTO_UPLOAD.md) โดยทั้งสองส่วนเพิ่มใน schema 2 แบบคงข้อมูลเดิม
+
+งานอัปโหลดที่ยังกรอกฟอร์มไม่ครบใช้สถานะ `draft` พร้อม `readiness` และ `form_schema`
+ส่วน `field_overrides` เก็บค่าที่กำหนดเฉพาะงานโดยไม่เปลี่ยนกฎของงานอื่น
+ทั้ง `draft` และ `prepared` จะคงการป้องกันต้นทางจาก Cleaner จนกว่าจะยกเลิกหรือทำงานเสร็จ

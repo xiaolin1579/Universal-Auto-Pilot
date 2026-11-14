@@ -16,6 +16,10 @@ import time
 
 SCHEMA_VERSION = 2
 KINDS = ('hr', 'quest_seed')
+UPLOAD_STATES = {'draft', 'prepared', 'submitting', 'publication_uncertain', 'published',
+                 'verification_failed', 'verified', 'adding', 'seed_uncertain',
+                 'rechecking', 'seeding', 'cancelled'}
+UPLOAD_HOLD_STATES = UPLOAD_STATES - {'seeding', 'cancelled'}
 
 
 def utcnow():
@@ -96,7 +100,7 @@ class MappingStore:
         version = data.get('schema_version', 1)
         if type(version) is not int or version not in (1, SCHEMA_VERSION):
             raise ValueError('Unsupported mapping schema version')
-        for key in ('site_records', 'site_sync', 'clients', 'migrations'):
+        for key in ('site_records', 'site_sync', 'clients', 'migrations', 'upload_jobs', 'content_groups'):
             if key not in data:
                 data[key] = {}
             if not isinstance(data[key], dict):
@@ -125,8 +129,34 @@ class MappingStore:
         for site, kinds in data['site_sync'].items():
             if not isinstance(kinds, dict) or any(not isinstance(v, dict) for v in kinds.values()):
                 raise ValueError('Invalid site synchronization evidence')
+        MappingStore._validate_uploads(data)
         data['schema_version'] = SCHEMA_VERSION
         return data
+
+    @staticmethod
+    def _validate_uploads(data):
+        for key, job in data['upload_jobs'].items():
+            if (not isinstance(job, dict) or job.get('id') != key
+                    or not re.fullmatch(r'[0-9a-f]{64}', key)
+                    or job.get('state') not in UPLOAD_STATES
+                    or not infohash(job.get('source_hash'))
+                    or job['source_hash'] != infohash(job['source_hash'])
+                    or not isinstance(job.get('source_node'), str)
+                    or not str(job.get('save_path') or '').startswith('/')
+                    or {'normal': 'DEDBIT', 'special': 'BITSUSE'}.get(job.get('source_zone')) != job.get('target_site')
+                    or job.get('content_group_id') not in data['content_groups']
+                    or not isinstance(job.get('rule'), dict)):
+                raise ValueError('Invalid upload job')
+            target = job.get('target_hash')
+            if target is not None and (not infohash(target) or target != infohash(target) or target == job['source_hash']):
+                raise ValueError('Invalid upload variant hash')
+        for key, group in data['content_groups'].items():
+            if (not isinstance(group, dict) or group.get('id') != key
+                    or not re.fullmatch(r'[0-9a-f]{64}', key)
+                    or not isinstance(group.get('hashes'), list)
+                    or any(not infohash(h) or h != infohash(h) for h in group['hashes'])
+                    or len(set(group['hashes'])) != len(group['hashes'])):
+                raise ValueError('Invalid upload content group')
 
     def read(self):
         try:
@@ -294,6 +324,9 @@ class MappingStore:
         if not target:
             return 'UNKNOWN'
         data = self.read()
+        if any(j['state'] in UPLOAD_HOLD_STATES and target in (j['source_hash'], j.get('target_hash'))
+               for j in data['upload_jobs'].values()):
+            return 'PROTECTED'
         rows = [r for r in data['site_records'].values() if r.get('infohash') == target]
         sites = {str(s).upper() for s in required_sites}
         sites.update(r['site'] for r in rows)

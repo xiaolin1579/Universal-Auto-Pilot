@@ -46,9 +46,15 @@ import functools
 from pathlib import Path
 import traceback
 import urllib.parse
-from torrent_store import MappingStore
+from torrent_store import MappingStore, UPLOAD_HOLD_STATES
 from client_registry import ClientAdapter, ClientRegistry
 from cross_seed_search import search_keywords, search_zones
+from upload_client import QbitUploadClient
+# Metainfo parsing is shared with the auto-upload worker.
+from torrent_metainfo import (
+    _bencode_value_end, _decode_bencode_value, _torrent_text,
+    _extract_torrent_manifest, _extract_torrent_info_hash,
+)
 
 print = functools.partial(print, flush=True)
 
@@ -5312,264 +5318,6 @@ class RtorrentNode:
             return {}
 
 
-def _bencode_value_end(data, pos):
-    """คืนตำแหน่ง byte ถัดจากค่า bencode หนึ่งค่า"""
-    if pos >= len(data):
-        raise ValueError("Unexpected end of bencode")
-
-    token = data[pos]
-
-    if token == ord("i"):
-        end = data.find(b"e", pos + 1)
-        if end < 0:
-            raise ValueError("Unterminated bencode integer")
-        return end + 1
-
-    if token in (ord("l"), ord("d")):
-        is_dict = token == ord("d")
-        pos += 1
-
-        while True:
-            if pos >= len(data):
-                raise ValueError("Unterminated bencode container")
-            if data[pos] == ord("e"):
-                return pos + 1
-
-            pos = _bencode_value_end(data, pos)
-            if is_dict:
-                pos = _bencode_value_end(data, pos)
-
-    if ord("0") <= token <= ord("9"):
-        colon = data.find(b":", pos)
-        if colon < 0:
-            raise ValueError("Invalid bencode byte string")
-        length_text = data[pos:colon]
-        if not length_text or not length_text.isdigit():
-            raise ValueError("Invalid byte string length")
-        end = colon + 1 + int(length_text)
-        if end > len(data):
-            raise ValueError("Truncated bencode byte string")
-        return end
-
-    raise ValueError(f"Invalid bencode token at offset {pos}")
-
-
-
-def _decode_bencode_value(data, offset=0):
-    """Decode one bencode value, returning (value, next_offset)."""
-    if offset >= len(data):
-        raise ValueError("Unexpected end of bencode")
-
-    token = data[offset]
-
-    if token == ord("i"):
-        end = data.find(b"e", offset + 1)
-        if end < 0:
-            raise ValueError("Unterminated integer")
-        try:
-            return int(data[offset + 1:end]), end + 1
-        except ValueError as exc:
-            raise ValueError("Invalid bencode integer") from exc
-
-    if token == ord("l"):
-        items = []
-        pos = offset + 1
-        while True:
-            if pos >= len(data):
-                raise ValueError("Unterminated list")
-            if data[pos] == ord("e"):
-                return items, pos + 1
-            value, pos = _decode_bencode_value(data, pos)
-            items.append(value)
-
-    if token == ord("d"):
-        result = {}
-        pos = offset + 1
-        while True:
-            if pos >= len(data):
-                raise ValueError("Unterminated dictionary")
-            if data[pos] == ord("e"):
-                return result, pos + 1
-
-            key, pos = _decode_bencode_value(data, pos)
-            if not isinstance(key, bytes):
-                raise ValueError("Bencode dictionary key must be bytes")
-            if key in result:
-                raise ValueError("Duplicate Bencode dictionary key")
-
-            value, pos = _decode_bencode_value(data, pos)
-            result[key] = value
-
-    if ord("0") <= token <= ord("9"):
-        colon = data.find(b":", offset)
-        if colon < 0:
-            raise ValueError("Invalid byte-string length")
-        raw_length = data[offset:colon]
-        if not raw_length.isdigit():
-            raise ValueError("Invalid byte-string length")
-
-        end = colon + 1 + int(raw_length)
-        if end > len(data):
-            raise ValueError("Truncated byte string")
-        return data[colon + 1:end], end
-
-    raise ValueError(f"Invalid bencode token at offset {offset}")
-
-
-def _torrent_text(value):
-    if not isinstance(value, bytes):
-        raise ValueError("Expected a bencode byte string")
-    return value.decode("utf-8", errors="surrogateescape")
-
-
-def _extract_torrent_manifest(content):
-    """Extract v1 info hash, root name and per-file path/size."""
-    data = bytes(content)
-    decoded, end = _decode_bencode_value(data, 0)
-
-    if end != len(data):
-        raise ValueError("Unexpected trailing data after torrent metainfo")
-    if not isinstance(decoded, dict):
-        raise ValueError("Torrent metainfo is not a dictionary")
-
-    info = decoded.get(b"info")
-    if not isinstance(info, dict):
-        raise ValueError("Missing info dictionary")
-
-    name_raw = info.get(b"name.utf-8", info.get(b"name"))
-    root_name = _torrent_text(name_raw)
-
-    if (
-        not root_name
-        or root_name in {".", ".."}
-        or "/" in root_name
-        or "\\" in root_name
-    ):
-        raise ValueError("Invalid torrent root name")
-
-    files = []
-
-    if b"files" in info:
-        entries = info.get(b"files")
-        if not isinstance(entries, list) or not entries:
-            raise ValueError("Invalid multi-file manifest")
-
-        seen_paths = set()
-
-        for entry in entries:
-            if not isinstance(entry, dict):
-                raise ValueError("Invalid file entry")
-
-            path_parts = entry.get(
-                b"path.utf-8",
-                entry.get(b"path"),
-            )
-            size = entry.get(b"length")
-
-            if not isinstance(path_parts, list) or not path_parts:
-                raise ValueError("Missing file path")
-            if not isinstance(size, int) or size < 0:
-                raise ValueError("Invalid file size")
-
-            parts = [_torrent_text(part) for part in path_parts]
-
-            if any(
-                not part
-                or part in {".", ".."}
-                or "/" in part
-                or "\\" in part
-                for part in parts
-            ):
-                raise ValueError("Unsafe file path component")
-
-            relative_path = "/".join(parts)
-            if relative_path in seen_paths:
-                raise ValueError("Duplicate file path in torrent")
-            seen_paths.add(relative_path)
-
-            files.append({
-                "path": relative_path,
-                "size_bytes": size,
-            })
-
-        multi_file = True
-
-    else:
-        size = info.get(b"length")
-        if not isinstance(size, int) or size < 0:
-            raise ValueError("Invalid single-file length")
-
-        files.append({
-            "path": root_name,
-            "size_bytes": size,
-        })
-        multi_file = False
-
-    tracker_urls = set()
-
-    announce = decoded.get(b"announce")
-    if isinstance(announce, bytes):
-        tracker_urls.add(
-            announce.decode("utf-8", errors="surrogateescape").strip()
-        )
-
-    announce_list = decoded.get(b"announce-list", [])
-    if isinstance(announce_list, list):
-        for group in announce_list:
-            entries = group if isinstance(group, list) else [group]
-            for entry in entries:
-                if isinstance(entry, bytes):
-                    tracker_urls.add(
-                        entry.decode(
-                            "utf-8", errors="surrogateescape"
-                        ).strip()
-                    )
-
-    tracker_urls = sorted(
-        url for url in tracker_urls
-        if url.startswith(("http://", "https://", "udp://"))
-    )
-
-    return {
-        "info_hash": _extract_torrent_info_hash(data),
-        "root_name": root_name,
-        "multi_file": multi_file,
-        "files": files,
-        "total_size_bytes": sum(f["size_bytes"] for f in files),
-        "announce_urls": tracker_urls,
-    }
-
-def _extract_torrent_info_hash(content):
-    """SHA-1 of the exact raw bencoded info dictionary."""
-    data = bytes(content)
-    decoded, total_end = _decode_bencode_value(data, 0)
-
-    if total_end != len(data):
-        raise ValueError("Unexpected trailing bytes in torrent metainfo")
-    if not isinstance(decoded, dict):
-        raise ValueError("Torrent metainfo is not a dictionary")
-    if not isinstance(decoded.get(b"info"), dict):
-        raise ValueError("Torrent has no valid info dictionary")
-
-    pos = 1
-    while pos < len(data):
-        if data[pos] == ord("e"):
-            break
-
-        key, value_start = _decode_bencode_value(data, pos)
-        if not isinstance(key, bytes):
-            raise ValueError("Top-level Bencode key is not bytes")
-
-        _, value_end = _decode_bencode_value(data, value_start)
-
-        if key == b"info":
-            return hashlib.sha1(data[value_start:value_end]).hexdigest().lower()
-
-        pos = value_end
-
-    raise ValueError("Torrent has no raw info dictionary")
-
-
 def update_trackers(node):
     """Submit one guarded re-announce request per node."""
 
@@ -5707,7 +5455,7 @@ def _read_builtin_storage_inventory(node):
 
 CLIENTS = ClientRegistry()
 CLIENTS.register(ClientAdapter("qbit", QbitNode, QbitNode, _read_builtin_storage_inventory,
-                               close=lambda node: node.s.close()))
+                               close=lambda node: node.s.close(), upload_factory=QbitUploadClient))
 CLIENTS.register(ClientAdapter("rtorrent", RtorrentNode, RtorrentNode, _read_builtin_storage_inventory,
                                purge_reader=lambda node, torrent_hash: node.get_purge_snapshot(torrent_hash),
                                supports_keep_files=False, close=lambda node: node.s.close()))
@@ -5753,9 +5501,13 @@ class NodeCleaner:
     @classmethod
     def get_global_protected_set(cls):
         data = _mapping_store().read()
-        return {r["infohash"] for r in data["site_records"].values()
-                if r.get("infohash") and (r.get("manual_hold") or
-                    any(o.get("status") == "required" for o in r["obligations"].values()))}
+        protected = {r["infohash"] for r in data["site_records"].values()
+                     if r.get("infohash") and (r.get("manual_hold") or
+                         any(o.get("status") == "required" for o in r["obligations"].values()))}
+        for job in data["upload_jobs"].values():
+            if job["state"] in UPLOAD_HOLD_STATES:
+                protected.update(h for h in (job["source_hash"], job.get("target_hash")) if h)
+        return protected
 
     @classmethod
     def update_protected_cache_item(cls, t_hash, status):
@@ -13965,6 +13717,11 @@ async def main():
                             "⚠️ ไม่มี Cross-seed target "
                             "ให้ตรวจสอบ build_cross_seed_targets() และ mapping"
                         )
+
+                if CFG.get("AUTO_UPLOAD", {}).get("enable") is True:
+                    from upload_runner import run_cycle as run_upload_cycle
+                    upload_results = await run_upload_cycle(sys.modules[__name__], active_nodes)
+                    print("[Auto Upload]", json.dumps(upload_results, ensure_ascii=False))
 
                 cycle_mode_completed = True
                 consecutive_errors = 0

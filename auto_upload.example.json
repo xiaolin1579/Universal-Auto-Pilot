@@ -1,0 +1,38 @@
+{
+  "AUTO_UPLOAD": {
+    "enable": false,
+    "enable_publish": false,
+    "enable_seed": false,
+    "enable_resume": false,
+    "artifact_dir": "upload_artifacts",
+    "max_jobs_per_cycle": 1,
+    "rules": [
+      {
+        "enable": false,
+        "source_zone": "normal",
+        "source_category": "กรอกชื่อหมวดตรงตามแถว Category ใน BearBit",
+        "target_site": "DEDBIT",
+        "target_category": "35",
+        "fields": {
+          "c3dub": "กรอกภาษาพากย์ตามข้อมูลต้นฉบับ",
+          "c3sub": "กรอกภาษาคำบรรยายตามข้อมูลต้นฉบับ",
+          "c35res": "1080i/p"
+        },
+        "confirmations": {"ack2": false, "ack4": false}
+      },
+      {
+        "enable": false,
+        "source_zone": "special",
+        "source_category": "กรอกชื่อหมวดตรงตามแถว Category ใน BearBit",
+        "target_site": "BITSUSE",
+        "target_category": "181",
+        "fields": {
+          "c100type": "",
+          "c100type2": "",
+          "c100cat": ""
+        },
+        "confirmations": {"ack2": false}
+      }
+    ]
+  }
+}

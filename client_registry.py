@@ -24,6 +24,7 @@ class ClientAdapter:
     purge_reader: Callable | None = None
     supports_keep_files: bool = True
     close: Callable | None = None
+    upload_factory: Callable | None = None
 
 
 class ClientRegistry:

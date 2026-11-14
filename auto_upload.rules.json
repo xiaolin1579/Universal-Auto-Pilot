@@ -1,0 +1,541 @@
+{
+  "rules": [
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "OS วินโดว์/ออฟฟิศ",
+      "target_site": "DEDBIT",
+      "target_category": "53",
+      "fields": {
+        "c53os": "Windows"
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "ซอฟต์แวร์ AntiVirus/Antispyware",
+      "target_site": "DEDBIT",
+      "target_category": "53",
+      "fields": {
+        "c53os": ""
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "ซอฟต์แวร์ แม็ค",
+      "target_site": "DEDBIT",
+      "target_category": "53",
+      "fields": {
+        "c53os": "Mac"
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "ซอฟต์แวร์ ลินุกซ์",
+      "target_site": "DEDBIT",
+      "target_category": "53",
+      "fields": {
+        "c53os": "Linux"
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "ซอฟต์แวร์",
+      "target_site": "DEDBIT",
+      "target_category": "53",
+      "fields": {
+        "c53os": ""
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "รายการทีวี/วาไรตี้/เกมโชว์",
+      "target_site": "DEDBIT",
+      "target_category": "4",
+      "fields": {},
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "ทั่วไป",
+      "target_site": "DEDBIT",
+      "target_category": "13",
+      "fields": {},
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "ธรรมะ",
+      "target_site": "DEDBIT",
+      "target_category": "18",
+      "fields": {},
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "สารคดี",
+      "target_site": "DEDBIT",
+      "target_category": "16",
+      "fields": {},
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "สื่อเรียนรู้/หนังสือ/Ebook",
+      "target_site": "DEDBIT",
+      "target_category": "12",
+      "fields": {},
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "คอนเสิร์ต",
+      "target_site": "DEDBIT",
+      "target_category": "41",
+      "fields": {
+        "c4genre": "",
+        "c41type": "Concert",
+        "c41sub": ""
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "คาราโอเกะ/MV",
+      "target_site": "DEDBIT",
+      "target_category": "41",
+      "fields": {
+        "c4genre": "",
+        "c41type": "",
+        "c41sub": ""
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "เพลง",
+      "target_site": "DEDBIT",
+      "target_category": "41",
+      "fields": {
+        "c4genre": "",
+        "c41type": "",
+        "c41sub": ""
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "เพลงคุณภาพสูง (Lossless)",
+      "target_site": "DEDBIT",
+      "target_category": "41",
+      "fields": {
+        "c4genre": "",
+        "c41type": "",
+        "c41sub": "Lossless"
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "ภาพยนตร์ 4K UHD",
+      "target_site": "DEDBIT",
+      "target_category": "35",
+      "fields": {
+        "c3dub": "",
+        "c3sub": "",
+        "c35res": "2160i/p"
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "ภาพยนตร์ DVD",
+      "target_site": "DEDBIT",
+      "target_category": "35",
+      "fields": {
+        "c3dub": "",
+        "c3sub": "",
+        "c35res": "SD (DVD/VCD)"
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "ภาพยนตร์ Hi-Def",
+      "target_site": "DEDBIT",
+      "target_category": "35",
+      "fields": {
+        "c3dub": "",
+        "c3sub": "",
+        "c35res": ""
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "ภาพยนตร์ VCD",
+      "target_site": "DEDBIT",
+      "target_category": "35",
+      "fields": {
+        "c3dub": "",
+        "c3sub": "",
+        "c35res": "SD (DVD/VCD)"
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "รูปภาพ",
+      "target_site": "DEDBIT",
+      "target_category": "72",
+      "fields": {
+        "c72type": ""
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "ฟอนต์/ไอคอน/คลิปอาร์ท/เทมเพลท",
+      "target_site": "DEDBIT",
+      "target_category": "72",
+      "fields": {
+        "c72type": "ทรัพยากรออกแบบ (PSD, เวกเตอร์, พรีเซ็ต, ฟอนต์)"
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "หนังชุด/ซีรีส์ [เกาหลี]",
+      "target_site": "DEDBIT",
+      "target_category": "7",
+      "fields": {
+        "c7country": "เกาหลี",
+        "c7type": "ทั่วไป"
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "หนังชุด/ซีรีส์ [จีน]",
+      "target_site": "DEDBIT",
+      "target_category": "7",
+      "fields": {
+        "c7country": "จีน",
+        "c7type": "ทั่วไป"
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "หนังชุด/ซีรีส์ [ญี่ปุ่น]",
+      "target_site": "DEDBIT",
+      "target_category": "7",
+      "fields": {
+        "c7country": "ญี่ปุ่น",
+        "c7type": "ทั่วไป"
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "หนังชุด/ซีรีส์ [ฝรั่ง]",
+      "target_site": "DEDBIT",
+      "target_category": "7",
+      "fields": {
+        "c7country": "ฝรั่ง",
+        "c7type": "ทั่วไป"
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "หนังชุด/ซีรีส์/ละคร [ไทย]",
+      "target_site": "DEDBIT",
+      "target_category": "7",
+      "fields": {
+        "c7country": "ไทย",
+        "c7type": "ทั่วไป"
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "หนังชุด/ซีรีส์ [อื่นๆ]",
+      "target_site": "DEDBIT",
+      "target_category": "7",
+      "fields": {
+        "c7country": "",
+        "c7type": "ทั่วไป"
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "normal",
+      "source_category": "หนังชุด/ซีรีส์ [แนวตั้ง]",
+      "target_site": "DEDBIT",
+      "target_category": "7",
+      "fields": {
+        "c7country": "",
+        "c7type": "แนวตั้ง"
+      },
+      "confirmations": {
+        "ack2": false,
+        "ack4": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "special",
+      "source_category": "๏X-ญี่ปุ่นเซ็น๏",
+      "target_site": "BITSUSE",
+      "target_category": "181",
+      "fields": {
+        "c100type": "",
+        "c100type2": "",
+        "c100cat": "ญี่ปุ่น"
+      },
+      "confirmations": {
+        "ack2": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "special",
+      "source_category": "๏X-ญี่ปุ่น ไม่เซ็นX๏",
+      "target_site": "BITSUSE",
+      "target_category": "180",
+      "fields": {
+        "c100type": "",
+        "c100type2": "",
+        "c100cat": "ญี่ปุ่น"
+      },
+      "confirmations": {
+        "ack2": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "special",
+      "source_category": "๏X-H Anime๏",
+      "target_site": "BITSUSE",
+      "target_category": "183",
+      "fields": {
+        "c183type": "การ์ตูน / อนิเมะ",
+        "c183cen": ""
+      },
+      "confirmations": {
+        "ack2": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "special",
+      "source_category": "๏X-H Game๏",
+      "target_site": "BITSUSE",
+      "target_category": "183",
+      "fields": {
+        "c183type": "เกม",
+        "c183cen": ""
+      },
+      "confirmations": {
+        "ack2": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "special",
+      "source_category": "๏X-Gay๏",
+      "target_site": "BITSUSE",
+      "target_category": "182",
+      "fields": {
+        "c182type": "",
+        "c182type2": "",
+        "c182cat": ""
+      },
+      "confirmations": {
+        "ack2": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "special",
+      "source_category": "๏X-ฝรั่ง X๏",
+      "target_site": "BITSUSE",
+      "target_category": "180",
+      "fields": {
+        "c100type": "",
+        "c100type2": "",
+        "c100cat": "ฝรั่ง"
+      },
+      "confirmations": {
+        "ack2": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "special",
+      "source_category": "๏X-รูป X๏",
+      "target_site": "BITSUSE",
+      "target_category": "184",
+      "fields": {
+        "c184type": "ภาพเซ็ต",
+        "c184cat": ""
+      },
+      "confirmations": {
+        "ack2": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "special",
+      "source_category": "๏Xนิตยสาร sexy X๏",
+      "target_site": "BITSUSE",
+      "target_category": "184",
+      "fields": {
+        "c184type": "นิตยสาร/โฟโต้บุ๊ก",
+        "c184cat": ""
+      },
+      "confirmations": {
+        "ack2": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "special",
+      "source_category": "๏X-เอเชียเซ็น๏",
+      "target_site": "BITSUSE",
+      "target_category": "181",
+      "fields": {
+        "c100type": "",
+        "c100type2": "",
+        "c100cat": ""
+      },
+      "confirmations": {
+        "ack2": false
+      }
+    },
+    {
+      "enable": true,
+      "source_zone": "special",
+      "source_category": "๏X-เอเชีย X๏",
+      "target_site": "BITSUSE",
+      "target_category": "180",
+      "fields": {
+        "c100type": "",
+        "c100type2": "",
+        "c100cat": ""
+      },
+      "confirmations": {
+        "ack2": false
+      }
+    }
+  ]
+}

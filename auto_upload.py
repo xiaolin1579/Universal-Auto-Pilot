@@ -1,0 +1,421 @@
+"""Durable BearBit -> Dedbit/Bitsuse upload workflow, independent of browser/client SDKs."""
+from copy import deepcopy
+import hashlib
+import os
+import re
+from pathlib import Path
+import tempfile
+from torrent_store import infohash, stamp, UPLOAD_STATES as STATES, UPLOAD_HOLD_STATES as HOLD_STATES
+from torrent_metainfo import (_extract_torrent_info_hash, payload_signature,
+                              create_variant, verify_completed)
+
+class UploadBlocked(ValueError):
+    """A safe, operator-readable reason that contains no server response or secret."""
+
+
+class UploadRejected(UploadBlocked):
+    def __init__(self, code, title_limit=None):
+        self.code, self.title_limit = code, title_limit
+        super().__init__('Upload explicitly rejected by the website: ' + code)
+
+
+def upload_title(job):
+    title = str(job['metadata']['title'])
+    limit = 80 if job['target_site'] == 'DEDBIT' else None
+    if limit is None or len(title) <= limit:
+        return title
+    base = re.sub(r'^(?:\[[^\]]+\]\s*[- ]*)+', '', title)
+    base = re.split(r'-\s*WEB[- ]?DL|\.H\.26[45]|-\s*BluRay', base, maxsplit=1, flags=re.I)[0].strip(' ._-')
+    quality = [tag.strip() for tag in re.findall(r'\[([^\]]+)\]', title)
+               if re.fullmatch(r'(?:[248]K|\d{3,4}p|HDR10\+?|HDR|DV|\d{2,3}fps)', tag.strip(), re.I)]
+    with_quality = base + (' [' + ' '.join(quality) + ']' if quality else '')
+    if len(with_quality) <= limit:
+        return with_quality
+    if len(base) <= limit:
+        return base
+    root = re.sub(r'\.(?:mkv|mp4|avi|torrent)$', '', str(job['metadata'].get('root_name') or ''), flags=re.I)
+    if root and len(root) <= limit:
+        return root
+    raise UploadBlocked('Source title needs an explicit shorter display title for this website')
+
+
+ROUTES = {'normal': 'DEDBIT', 'special': 'BITSUSE'}
+def select_rule(rules, metadata):
+    """Category IDs are site-specific: never infer them from a numeric source ID."""
+    zone = metadata.get('zone')
+    if zone not in ROUTES or metadata.get('zone_verified') is not True:
+        raise UploadBlocked('BearBit zone is not verified')
+    matches = [r for r in rules if r.get('enable') is True
+               and r.get('source_zone') == zone
+               and str(r.get('source_category')) == str(metadata.get('category'))]
+    if len(matches) != 1 or matches[0].get('target_site') != ROUTES[zone]:
+        raise UploadBlocked('Exactly one explicit category rule is required for this BearBit category')
+    rule = matches[0]
+    if not isinstance(rule.get('fields', {}), dict) or not isinstance(rule.get('confirmations', {}), dict):
+        raise UploadBlocked('Category fields and confirmations must be dictionaries')
+    if set(rule.get('confirmations', {})) - {'ack2', 'ack4'}:
+        raise UploadBlocked('Only factual confirmations ack2/ack4 can be configured')
+    if set(rule) - {'enable', 'source_zone', 'source_category', 'target_site', 'target_category',
+                    'fields', 'confirmations', 'short_description'}:
+        raise UploadBlocked('Unsupported category rule fields')
+    return deepcopy(rule)
+
+
+def effective_rule(job):
+    rule = deepcopy(job['rule'])
+    overrides = job.get('field_overrides', {})
+    for key in ('fields', 'confirmations'):
+        rule.setdefault(key, {}).update(overrides.get(key, {}))
+    return rule
+
+
+def write_artifact(directory, job_id, kind, content):
+    directory = Path(directory).resolve(); directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = directory / (job_id + '.' + kind + '.torrent')
+    fd, tmp = tempfile.mkstemp(dir=directory)
+    try:
+        with os.fdopen(fd, 'wb') as handle:
+            handle.write(content); handle.flush(); os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+    return str(path)
+
+
+class UploadLedger:
+    def __init__(self, store, artifacts):
+        self.store, self.artifacts = store, artifacts
+
+    def prepare(self, source, inventory, files, metadata, rule, announce, readiness=None, form_schema=None):
+        manifest = verify_completed(source, inventory, files)
+        if metadata.get('infohash') != manifest['info_hash'] or metadata.get('site') != 'BEARBIT':
+            raise UploadBlocked('BearBit metadata does not match this source hash')
+        select_rule([rule], metadata)
+        if not metadata.get('title') or not metadata.get('description') or not metadata.get('details_url'):
+            raise UploadBlocked('BearBit primary metadata incomplete')
+        signature = payload_signature(source)
+        key_text = ':'.join((manifest['info_hash'], rule['target_site'], metadata['zone'], str(rule['target_category'])))
+        key = hashlib.sha256(key_text.encode()).hexdigest()
+        variant = create_variant(source, rule['target_site'], metadata['zone'], rule['target_category'], announce)
+        variant_hash = _extract_torrent_info_hash(variant)
+        if readiness is not None and type(readiness.get('ready')) is not bool:
+            raise UploadBlocked('Invalid draft readiness')
+        job = {'id': key, 'state': 'draft' if readiness and not readiness['ready'] else 'prepared', 'source_hash': manifest['info_hash'],
+               'source_site': 'BEARBIT', 'source_zone': metadata['zone'], 'source_node': inventory['node'],
+               'save_path': inventory['save_path'], 'target_site': rule['target_site'],
+               'target_zone': metadata['zone'], 'target_category': str(rule['target_category']),
+               'content_group_id': signature, 'prepared_hash': variant_hash,
+               'metadata': deepcopy(metadata), 'rule': deepcopy(rule), 'created_at': stamp(), 'updated_at': stamp()}
+        if readiness is not None:
+            job['readiness'] = deepcopy(readiness)
+        if form_schema is not None:
+            job['form_schema'] = {k: deepcopy(form_schema[k]) for k in ('fields', 'acknowledgements')}
+        def apply(data):
+            old = data['upload_jobs'].get(key)
+            if old:
+                if old['state'] not in ('draft', 'prepared', 'cancelled'):
+                    return deepcopy(old)
+                if (old['state'] != 'cancelled' and old['rule'] == job['rule']
+                        and old.get('readiness') == job.get('readiness')
+                        and old['save_path'] == job['save_path'] and old['source_node'] == job['source_node']
+                        and old.get('metadata') == job.get('metadata')):
+                    return deepcopy(old)
+                if old['rule'] == job['rule'] and old.get('field_overrides') and job.get('form_schema'):
+                    from upload_sites import form_readiness
+                    job['field_overrides'] = deepcopy(old['field_overrides'])
+                    job['readiness'] = form_readiness(job['form_schema'], effective_rule(job))
+                    job['state'] = 'prepared' if job['readiness']['ready'] else 'draft'
+                job['created_at'] = old['created_at']
+                job['prepare_revision'] = old.get('prepare_revision', 1) + 1
+            if any(j['id'] != key and j['source_hash'] == job['source_hash'] and j['target_site'] == job['target_site']
+                   and j['state'] != 'cancelled' for j in data['upload_jobs'].values()):
+                raise UploadBlocked('This source already has a job on this destination')
+            # Write before the ledger pointer, under its lock; never overwrite a published artifact.
+            job['source_artifact'] = write_artifact(self.artifacts, key, 'source', source)
+            job['prepared_artifact'] = write_artifact(self.artifacts, key, 'prepared', variant)
+            data['upload_jobs'][key] = job
+            group = data['content_groups'].setdefault(signature, {'id': signature, 'hashes': [], 'primary_site': 'BEARBIT'})
+            if job['source_hash'] not in group['hashes']: group['hashes'].append(job['source_hash'])
+            for row in data['torrents']:
+                if infohash(row['client_info'].get('hash')) == job['source_hash']:
+                    row['content_group_id'] = signature
+            return deepcopy(job)
+        return self.store.update(apply)
+
+    def get(self, key):
+        return deepcopy(self.store.read()['upload_jobs'][key])
+
+    def review(self, key):
+        job = self.get(key)
+        public = {k: deepcopy(job[k]) for k in (
+            'id', 'state', 'source_hash', 'source_site', 'source_zone', 'source_node',
+            'target_site', 'target_zone', 'target_category', 'content_group_id', 'prepared_hash',
+            'metadata', 'rule', 'readiness', 'form_schema', 'duplicate_check',
+            'source_verified_at', 'field_overrides', 'created_at', 'updated_at', 'target_hash', 'listing') if k in job}
+        public['target_title'] = upload_title(job)
+        public['effective_fields'] = effective_rule(job).get('fields', {})
+        public['effective_confirmations'] = effective_rule(job).get('confirmations', {})
+        # Artifact files contain announce credentials; expose only their content identity.
+        return public
+
+    def configure_job(self, key, changes):
+        if not isinstance(changes, dict) or set(changes) - {'fields', 'confirmations'}:
+            raise UploadBlocked('Job configuration accepts only fields and confirmations')
+        if any(not isinstance(v, dict) for v in changes.values()):
+            raise UploadBlocked('Job overrides must be dictionaries')
+        def apply(data):
+            from upload_sites import form_readiness
+            job = data['upload_jobs'][key]
+            if job['state'] not in ('draft', 'prepared') or not job.get('form_schema'):
+                raise UploadBlocked('Only an unsubmitted job with a known form can be configured')
+            fields = changes.get('fields', {})
+            confirmations = changes.get('confirmations', {})
+            allowed_ack = set(job['form_schema']['acknowledgements']) - {'ack3'}
+            if set(fields) - set(job['form_schema']['fields']):
+                raise UploadBlocked('Unknown destination field in job override')
+            if set(confirmations) - allowed_ack or any(type(v) is not bool for v in confirmations.values()):
+                raise UploadBlocked('Only the factual form confirmations can be configured')
+            overrides = job.setdefault('field_overrides', {})
+            for section, values in changes.items():
+                overrides.setdefault(section, {}).update(deepcopy(values))
+            readiness = form_readiness(job['form_schema'], effective_rule(job))
+            if readiness['invalid_fields']:
+                raise UploadBlocked('Invalid destination field value in job override')
+            job.update(readiness=readiness, state='prepared' if readiness['ready'] else 'draft', updated_at=stamp())
+        self.store.update(apply)
+        return self.review(key)
+
+    def transition(self, key, expected, state, **fields):
+        if state not in STATES:
+            raise UploadBlocked('Invalid upload state')
+        def apply(data):
+            job = data['upload_jobs'][key]
+            if job['state'] not in expected:
+                raise UploadBlocked('Upload state changed; refusing repeated action')
+            job.update(fields, state=state, updated_at=stamp())
+            return deepcopy(job)
+        return self.store.update(apply)
+
+    @staticmethod
+    def same_configuration(current, expected):
+        keys = ('source_hash', 'source_node', 'save_path', 'prepared_hash', 'metadata', 'rule', 'field_overrides')
+        return all(current.get(k) == expected.get(k) for k in keys)
+
+    def claim_submission(self, key, expected, evidence):
+        def apply(data):
+            current = data['upload_jobs'][key]
+            if current['state'] != 'prepared' or not self.same_configuration(current, expected):
+                raise UploadBlocked('Job configuration changed during preflight; check the job again')
+            current.update(state='submitting', duplicate_check={**evidence, 'checked_at': stamp()}, updated_at=stamp())
+        self.store.update(apply)
+
+    def record_check(self, key, expected, evidence, readiness=None):
+        def apply(data):
+            current = data['upload_jobs'][key]
+            if current['state'] not in ('draft', 'prepared') or not self.same_configuration(current, expected):
+                raise UploadBlocked('Job configuration changed while it was being checked')
+            current['duplicate_check'] = {**evidence, 'checked_at': stamp()}
+            if readiness is not None:
+                current.update(readiness=readiness, state='prepared' if readiness['ready'] else 'draft',
+                               source_verified_at=stamp())
+            current['updated_at'] = stamp()
+        self.store.update(apply)
+
+    def record_publication(self, key, listing):
+        if not str(listing.get('torrent_id', '')).isdigit() or not listing.get('details_url'):
+            raise UploadBlocked('Publication has no verified listing identity')
+        return self.transition(key, {'submitting', 'publication_uncertain'}, 'published', listing=listing)
+
+    def accept_canonical(self, key, content):
+        job = self.get(key); target = _extract_torrent_info_hash(content)
+        if payload_signature(content) != job['content_group_id'] or target == job['source_hash']:
+            raise UploadBlocked('Published torrent payload differs, or hash is unchanged')
+        # Only destination announce hosts; source credentials must not reach the client.
+        from torrent_metainfo import _extract_torrent_manifest
+        from urllib.parse import urlsplit
+        hosts = {'DEDBIT': {'tracker.cab'}, 'BITSUSE': {'bitsuse.com', 'www.bitsuse.com'}}[job['target_site']]
+        from torrent_metainfo import _decode_bencode_value
+        decoded, _ = _decode_bencode_value(content)
+        if decoded[b'info'].get(b'private') != 1 or any(k in decoded for k in (b'url-list', b'httpseeds', b'nodes')):
+            raise UploadBlocked('Canonical torrent is not private or contains alternate data sources')
+        urls = _extract_torrent_manifest(content)['announce_urls']
+        if not urls or any(urlsplit(u).hostname not in hosts or urlsplit(u).scheme not in ('http', 'https')
+                           or urlsplit(u).path != '/announce.php' for u in urls):
+            raise UploadBlocked('Canonical torrent has an unrecognized tracker')
+        def apply(data):
+            current = data['upload_jobs'][key]
+            if current['state'] not in {'published', 'verification_failed'}:
+                raise UploadBlocked('Canonical verification is not allowed in this state')
+            group = data['content_groups'][job['content_group_id']]
+            if (target in group['hashes']
+                    or any(infohash(r['client_info'].get('hash')) == target for r in data['torrents'])):
+                raise UploadBlocked('Canonical hash already belongs to another source or variant')
+            current.update(state='verified', target_hash=target, updated_at=stamp(),
+                canonical_artifact=write_artifact(self.artifacts, key, 'canonical', content))
+            group['hashes'].append(target)
+            listing = current['listing']; site = job['target_site']; tid = str(listing['torrent_id'])
+            site_key = site + ':' + tid
+            previous = data['site_records'].get(site_key)
+            if previous and previous.get('infohash') not in (None, target):
+                raise UploadBlocked('Listing already has another infohash')
+            if not previous:
+                data['site_records'][site_key] = {'site': site, 'torrent_id': tid, 'infohash': target,
+                    'legacy_state': {'hash': target, 'name': job['metadata']['title'],
+                                     'url': listing['details_url']},
+                    'obligations': {k: {'status': 'unknown'} for k in ('hr', 'quest_seed')}}
+            if not any(infohash(r['client_info'].get('hash')) == target for r in data['torrents']):
+                data['torrents'].append({'client_info': {'hash': target, 'name': job['metadata']['title']},
+                    'content_group_id': job['content_group_id'], 'source_site': site, 'source_site_verified': True,
+                    'source_zone_id': job['target_zone'], 'source_zone_verified': True,
+                    'source_zone_evidence': {'method': 'authenticated_upload_canonical_torrent',
+                        'details_url': listing['details_url'], 'verified_at': stamp()},
+                    'variant_info': {'role': 'uploaded_variant', 'original_infohash': job['source_hash'],
+                        'target_site': site, 'target_zone_id': job['target_zone'], 'verified': True},
+                    'site_listings': [{'site_key': site, 'torrent_id': tid, 'details_url': listing['details_url'],
+                                       'zone_id': job['target_zone'], 'verified': True}], 'node_locations': []})
+            return deepcopy(current)
+        return self.store.update(apply)
+
+
+class UploadWorker:
+    """Adapters must supply live metadata/duplicate evidence, never optimistic fallbacks."""
+    def __init__(self, ledger):
+        self.ledger = ledger
+
+    async def check_job(self, key, adapter, client):
+        """Inspect a draft/prepared job without any publication or client mutation."""
+        job = self.ledger.get(key)
+        if job['state'] not in ('draft', 'prepared'):
+            raise UploadBlocked('Only an unsubmitted job can be checked')
+        self.ledger.record_check(key, job, {'status': 'unknown', 'complete': False, 'reason': 'check_in_progress'})
+        live = client.inventory(job['source_hash'])
+        if client.name != job['source_node'] or live.get('save_path') != job['save_path']:
+            raise UploadBlocked('Source client or save path changed')
+        verify_completed(Path(job['source_artifact']).read_bytes(), live, client.files(job['source_hash']))
+        spec = await adapter.load_form(job, require_ready=False)
+        evidence = await adapter.check_duplicates(job)
+        self.ledger.record_check(key, job, evidence, readiness=spec['readiness'])
+        return self.ledger.review(key)
+
+    async def publish(self, key, adapter, client):
+        job = self.ledger.get(key)
+        if job['state'] != 'prepared':
+            raise UploadBlocked('Only prepared jobs can be published; uncertain jobs require reconciliation')
+        # Revalidate live source; Cleaner holds it while this job is active.
+        source = Path(job['source_artifact']).read_bytes()
+        live = client.inventory(job['source_hash'])
+        if client.name != job['source_node'] or live.get('save_path') != job['save_path']:
+            raise UploadBlocked('Source client or save path changed; prepare a new job')
+        verify_completed(source, live, client.files(job['source_hash']))
+        form = await adapter.load_form(job)
+        variant = create_variant(source, job['target_site'], job['target_zone'], job['target_category'], form['announce'])
+        if _extract_torrent_info_hash(variant) != job['prepared_hash']:
+            raise UploadBlocked('Prepared variant no longer matches the rule')
+        evidence = await adapter.check_duplicates(job)
+        if evidence.get('status') != 'clear' or evidence.get('complete') is not True:
+            raise UploadBlocked('Duplicate search found an existing payload or could not complete')
+        # Duplicate search navigates away: refresh nonce and validate fields once more.
+        form = await adapter.load_form(job)
+        variant = create_variant(source, job['target_site'], job['target_zone'], job['target_category'], form['announce'])
+        path = write_artifact(self.ledger.artifacts, key, 'submission', variant)
+        await adapter.fill(job, path)
+        self.ledger.claim_submission(key, job, evidence)
+        try:
+            listing = await adapter.submit(job)
+            self.ledger.record_publication(key, listing)
+        except UploadRejected as exc:
+            self.ledger.transition(key, {'submitting'}, 'prepared',
+                last_submission_failure={'code': exc.code, 'title_limit': exc.title_limit, 'verified_at': stamp()})
+            raise
+        except BaseException:
+            self.ledger.transition(key, {'submitting'}, 'publication_uncertain')
+            raise
+        return await self.verify_publication(key, adapter)
+
+    async def verify_publication(self, key, adapter):
+        job = self.ledger.get(key)
+        try:
+            canonical = await adapter.download_listing(job['listing']['details_url'])
+            return self.ledger.accept_canonical(key, canonical)
+        except Exception:
+            self.ledger.transition(key, {'published', 'verification_failed'}, 'verification_failed')
+            raise
+
+    def seed(self, key, client, resume=False):
+        job = self.ledger.get(key)
+        if job['source_node'] != client.name:
+            raise UploadBlocked('Cross-seed must use the verified source client and save path')
+        if job['state'] == 'verified':
+            live = client.inventory(job['source_hash'])
+            if live.get('save_path') != job['save_path']:
+                raise UploadBlocked('Source save path changed')
+            verify_completed(Path(job['source_artifact']).read_bytes(), live, client.files(job['source_hash']))
+            content = Path(job['canonical_artifact']).read_bytes()
+            if (_extract_torrent_info_hash(content) != job['target_hash']
+                    or payload_signature(content) != job['content_group_id']):
+                raise UploadBlocked('Canonical artifact changed')
+            # Persist before client mutation: never blindly retry an interrupted add.
+            self.ledger.transition(key, {'verified'}, 'adding')
+            try:
+                if client.inventory(job['target_hash'], missing_ok=True) is not None:
+                    raise UploadBlocked('Target hash already exists; reconcile it explicitly')
+                if not client.add_paused(content, job):
+                    raise RuntimeError('Paused add not confirmed')
+                if not client.recheck(job['target_hash']):
+                    raise RuntimeError('Recheck request not confirmed')
+                self.ledger.transition(key, {'adding'}, 'rechecking', recheck_requested_at=stamp())
+                # A later pass must observe checking and then a completed paused state.
+            except BaseException:
+                self.ledger.transition(key, {'adding'}, 'seed_uncertain')
+                raise
+            return self.ledger.get(key)
+        if job['state'] != 'rechecking':
+            return job
+        row = client.inventory(job['target_hash'])
+        state = str(row.get('state', '')).lower()
+        if state.startswith('checking'):
+            return self.ledger.transition(key, {'rechecking'}, 'rechecking', recheck_observed=True)
+        if not job.get('recheck_observed') and not client.recheck_complete(job['target_hash']):
+            return job
+        verify_completed(Path(job['canonical_artifact']).read_bytes(), row, client.files(job['target_hash']))
+        if not resume:
+            return job
+        if not client.resume(job['target_hash']):
+            raise RuntimeError('Resume not confirmed')
+        confirmed = client.inventory(job['target_hash'])
+        verify_completed(Path(job['canonical_artifact']).read_bytes(), confirmed, client.files(job['target_hash']))
+        if str(confirmed.get('state', '')).lower() not in ('uploading', 'stalledup', 'forcedup'):
+            return self.ledger.get(key)
+        def apply(data):
+            current = data['upload_jobs'][key]
+            if current['state'] != 'rechecking':
+                raise UploadBlocked('Seed state changed during verification')
+            for record in data['torrents']:
+                if infohash(record['client_info'].get('hash')) == job['target_hash']:
+                    locations = record.setdefault('node_locations', [])
+                    locations[:] = [loc for loc in locations if loc.get('seedbox_host') != client.name]
+                    locations.append({'seedbox_host': client.name, 'save_path': confirmed['save_path'],
+                        'present': True, 'inventory_verified': True, 'verified_at': stamp(),
+                        'verification_method': 'live_upload_recheck_complete'})
+            current.update(state='seeding', verified_at=stamp(), updated_at=stamp())
+            return deepcopy(current)
+        return self.ledger.store.update(apply)
+
+    def reconcile_seed(self, key, client):
+        job = self.ledger.get(key)
+        if job['state'] not in ('adding', 'seed_uncertain') or client.name != job['source_node']:
+            raise UploadBlocked('Only an uncertain add on its source client can be reconciled')
+        row = client.inventory(job['target_hash'])
+        if row.get('save_path') != job['save_path']:
+            raise UploadBlocked('Existing target save path differs from the verified source')
+        from torrent_metainfo import _extract_torrent_manifest
+        m = _extract_torrent_manifest(Path(job['canonical_artifact']).read_bytes())
+        expected = [(m['root_name'] + '/' + f['path'] if m['multi_file'] else f['path'], f['size_bytes']) for f in m['files']]
+        ordinary = [(m['root_name'] + '/' + f['path'] if m['multi_file'] else f['path'], f['size_bytes'])
+                    for f in m['files'] if not f.get('is_padding')]
+        if sorted((f['path'], f['size_bytes']) for f in client.files(job['target_hash'])) not in (sorted(expected), sorted(ordinary)):
+            raise UploadBlocked('Existing target manifest differs from canonical torrent')
+        if not client.recheck(job['target_hash']):
+            raise RuntimeError('Recheck request not confirmed')
+        return self.ledger.transition(key, {'adding', 'seed_uncertain'}, 'rechecking',
+                                      recheck_requested_at=stamp(), recheck_observed=False)

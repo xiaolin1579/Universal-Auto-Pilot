@@ -175,3 +175,6 @@ torrent_mapping.json
 # Shared mapping transaction and migration artifacts
 torrent_mapping.json.lock
 torrent_mapping.json.pre-central.bak
+
+# Private upload metainfo contains destination passkeys
+/upload_artifacts/
