@@ -105,9 +105,18 @@ python -c "import json; from pathlib import Path; json.loads(Path('config.json')
 
 เปิดเฉพาะเว็บไซต์ โซน และโหนดที่จะใช้งาน ก่อนเปิดการลบหรือเผยแพร่ให้ตรวจเงื่อนไข
 ในแต่ละส่วนด้านล่าง สามารถแก้ config ผ่าน `manage_config.sh` หรือ
-`manage_config.bat` สำหรับเมนูที่สคริปต์รองรับ ส่วนค่าขั้นสูงแก้ใน JSON โดยตรง
-เมนู Node/Global Cleaner ของสคริปต์รองรับ config เดิมเท่านั้น หากใช้ references
-ให้แก้ JSON แล้วตรวจด้วย `python node_config.py config.json`
+`manage_config.bat` ซึ่งใช้เมนู Python ร่วมกันและรองรับทั้ง config เดิมและ references
+จัดการบัญชีเว็บไซต์ โซน การแจ้งเตือน ตัวกรอง node บัญชีร่วม storage และ Cleaner ได้
+ตัวจัดการตรวจ references ก่อนบันทึกและเก็บข้อมูลในรูปแบบเดิมของไฟล์
+
+```bash
+bash manage_config.sh
+bash manage_config.sh --validate
+```
+
+บน Windows ใช้ `.\manage_config.bat` หรือ `.\manage_config.bat --validate`
+เพิ่ม `--config PATH` ได้เมื่อแก้ไฟล์อื่น เช่นไฟล์ทดลอง โดยค่าเริ่มต้นคือ
+`config.json` ในโฟลเดอร์โครงการ ดูรายละเอียดใน [NODE_CONFIG.md](docs/NODE_CONFIG.md)
 
 ## เริ่มใช้งาน
 
@@ -234,6 +243,7 @@ Cleaner ตรวจ H&R/Quest, manual hold และงานอัปโหล
 | [torrent_metainfo.py](torrent_metainfo.py) | อ่าน metainfo ตรวจ payload และสร้าง variant |
 | [storage_telemetry.py](storage_telemetry.py) | ตัวอ่านพื้นที่ Swizzin แบบ quota ก่อน mount |
 | [node_config.py](node_config.py) / [nodes.example.json](nodes.example.json) | ตัวอ่านและตัวอย่าง config โหนดแบบใช้ข้อมูลร่วมกัน |
+| [config_editor.py](config_editor.py) | เมนูแก้ config ร่วมสำหรับ `manage_config.sh` และ `.bat` |
 | `torrent_mapping.json` | ข้อมูล torrent, site records, H&R/Quest, ตำแหน่งไฟล์ และ upload jobs |
 | `stats_history.json` / `stats_cache.json` | สถิติและข้อมูลสำหรับรายงาน |
 | [docs/TORRENT_MAPPING.md](docs/TORRENT_MAPPING.md) | schema การย้ายข้อมูล ภาระการ seed และการเพิ่ม client |

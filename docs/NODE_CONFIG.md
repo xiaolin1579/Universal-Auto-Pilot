@@ -118,7 +118,41 @@ python node_config.py nodes.example.json
 ยังอ้างชื่ออยู่ ระบบเพิ่ม `client_id` เป็น metadata เมื่อ initialize mapping
 แต่ยังไม่ได้ย้าย references เก่าทั้งหมดให้เปลี่ยนชื่อแสดงผลได้อย่างอิสระ
 
-รีโมทยังคงแก้และบันทึก raw config เฉพาะค่าระบบที่รองรับ จึงรักษา references ไว้
-เมนู Node/Global Cleaner ใน `manage_config.sh` และ `.bat` จะหยุดแก้เมื่อพบรูปแบบใหม่
-ให้แก้ JSON โดยตรงแล้วตรวจด้วยคำสั่งด้านบน เมนูเว็บไซต์/ตัวกรองที่ไม่เกี่ยวกับ
-โครงสร้างโหนดยังใช้งานตามเดิม
+## เมนูจัดการ config
+
+`manage_config.sh` และ `manage_config.bat` เรียก [config_editor.py](../config_editor.py)
+ตัวเดียวกัน เมนูรองรับทั้ง config เดิมและแบบ references โดยบันทึก raw document
+และใช้ตัวอ่าน normalize เพื่อตรวจความถูกต้องเท่านั้น จึงไม่กระจายรหัสผ่านกลับลง
+ทุก node หรือเขียน `_storage_reader` ลงไฟล์
+
+```sh
+bash manage_config.sh
+bash manage_config.sh --validate
+bash manage_config.sh --config /path/to/config-test.json --validate
+```
+
+บน Windows ใช้ `manage_config.bat` พร้อม arguments เดียวกัน หรือเรียก Python โดยตรง:
+
+```sh
+python config_editor.py --config config.json
+python config_editor.py --config config.json --validate
+```
+
+ตัวเปิดโปรแกรมเลือก Python ใน `venv`/`.venv` ก่อน แล้วจึงค้นหา Python ของระบบ
+ต้องใช้ Python 3.10 ขึ้นไป ไม่ติดตั้งหรือถอนแพ็กเกจเมื่อเปิดตัวจัดการ
+
+เมนูแยกการแก้บัญชีเว็บไซต์/โซน การแจ้งเตือน ตัวกรอง Cleaner และ node
+สำหรับ config แบบ references มีเมนูจัดการ `CREDENTIALS` และ `STORAGES` เพิ่มเติม
+การแก้ข้อมูลร่วมมีผลต่อทุก node ที่อ้างรายการนั้น ตรวจชื่อ node ที่เกี่ยวข้องก่อนบันทึก
+รหัสผ่านและ token ไม่แสดงค่าเดิม และกรอกผ่านช่องรับข้อมูลแบบซ่อนตัวอักษร
+
+การบันทึกจะตรวจ config ก่อนแทนที่ไฟล์แบบ atomic และเก็บฉบับก่อนแก้ไว้ที่
+`config.json.editor.bak` หากเลือกไฟล์ชื่ออื่น backup จะใช้ชื่อไฟล์นั้นตามด้วย
+`.editor.bak` ไฟล์ backup มีข้อมูลบัญชีและถูกยกเว้นจาก Git เช่นเดียวกับ config
+หากพบว่ามีโปรเซสอื่นแก้ config ระหว่างเปิดเมนู จะปฏิเสธการบันทึกทับ
+
+การลบบัญชี/storage หรือ node ที่ยังถูก `via_node` อ้างถึงจะต้องแก้ references
+ให้ครบก่อน จึงจะบันทึกได้ การเปลี่ยน `id`/ชื่อของ node เดิมยังไม่เปิดให้ทำผ่านเมนู
+เพราะ mapping และงานเก่าต้องใช้ชื่อเดิม การแก้ไฟล์ config ไม่ลบ torrent หรือไฟล์บน seedbox
+
+รีโมทยังคงแก้และบันทึก raw config เฉพาะค่าระบบที่รองรับ จึงรักษา references ไว้เช่นกัน
