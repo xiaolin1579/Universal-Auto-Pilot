@@ -109,6 +109,11 @@ def search_zones(site_config, targets, zone_metadata, max_queries=3):
             cats = [key[1:] for key, values in controls.items() if re.fullmatch(r'c\d+', key) and values[-1] == '1']
             if site == 'torrentdd' and 'cate' in controls:
                 cats = controls['cate'][-1].split(',')
+            if site == 'unlimitz':
+                if 'cat' in controls and controls['cat'][-1] != '0':
+                    cats = [controls['cat'][-1]]
+                if 'blah' in controls:
+                    url_filters['searchin'] = controls['blah'][-1]
             if cats:
                 url_filters['selected_cats'] = cats
             if 'freeload' in controls:

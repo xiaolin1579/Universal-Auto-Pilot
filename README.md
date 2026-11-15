@@ -11,7 +11,7 @@ Cross-Seed โดยใช้ `torrent_mapping.json` เป็นฐานข้
 - **ขอบคุณและโหวต** ตามฟังก์ชันที่เว็บไซต์รองรับ
 - **Torrent mapping กลาง** เชื่อมรายการเว็บไซต์กับ infohash ตำแหน่งไฟล์บน client
   ภาระ H&R/Quest Seed ความสัมพันธ์ Cross-Seed และคิวอัปโหลด
-- **Cross-Seed** ค้นหาในโซนที่เปิดไว้ของ BearBit, Bitsuse, Dedbit และ TorrentDD พร้อมลองคำค้น
+- **Cross-Seed** ค้นหาในโซนที่เปิดไว้ของ BearBit, Bitsuse, Dedbit, TorrentDD และ Unlimitz พร้อมลองคำค้น
   สำรองที่คงรหัสตอน/รหัสไฟล์ และตรวจ manifest ก่อนเพิ่มงาน
 - **Auto Upload และ Cross-Seed** จาก BearBit โซนปกติไป Dedbit และโซนพิเศษไป Bitsuse
   ใช้รายละเอียดจากต้นฉบับ สร้าง infohash แยก และตรวจไฟล์ก่อนเริ่ม seed
@@ -122,6 +122,8 @@ bash manage_config.sh --validate
 แม้ปิดการแสดงรูป ใช้ OCR สองรุ่นและขอภาพใหม่ได้สูงสุด 5 รอบ โดยส่งข้อมูลบัญชี
 เมื่อเว็บยืนยัน CAPTCHA แล้วเท่านั้น จากนั้นตรวจชื่อบัญชีและลิงก์ออกจากระบบบนหน้า
 สมาชิก หากเว็บปฏิเสธการล็อกอินจะหยุดรอบนั้นโดยไม่ส่งข้อมูลบัญชีซ้ำ
+การค้นหาและตรวจไฟล์ Cross-Seed ของเว็บนี้อธิบายใน
+[UNLIMITZ_CROSS_SEED.md](docs/UNLIMITZ_CROSS_SEED.md)
 
 ## เริ่มใช้งาน
 

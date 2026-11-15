@@ -233,7 +233,13 @@ async def login(page, site_cfg, *, primary_ocr=None, max_captcha_attempts=5):
                 or not site_cfg.get("username") or not site_cfg.get("password")):
             return False
         for attempt in range(min(max_captcha_attempts, 5)):
+            if attempt:
+                # Unlimitz returns a SPAM page when login.php is reloaded within 10s.
+                await asyncio.sleep(10)
             state = await _navigate(page, ORIGIN + "/login.php")
+            if "SPAM Wait 10 seconds" in state.get("html", ""):
+                await asyncio.sleep(10)
+                state = await _navigate(page, ORIGIN + "/login.php")
             if session_is_authenticated(state.get("html", ""), state.get("url", ""), site_cfg["username"]):
                 print("✅ [UNLIMITZ] ยืนยัน session สมาชิกแล้ว")
                 return True

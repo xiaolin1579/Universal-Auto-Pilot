@@ -54,6 +54,7 @@ from storage_telemetry import parse_size_gib, read_swizzin_storage_stats
 from node_config import load_config as load_node_config
 import torrentdd_cross_seed
 import unlimitz_login
+import unlimitz_cross_seed
 # Metainfo parsing is shared with the auto-upload worker.
 from torrent_metainfo import (
     _bencode_value_end, _decode_bencode_value, _torrent_text,
@@ -7174,42 +7175,7 @@ async def _extract_dedbit_logic(row, base_url, dl_session, headers, checked_cach
     }    
 
 async def _extract_unlimitz_logic(row, base_url, dl_session, headers, checked_cache):
-    tds = row.find_all("td")
-    if len(tds) < 12: return None
-
-    # 1. สกัด ID & Title
-    title_tag = tds[1].find("a", href=re.compile(r"details\.php"))
-    t_id = re.search(r"id=(\d+)", title_tag['href']).group(1) if title_tag else None
-    title = title_tag.get_text(strip=True) if title_tag else "Unknown"
-    details_url = f"{base_url.rstrip('/')}/details.php?id={t_id}"
-
-    # 2. สกัดเวลา (อยู่ใน tds[7] มี tag <nobr>)
-    # ข้อมูลดิบ: 2026-07-04<br />10:15:22
-    raw_date = tds[7].get_text(separator=' ', strip=True) 
-
-    # 3. สกัด Stats (Seed/Leech)
-    # tds[10] = Seeders, tds[11] = Leechers
-    seeders = extract_digit(tds[10])
-    leechers = extract_digit(tds[11])
-    
-    # 4. สกัด Size (tds[8])
-    size_str = tds[8].get_text(separator=' ', strip=True).replace(" ", "")
-
-    # 5. สกัด Download URL (tds[2])
-    dl_tag = tds[2].find("a", href=re.compile(r"/d\.php"))
-    download_url = f"{base_url.rstrip('/')}/{dl_tag['href'].lstrip('/')}" if dl_tag else None
-
-    return {
-        "id": t_id,
-        "title": title,
-        "seeders": seeders,
-        "leechers": leechers,
-        "completed": 0, # Unlimitz ไม่มีคอลัมน์นี้ชัดเจน
-        "size_str": size_str,
-        "raw_date": raw_date,
-        "download_url": download_url,
-        "details_url": details_url
-    }
+    return unlimitz_cross_seed.extract_row(row, base_url)
 
 async def _extract_torrentdd_logic(row, base_url, dl_session, headers, checked_cache):
     return torrentdd_cross_seed.extract_row(row, base_url)
@@ -7383,6 +7349,9 @@ class ResponseWrapper:
         self.headers = {} # ถ้าต้องใช้ headers ให้ดึงมาใส่ด้วย
 
 async def download_torrent_smart(tab, details_url, download_url):
+    if any((urlsplit(str(url or '')).hostname or '').casefold() in unlimitz_cross_seed.HOSTS
+           for url in (details_url, download_url)):
+        return await unlimitz_cross_seed.download_candidate(tab, details_url, download_url)
     if any((urlsplit(str(url or "")).hostname or "").casefold()
            in {"torrentdd.com", "www.torrentdd.com"} for url in (details_url, download_url)):
         return await torrentdd_cross_seed.download_candidate(tab, details_url, download_url)
@@ -9160,6 +9129,12 @@ def build_search_url(
 
     site_key = str(site_name or "").strip().lower()
 
+    if site_key == 'unlimitz':
+        if bonus_upload or sortby or quality_options or subcat2:
+            return None
+        return unlimitz_cross_seed.build_search_url(search_keyword, selected_cats=selected_cats,
+            target_path=target_path, incldead=incldead, searchin=searchin, freeload=freeload)
+
     if site_key == "torrentdd":
         return torrentdd_cross_seed.build_search_url(
             search_keyword, selected_cats=selected_cats,
@@ -9831,6 +9806,9 @@ async def _read_cross_seed_filelist(browser_tab, site, torrent_id, details_url):
     units are both considered when the site labels units ambiguously).
     """
     from urllib.parse import urlsplit, urlunsplit, urlencode
+
+    if str(site or '').strip().casefold() == 'unlimitz':
+        return await unlimitz_cross_seed.read_filelist(browser_tab, torrent_id, details_url)
 
     if str(site or "").strip().casefold() == "torrentdd":
         return await torrentdd_cross_seed.read_filelist(browser_tab, torrent_id, details_url)
@@ -11031,6 +11009,9 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                         if str(site).strip().casefold() == "torrentdd":
                             current_url = await site_page.evaluate('window.location.href')
                             torrentdd_cross_seed.validate_search_page(soup, current_url, target_url)
+                        if str(site).strip().casefold() == 'unlimitz':
+                            current_url = await site_page.evaluate('window.location.href')
+                            unlimitz_cross_seed.validate_search_page(soup, current_url, target_url)
 
                         # -----------------------------------------------------
                         # สำคัญ:
@@ -11141,7 +11122,9 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                         # Match each TorrentDD listing inside its result table;
                         # userdetails.php links and sidebar widgets are not torrents.
                         rows = torrentdd_cross_seed.search_rows(soup)
-                    for a in ([] if str(site).strip().casefold() == "torrentdd" else all_details):
+                    if str(site).strip().casefold() == 'unlimitz':
+                        rows = unlimitz_cross_seed.search_rows(soup)
+                    for a in ([] if str(site).strip().casefold() in {'torrentdd', 'unlimitz'} else all_details):
                         if stop_event.is_set(): 
                             break
                         link_title = a.get_text(strip=True)
