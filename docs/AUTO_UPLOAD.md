@@ -99,7 +99,9 @@ The.Silent.Storm.2026.S01E10.4K.TORRENTDD.torrent
 ขั้นตอนใช้ basename เดียวกัน เพื่อให้ source/prepared/submission/canonical ไม่เขียนทับกัน
 ไฟล์ที่แนบส่งขึ้นเว็บใช้ชื่อใหม่นี้ด้วย ส่วน artifact เดิมยังอ่านจาก path ที่เก็บใน mapping ได้
 
-1. ตรวจ listing ของ BearBit กับ hash จริง และยืนยันว่าพบ listing ในหน้าค้นหาของโซนที่กำหนด
+1. ตรวจ listing ของ BearBit กับ hash จริง และยืนยันว่าพบ ID ต้นฉบับในตารางผลค้นหาของโซนที่กำหนด
+   ค้นทั้งชื่อไฟล์และชื่อประกาศ พร้อมตามหน้าถัดไปที่คงคำค้นและตัวกรองเดิม รวมไม่เกิน 12 หน้า
+   ต่องาน หากยังยืนยันไม่ได้จะหยุด ไม่ใช้เพียงลิงก์หมวดหรือรายการในส่วนอื่นของหน้าเป็นหลักฐาน
 2. ตรวจว่าต้นทางโหลดครบ พร้อมตรวจขนาดรวมและชื่อ/ขนาดไฟล์ทุกไฟล์จาก client สด
 3. สร้าง `.torrent` สำหรับปลายทางโดยคงชื่อไฟล์ ขนาด piece length และ piece hashes
    แล้วกำหนด `info.source` แยกตามเว็บ/โซน/หมวด และ `private=1` จึงได้ infohash ต่างจากต้นทาง
@@ -117,6 +119,9 @@ The.Silent.Storm.2026.S01E10.4K.TORRENTDD.torrent
 แม้ qBittorrent ไม่แสดง padding ใน files API หากเป็น v2/hybrid, symlink หรือ client
 ที่ยังไม่มี capability นี้จะหยุดขั้นตอน ไม่เดาว่าไฟล์ตรงกัน rTorrent ยังคงใช้ระบบเดิมได้
 แต่ยังไม่รองรับการเพิ่มงานจากคิวอัปโหลดนี้
+ระบบตรวจไฟล์ต้นทางก่อนเปิดฟอร์มปลายทาง และแสดงขั้นตอนที่ติดพร้อมเหตุผลที่ปลอดภัยใน log
+เช่น `source manifest: v2/hybrid source unsupported; Auto Upload requires v1`
+ข้อผิดพลาดที่ไม่รู้จักจะแสดงเฉพาะขั้นตอนและชนิด exception เพื่อไม่เปิดเผย URL หรือ passkey
 
 ค่าต่าง ๆ แยกเปิดได้: `enable` เปิดรอบทำงาน, `enable_publish` อนุญาตส่งฟอร์ม,
 `enable_seed` อนุญาตเพิ่มงานและ recheck, `enable_resume` อนุญาตเริ่ม seed หลังตรวจครบ
@@ -131,6 +136,11 @@ browser profile เดียวกัน
 หากพบ piece stream เดียวกันแม้เปลี่ยนชื่อจะถือว่าซ้ำ หาก manifest ของไฟล์ปกติตรงกัน
 แต่ padding/piece length ต่างกัน หรือพบไฟล์ใหญ่เดียวกันใน pack จะเป็น `possible_duplicate`
 และหยุดรอตรวจสอบ ไม่ยืนยันว่าไม่มีรายการซ้ำ
+เมื่อหยุดก่อนส่ง ระบบแยก log เป็น `Duplicate payload already exists` เมื่อพบ payload ซ้ำ,
+`Possible duplicate payload requires review` เมื่อยังต้องตรวจสอบ หรือ `Duplicate search incomplete`
+เมื่อค้นหาไม่ครบ พร้อมเลขรายการที่พบหรือเหตุผล เช่น เกินจำนวนหน้าที่กำหนด
+บันทึกหลักฐานและเวลาตรวจล่าสุดไว้ใน `upload_jobs.<job_id>.duplicate_check` แม้งานยังเป็น `prepared`
+ดูผ่าน `show JOB_ID` ได้ การพบงานซ้ำจะไม่ส่งฟอร์มหรือเปลี่ยนเป็น `seeding` อัตโนมัติ
 
 ## คำสั่ง
 

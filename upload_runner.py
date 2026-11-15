@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from urllib.parse import urlsplit
 from auto_upload import UploadLedger, UploadWorker, select_rule, select_rules, PUBLISH_CONFIRMATIONS
+from torrent_metainfo import verify_completed
 from upload_sites import BrowserSite
 
 
@@ -60,19 +61,41 @@ async def prepare_job(app, session, node, source_hash, details_url, zone, target
 
 
 async def _prepare_destination(app, session, client, source_hash, metadata, content, rule):
-    # Destination form must be current and compatible before an artifact is prepared.
-    dest = await session.adapter(rule['target_site'])
-    spec = await dest.load_form({'target_site': rule['target_site'], 'target_zone': metadata['zone'], 'metadata': metadata,
-                                'target_category': str(rule['target_category']), 'rule': rule}, require_ready=False)
-    inventory, files = await asyncio.to_thread(lambda: (client.inventory(source_hash), client.files(source_hash)))
-    ledger = ledger_for(app)
-    job = await asyncio.to_thread(ledger.prepare, content, inventory, files, metadata, rule,
-                                   spec['announce'], readiness=spec['readiness'], form_schema=spec)
-    if (app.CFG.get('AUTO_UPLOAD', {}).get('enable_publish') is True
-            and job['state'] in ('draft', 'prepared')):
-        await asyncio.to_thread(ledger.confirm_for_publish, job['id'])
-        job = ledger.get(job['id'])
-    return job
+    stage = 'source inventory'
+    try:
+        inventory, files = await asyncio.to_thread(lambda: (client.inventory(source_hash), client.files(source_hash)))
+        stage = 'source manifest'
+        verify_completed(content, inventory, files)
+        stage = 'destination login'
+        dest = await session.adapter(rule['target_site'])
+        stage = 'destination form'
+        spec = await dest.load_form({'target_site': rule['target_site'], 'target_zone': metadata['zone'], 'metadata': metadata,
+                                    'target_category': str(rule['target_category']), 'rule': rule}, require_ready=False)
+        stage = 'prepare artifacts'
+        ledger = ledger_for(app)
+        job = await asyncio.to_thread(ledger.prepare, content, inventory, files, metadata, rule,
+                                       spec['announce'], readiness=spec['readiness'], form_schema=spec)
+        if (app.CFG.get('AUTO_UPLOAD', {}).get('enable_publish') is True
+                and job['state'] in ('draft', 'prepared')):
+            stage = 'publication confirmations'
+            await asyncio.to_thread(ledger.confirm_for_publish, job['id'])
+            job = ledger.get(job['id'])
+        return job
+    except Exception as exc:
+        safe_reasons = {
+            'Auto-upload currently supports v1 torrents only': 'v2/hybrid source unsupported; Auto Upload requires v1',
+            **{text: text for text in (
+                'Missing v1 piece hashes', 'Piece count does not match file sizes',
+                'Symlinks need a dedicated client adapter',
+                'Source is incomplete or does not match the exported torrent',
+                'Source file inventory unavailable',
+                'One or more source files are incomplete, including deselected files',
+                'Source client file paths or sizes do not match metainfo',
+                'Unsupported upload route or category', 'Unrecognized target announce',
+                'Variant did not preserve payload with a distinct hash')},
+        }
+        reason = str(exc) if isinstance(exc, UploadBlocked) else safe_reasons.get(str(exc), type(exc).__name__)
+        raise UploadBlocked(stage + ': ' + reason) from None
 
 
 def enabled_rule(cfg, job):

@@ -42,6 +42,30 @@ def upload_filename(job):
 ROUTES = UPLOAD_TARGETS
 PUBLISH_CONFIRMATIONS = {'DEDBIT': {'ack2', 'ack4'}, 'BITSUSE': {'ack2'},
                          'TORRENTDD': {'cf1', 'cf2'}}
+
+
+def duplicate_block_reason(evidence, site):
+    """Log only controlled result codes and a numeric listing ID, never raw URLs."""
+    listing = evidence.get('listing') or {}
+    torrent_id = str(listing.get('torrent_id', '')) if isinstance(listing, dict) else ''
+    destination = site if site in PUBLISH_CONFIRMATIONS else 'destination'
+    match = ' (' + destination + ' #' + torrent_id + ')' if re.fullmatch(r'[0-9]{1,20}', torrent_id) else ''
+    if evidence.get('status') == 'duplicate':
+        return 'Duplicate payload already exists' + match
+    if evidence.get('status') == 'possible_duplicate':
+        return 'Possible duplicate payload requires review' + match
+    reasons = {
+        'page_budget_exceeded': 'page budget exceeded',
+        'candidate_budget_exceeded': 'candidate budget exceeded',
+        'search_page_unverified': 'search page could not be verified',
+        'unrecognized_result_row': 'result row could not be parsed',
+        'empty_result_section_unverified': 'empty result section could not be verified',
+        'pagination_query_unverified': 'pagination filters could not be verified',
+    }
+    reason = reasons.get(evidence.get('reason'), 'results could not be fully verified')
+    return 'Duplicate search incomplete: ' + reason
+
+
 def select_rules(rules, metadata):
     """Select one explicit category rule per destination for a verified source."""
     zone = metadata.get('zone')
@@ -368,9 +392,11 @@ class UploadWorker:
         variant = create_variant(source, job['target_site'], job['target_zone'], job['target_category'], form['announce'])
         if _extract_torrent_info_hash(variant) != job['prepared_hash']:
             raise UploadBlocked('Prepared variant no longer matches the rule')
+        self.ledger.record_check(key, job, {'status': 'unknown', 'complete': False, 'reason': 'check_in_progress'})
         evidence = await adapter.check_duplicates(job)
         if evidence.get('status') != 'clear' or evidence.get('complete') is not True:
-            raise UploadBlocked('Duplicate search found an existing payload or could not complete')
+            self.ledger.record_check(key, job, evidence)
+            raise UploadBlocked(duplicate_block_reason(evidence, job['target_site']))
         # Duplicate search navigates away: refresh nonce and validate fields once more.
         form = await adapter.load_form(job)
         variant = create_variant(source, job['target_site'], job['target_zone'], job['target_category'], form['announce'])

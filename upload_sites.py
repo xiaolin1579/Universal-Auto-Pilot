@@ -309,6 +309,16 @@ def navigation_query(url):
     return values
 
 
+def source_query(url):
+    values = navigation_query(url)
+    values.pop('page', None)
+    # BearBit pagination omits default sortby=0 (observed on live browse).
+    for name in ('sortby', 'searchin', 'cat'):
+        if values.get(name) == ['0']:
+            values.pop(name)
+    return values
+
+
 class BrowserSite:
     def __init__(self, site, tab, enabled_paths=None):
         self.site, self.tab = site, tab
@@ -404,7 +414,7 @@ class BrowserSite:
         _extract_torrent_info_hash(content)
         return content
 
-    async def read_source(self, url, source_hash, zone):
+    async def read_source(self, url, source_hash, zone, max_pages=12):
         if self.site != 'BEARBIT' or zone not in SITES['BEARBIT'][2]:
             raise UploadBlocked('Unsupported source')
         html, current = await self.open(url)
@@ -422,27 +432,50 @@ class BrowserSite:
         root_name = _extract_torrent_manifest(content)['root_name']
         keywords = source_search_keywords({**metadata, 'root_name': root_name})
         found = False
+        pages = 0
         for keyword in keywords:
             query = self.origin + path + '?' + urlencode({'search': keyword, 'incldead': 1, 'searchin': 0, 'sortby': 0})
-            html, actual = await self.open(query)
-            trusted_url('BEARBIT', actual)
-            if urlsplit(actual).path != path or navigation_query(actual) != navigation_query(query):
-                raise UploadBlocked('BearBit zone search redirected')
-            soup = BeautifulSoup(html, 'html.parser')
-            if not soup.select_one('input[name="search"]'):
-                raise UploadBlocked('BearBit zone search form not recognized')
-            category_in_zone = any(a.get_text(' ', strip=True) == metadata['category']
-                                   and urlsplit(urljoin(actual, a.get('href', ''))).path == path
-                                   for a in soup.select('a.catlink[href]'))
-            if not category_in_zone:
-                raise UploadBlocked('Source category is not present in this BearBit zone')
-            ids = set()
-            for a in soup.select('table.bb-btable a[href]'):
-                link = urljoin(actual, a['href'])
-                try: ids.add(listing_identity('BEARBIT', link)['torrent_id'])
-                except ValueError: pass
-            if listing['torrent_id'] in ids:
-                found = True
+            pending = [query]; seen = set()
+            while pending:
+                requested = pending.pop(0)
+                if requested in seen: continue
+                if pages >= max_pages:
+                    raise UploadBlocked('Source zone search page budget exhausted; membership remains unverified')
+                seen.add(requested); pages += 1
+                html, actual = await self.open(requested)
+                trusted_url('BEARBIT', actual)
+                if (urlsplit(actual).path != path or source_query(actual) != source_query(query)
+                        or navigation_query(actual).get('page') != navigation_query(requested).get('page')):
+                    raise UploadBlocked('BearBit zone search redirected')
+                soup = BeautifulSoup(html, 'html.parser')
+                if not soup.select_one('input[name="search"]'):
+                    raise UploadBlocked('BearBit zone search form not recognized')
+                category_in_zone = any(a.get_text(' ', strip=True) == metadata['category']
+                                       and urlsplit(urljoin(actual, a.get('href', ''))).path == path
+                                       for a in soup.select('a.catlink[href]'))
+                if not category_in_zone:
+                    raise UploadBlocked('Source category is not present in this BearBit zone')
+                ids = set()
+                for a in soup.select('table.bb-btable a[href]'):
+                    link = urljoin(actual, a['href'])
+                    try: ids.add(listing_identity('BEARBIT', link)['torrent_id'])
+                    except ValueError: pass
+                if listing['torrent_id'] in ids:
+                    found = True
+                    break
+                for anchor in soup.select('a[href]'):
+                    link = urljoin(actual, anchor['href']); parsed = urlsplit(link)
+                    values = parse_qs(parsed.query)
+                    page = values.get('page', [])
+                    if (parsed.path != path or len(page) != 1 or not page[0].strip().isdigit()
+                            or source_query(link) != source_query(query)):
+                        continue
+                    try: trusted_url('BEARBIT', link)
+                    except ValueError: continue
+                    values['page'] = [str(int(page[0].strip()))]
+                    link = parsed._replace(query=urlencode(values, doseq=True), fragment='').geturl()
+                    if link not in seen and link not in pending: pending.append(link)
+            if found:
                 break
         if not found:
             raise UploadBlocked('Source listing membership in this BearBit zone could not be verified')
@@ -490,7 +523,7 @@ class BrowserSite:
                 seen.add(url); page_count += 1
                 html, actual = await self.open(url); soup = BeautifulSoup(html, 'html.parser')
                 if urlsplit(actual).path != path or not soup.select_one('input[name="search"]'):
-                    return {'status': 'unknown', 'complete': False}
+                    return {'status': 'unknown', 'complete': False, 'reason': 'search_page_unverified'}
                 candidates = set(); titles = {}
                 tables = soup.select('table.torrenttable')
                 for table in tables:
@@ -507,12 +540,12 @@ class BrowserSite:
                     link = urljoin(actual, a['href']); p = urlsplit(link); q = parse_qs(p.query)
                     if p.path == path and 'page' in q and p.hostname == urlsplit(self.origin).hostname:
                         if q.get('search') != [keyword]:
-                            return {'status': 'unknown', 'complete': False}
+                            return {'status': 'unknown', 'complete': False, 'reason': 'pagination_query_unverified'}
                         trusted_url(self.site, link)
                         if link not in seen and link not in pending: pending.append(link)
                 # A search form alone does not prove its result section loaded successfully.
                 if not candidates and not re.search(r'ไม่พบ|ไม่มีทอร์เรนต์|ไม่เจอ|No torrents|Nothing found', soup.get_text(' ', strip=True), re.I):
-                    return {'status': 'unknown', 'complete': False}
+                    return {'status': 'unknown', 'complete': False, 'reason': 'empty_result_section_unverified'}
                 for url in sorted(candidates):
                     if url in checked: continue
                     if not any(candidate_relevant(job['metadata'], title) for title in titles.get(url, [''])):
