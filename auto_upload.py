@@ -40,6 +40,8 @@ def upload_filename(job):
 
 
 ROUTES = UPLOAD_TARGETS
+PUBLISH_CONFIRMATIONS = {'DEDBIT': {'ack2', 'ack4'}, 'BITSUSE': {'ack2'},
+                         'TORRENTDD': {'cf1', 'cf2'}}
 def select_rules(rules, metadata):
     """Select one explicit category rule per destination for a verified source."""
     zone = metadata.get('zone')
@@ -225,6 +227,20 @@ class UploadLedger:
         self.store.update(apply)
         return self.review(key)
 
+    def confirm_for_publish(self, key):
+        """Called only when the operator explicitly enables publication.
+
+        ack3 is derived from a fresh duplicate check by the worker, never here.
+        Keep the stored rule intact so disabling/changing it still blocks jobs.
+        """
+        job = self.get(key)
+        if job['state'] not in ('draft', 'prepared') or not job.get('form_schema'):
+            raise UploadBlocked('Only an unsubmitted job with a known form can be confirmed')
+        factual = set(job['form_schema']['acknowledgements']) - {'ack3'}
+        if not factual <= PUBLISH_CONFIRMATIONS.get(job['target_site'], set()):
+            raise UploadBlocked('Destination confirmations changed; inspect the upload form')
+        return self.configure_job(key, {'confirmations': {name: True for name in factual}})
+
     def transition(self, key, expected, state, **fields):
         if state not in STATES:
             raise UploadBlocked('Invalid upload state')
@@ -316,8 +332,9 @@ class UploadLedger:
 
 class UploadWorker:
     """Adapters must supply live metadata/duplicate evidence, never optimistic fallbacks."""
-    def __init__(self, ledger):
+    def __init__(self, ledger, *, enable_publish=False):
         self.ledger = ledger
+        self.enable_publish = enable_publish is True
 
     async def check_job(self, key, adapter, client):
         """Inspect a draft/prepared job without any publication or client mutation."""
@@ -336,6 +353,9 @@ class UploadWorker:
 
     async def publish(self, key, adapter, client):
         job = self.ledger.get(key)
+        if self.enable_publish and job['state'] in ('draft', 'prepared'):
+            self.ledger.confirm_for_publish(key)
+            job = self.ledger.get(key)
         if job['state'] != 'prepared':
             raise UploadBlocked('Only prepared jobs can be published; uncertain jobs require reconciliation')
         # Revalidate live source; Cleaner holds it while this job is active.

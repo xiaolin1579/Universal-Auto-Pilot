@@ -34,7 +34,8 @@ def parser():
 
 async def execute(args, app):
     await app.initialize_mapping()
-    ledger = ledger_for(app); worker = UploadWorker(ledger); cfg = app.CFG.get('AUTO_UPLOAD', {})
+    ledger = ledger_for(app); cfg = app.CFG.get('AUTO_UPLOAD', {})
+    worker = UploadWorker(ledger, enable_publish=cfg.get('enable_publish') is True)
     if args.command == 'status':
         return [{'id': j['id'], 'state': j['state'], 'source_hash': j['source_hash'],
                  'target_site': j['target_site'], 'target_category': j['target_category'],

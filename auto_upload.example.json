@@ -17,8 +17,7 @@
           "c3dub": "กรอกภาษาพากย์ตามข้อมูลต้นฉบับ",
           "c3sub": "กรอกภาษาคำบรรยายตามข้อมูลต้นฉบับ",
           "c35res": "1080i/p"
-        },
-        "confirmations": {"ack2": false, "ack4": false}
+        }
       },
       {
         "enable": false,
@@ -30,8 +29,7 @@
           "c100type": "",
           "c100type2": "",
           "c100cat": ""
-        },
-        "confirmations": {"ack2": false}
+        }
       },
       {
         "enable": false,
@@ -39,8 +37,7 @@
         "source_category": "กรอกชื่อหมวด BearBit ของงานจริงก่อนเปิดใช้ตัวอย่าง TorrentDD",
         "target_site": "TORRENTDD",
         "target_category": "19",
-        "fields": {},
-        "confirmations": {"cf1": false, "cf2": false}
+        "fields": {}
       },
       {
         "enable": false,
@@ -48,8 +45,7 @@
         "source_category": "กรอกชื่อหมวด BearBit ของงานจริงก่อนเปิดใช้ตัวอย่าง TorrentDD",
         "target_site": "TORRENTDD",
         "target_category": "35",
-        "fields": {},
-        "confirmations": {"cf1": false, "cf2": false}
+        "fields": {}
       }
     ]
   }

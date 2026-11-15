@@ -4,7 +4,7 @@ import asyncio
 import os
 from pathlib import Path
 from urllib.parse import urlsplit
-from auto_upload import UploadLedger, UploadWorker, select_rule, select_rules
+from auto_upload import UploadLedger, UploadWorker, select_rule, select_rules, PUBLISH_CONFIRMATIONS
 from upload_sites import BrowserSite
 
 
@@ -65,19 +65,41 @@ async def _prepare_destination(app, session, client, source_hash, metadata, cont
     spec = await dest.load_form({'target_site': rule['target_site'], 'target_zone': metadata['zone'], 'metadata': metadata,
                                 'target_category': str(rule['target_category']), 'rule': rule}, require_ready=False)
     inventory, files = await asyncio.to_thread(lambda: (client.inventory(source_hash), client.files(source_hash)))
-    return await asyncio.to_thread(ledger_for(app).prepare, content, inventory, files, metadata, rule,
+    ledger = ledger_for(app)
+    job = await asyncio.to_thread(ledger.prepare, content, inventory, files, metadata, rule,
                                    spec['announce'], readiness=spec['readiness'], form_schema=spec)
+    if (app.CFG.get('AUTO_UPLOAD', {}).get('enable_publish') is True
+            and job['state'] in ('draft', 'prepared')):
+        await asyncio.to_thread(ledger.confirm_for_publish, job['id'])
+        job = ledger.get(job['id'])
+    return job
 
 
 def enabled_rule(cfg, job):
     # Disabling or changing a rule invalidates publication of its older prepared jobs.
-    return any(r.get('enable') is True and r == job['rule'] for r in cfg.get('rules', []))
+    def normalized(rule):
+        if not isinstance(rule, dict):
+            return None
+        result = dict(rule)
+        if cfg.get('enable_publish') is True:
+            confirmations = result.get('confirmations', {})
+            if (not isinstance(confirmations, dict)
+                    or set(confirmations) - PUBLISH_CONFIRMATIONS.get(job['target_site'], set())
+                    or any(type(value) is not bool for value in confirmations.values())):
+                return None
+            result.pop('confirmations', None)
+        return result
+    expected = normalized(job['rule'])
+    return expected is not None and any(isinstance(r, dict) and r.get('enable') is True
+        and normalized(r) == expected for r in cfg.get('rules', []))
 
 
 async def run_cycle(app, active_nodes):
     cfg = app.CFG.get('AUTO_UPLOAD', {})
     if cfg.get('enable') is not True: return []
-    ledger = ledger_for(app); worker = UploadWorker(ledger); session = UploadSession(app)
+    ledger = ledger_for(app)
+    worker = UploadWorker(ledger, enable_publish=cfg.get('enable_publish') is True)
+    session = UploadSession(app)
     nodes = {node.name: node for node, _ in active_nodes}
     outcomes = []
     limit = max(1, min(int(cfg.get('max_jobs_per_cycle', 1)), 10))
@@ -85,14 +107,16 @@ async def run_cycle(app, active_nodes):
         # Continue existing durable jobs first. Ambiguous POST/add states never auto-retry.
         for job in ledger.store.read()['upload_jobs'].values():
             if len(outcomes) >= limit: return outcomes
-            if job['state'] in ('draft', 'seeding', 'cancelled', 'publication_uncertain', 'submitting', 'adding', 'seed_uncertain'):
+            if job['state'] in ('seeding', 'cancelled', 'publication_uncertain', 'submitting', 'adding', 'seed_uncertain'):
+                continue
+            if job['state'] == 'draft' and cfg.get('enable_publish') is not True:
                 continue
             node = nodes.get(job['source_node'])
             if node is None or not enabled_rule(cfg, job): continue
             try:
                 client = client_for(app, node)
                 acted = False
-                if job['state'] == 'prepared' and cfg.get('enable_publish') is True:
+                if job['state'] in ('draft', 'prepared') and cfg.get('enable_publish') is True:
                     adapter = await session.adapter(job['target_site'])
                     acted = True
                     job = await worker.publish(job['id'], adapter, client)
