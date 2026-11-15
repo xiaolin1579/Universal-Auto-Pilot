@@ -6,6 +6,7 @@ import json
 from auto_upload import UploadWorker
 from upload_runner import UploadSession, ledger_for, client_for, prepare_job, run_cycle, enabled_rule
 from upload_sites import listing_identity
+from upload_notifications import UploadNotifications, safe_error
 
 
 def parser():
@@ -89,6 +90,7 @@ async def execute(args, app):
     if args.command in ('seed', 'reconcile-seed') and cfg.get('enable_seed') is not True:
         raise UploadBlocked('AUTO_UPLOAD.enable_seed must be true')
     session = UploadSession(app); node = None
+    notices = UploadNotifications(app, ledger)
     try:
         if args.command == 'reconcile':
             if job['state'] not in ('publication_uncertain', 'submitting'):
@@ -129,10 +131,19 @@ async def execute(args, app):
                 result = await asyncio.to_thread(worker.reconcile_seed, job['id'], client)
             else:
                 result = await asyncio.to_thread(worker.seed, job['id'], client, cfg.get('enable_resume') is True)
+        notices.record(result)
         return {'id': result['id'], 'state': result['state'], 'target_site': result['target_site']}
+    except Exception as exc:
+        if job is not None and args.command in ('publish', 'seed', 'reconcile', 'reconcile-seed'):
+            notices.record(ledger.get(job['id']), safe_error(exc))
+        raise
     finally:
-        if node is not None: app.CLIENTS.close(node)
-        await session.close()
+        try:
+            if node is not None: app.CLIENTS.close(node)
+            await session.close()
+        finally:
+            if args.command in ('prepare', 'publish', 'seed', 'reconcile', 'reconcile-seed'):
+                await notices.flush()
 
 
 def main():

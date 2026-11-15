@@ -128,15 +128,14 @@ async def send_notify(msg, *args, **kwargs):
     """
     try:
         # เรียกฟังก์ชันซิงค์โดยตรง ถ้ามันอยู่ในไฟล์เดียวกันหรือ Import มา
-        await asyncio.to_thread(_send_notify_sync, msg, *args, **kwargs)
+        return await asyncio.to_thread(_send_notify_sync, msg, *args, **kwargs)
         
     except Exception as e:
-        error_msg = f"🚨 [Notification Error]: {e}"
+        error_msg = f"🚨 [Notification Error]: {type(e).__name__}"
         print(error_msg)
         with open("bot_error.log", "a", encoding="utf-8") as f:
             f.write(f"{get_now()} - {error_msg}\n")
         return False
-    return True
 
 def _send_notify_sync(msg):
     """
@@ -144,6 +143,7 @@ def _send_notify_sync(msg):
     """
     try:
         cfg = load_full_config()
+        delivered = False
         msg = msg.strip()
         discord_msg = msg.replace('<b>', '**').replace('</b>', '**')
         line_clean_msg = msg.replace('<b>', '').replace('</b>', '')
@@ -152,20 +152,23 @@ def _send_notify_sync(msg):
         line_cfg = cfg.get('LINE_CONFIG', {})
         if line_cfg.get('enable') and line_cfg.get('access_token'):
             try:
-                requests.post("https://api.line.me/v2/bot/message/push", 
+                response = requests.post("https://api.line.me/v2/bot/message/push",
                               json={"to": line_cfg.get('user_id'), "messages": [{"type": "text", "text": line_clean_msg}]},
                               headers={"Authorization": f"Bearer {line_cfg.get('access_token')}"}, timeout=10)
+                delivered = response.status_code in (200, 201, 202) or delivered
             except Exception as e:
-                print(f"LINE Error: {e}")
+                print(f"LINE Error: {type(e).__name__}")
 
         # 2. Telegram
         tele_cfg = cfg.get('TELEGRAM_CONFIG', {})
         if tele_cfg.get('notify_enable') and tele_cfg.get('main_bot_token'):
             try:
-                requests.post(f"https://api.telegram.org/bot{tele_cfg.get('main_bot_token')}/sendMessage",
+                response = requests.post(f"https://api.telegram.org/bot{tele_cfg.get('main_bot_token')}/sendMessage",
                               json={'chat_id': tele_cfg.get('chat_id'), 'text': msg, 'parse_mode': 'HTML'}, timeout=10)
+                if response.status_code == 200 and response.json().get('ok') is True:
+                    delivered = True
             except Exception as e:
-                print(f"Telegram Error: {e}")
+                print(f"Telegram Error: {type(e).__name__}")
 
         # 3. Discord
         disc_cfg = cfg.get('DISCORD_CONFIG', {})
@@ -178,15 +181,18 @@ def _send_notify_sync(msg):
                                     json={"recipient_id": str(admin_id)}, headers=headers, timeout=10)
                 if res.status_code == 200:
                     channel_id = res.json().get('id')
-                    requests.post(f"https://discord.com/api/v10/channels/{channel_id}/messages",
-                                  json={"content": f"🔔 **[Universal Notification]**\n{discord_msg}"}, headers=headers, timeout=10)
+                    if channel_id:
+                        response = requests.post(f"https://discord.com/api/v10/channels/{channel_id}/messages",
+                                      json={"content": f"🔔 **[Universal Notification]**\n{discord_msg}",
+                                            "allowed_mentions": {"parse": []}}, headers=headers, timeout=10)
+                        delivered = response.status_code in (200, 201) or delivered
             except Exception as e:
-                print(f"Discord Error: {e}")
+                print(f"Discord Error: {type(e).__name__}")
         
-        return True
+        return delivered
         
     except Exception as e:
-        print(f"Critical _send_notify_sync Error: {e}")
+        print(f"Critical _send_notify_sync Error: {type(e).__name__}")
         return False
 
 # กำหนด Timezone ไทย

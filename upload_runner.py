@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 from auto_upload import UploadLedger, UploadWorker, select_rule, select_rules, PUBLISH_CONFIRMATIONS
 from torrent_metainfo import verify_completed
 from upload_sites import BrowserSite
+from upload_notifications import UploadNotifications, safe_error
 
 
 def ledger_for(app):
@@ -121,6 +122,7 @@ async def run_cycle(app, active_nodes):
     cfg = app.CFG.get('AUTO_UPLOAD', {})
     if cfg.get('enable') is not True: return []
     ledger = ledger_for(app)
+    notices = UploadNotifications(app, ledger)
     worker = UploadWorker(ledger, enable_publish=cfg.get('enable_publish') is True)
     session = UploadSession(app)
     nodes = {node.name: node for node, _ in active_nodes}
@@ -130,7 +132,10 @@ async def run_cycle(app, active_nodes):
         # Continue existing durable jobs first. Ambiguous POST/add states never auto-retry.
         for job in ledger.store.read()['upload_jobs'].values():
             if len(outcomes) >= limit: return outcomes
-            if job['state'] in ('seeding', 'cancelled', 'publication_uncertain', 'submitting', 'adding', 'seed_uncertain'):
+            if job['state'] in ('publication_uncertain', 'submitting', 'adding', 'seed_uncertain'):
+                notices.record(job)
+                continue
+            if job['state'] in ('seeding', 'cancelled'):
                 continue
             if job['state'] == 'draft' and cfg.get('enable_publish') is not True:
                 continue
@@ -151,10 +156,13 @@ async def run_cycle(app, active_nodes):
                     acted = True
                     job = await asyncio.to_thread(worker.seed, job['id'], client, cfg.get('enable_resume') is True)
                 if acted:
+                    notices.record(job)
                     outcomes.append({'id': job['id'], 'state': job['state']})
             except Exception as exc:
                 # No response bodies/URLs/cookies/announce tokens in logs.
-                outcomes.append({'id': job['id'], 'state': ledger.get(job['id'])['state'], 'error': str(exc) if isinstance(exc, UploadBlocked) else type(exc).__name__})
+                current = ledger.get(job['id'])
+                notices.record(current, safe_error(exc))
+                outcomes.append({'id': job['id'], 'state': current['state'], 'error': safe_error(exc)})
         if len(outcomes) >= limit: return outcomes
         # Queue only hashes linked to BearBit by verified, authenticated site_records.
         data = ledger.store.read()
@@ -188,6 +196,7 @@ async def run_cycle(app, active_nodes):
                         if pair in existing: continue
                         try:
                             job = await _prepare_destination(app, session, client, source_hash, metadata, content, rule)
+                            notices.record(job)
                             outcomes.append({'id': job['id'], 'state': job['state']})
                             existing.add(pair)
                         except Exception as exc:
@@ -197,4 +206,7 @@ async def run_cycle(app, active_nodes):
                 if len(outcomes) >= limit: return outcomes
         return outcomes
     finally:
-        await session.close()
+        try:
+            await session.close()
+        finally:
+            await notices.flush()

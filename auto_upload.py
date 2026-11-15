@@ -210,7 +210,8 @@ class UploadLedger:
             'id', 'state', 'source_hash', 'source_site', 'source_zone', 'source_node',
             'target_site', 'target_zone', 'target_category', 'content_group_id', 'prepared_hash',
             'metadata', 'rule', 'readiness', 'form_schema', 'duplicate_check',
-            'source_verified_at', 'field_overrides', 'created_at', 'updated_at', 'target_hash', 'listing') if k in job}
+            'source_verified_at', 'field_overrides', 'created_at', 'updated_at', 'target_hash', 'listing',
+            'notifications') if k in job}
         public['target_title'] = upload_title(job)
         public['torrent_filename'] = upload_filename(job)
         public['effective_fields'] = effective_rule(job).get('fields', {})

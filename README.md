@@ -152,6 +152,9 @@ python remote_control.py
 
 การแจ้งเตือน LINE ใช้ Messaging API โดยต้องกำหนด `LINE_CONFIG.enable`,
 `access_token` และ `user_id` ของผู้รับเพิ่มเติมจากไฟล์ config ตัวอย่าง
+Auto Upload ใช้ช่องทางแจ้งเตือนชุดเดียวกัน แจ้งสถานะการเตรียมงาน อัปโหลด recheck/seed
+และงานที่หยุดรอตรวจสอบ พร้อมป้องกันการแจ้งข้อความเดิมซ้ำข้าม cycle/การรีสตาร์ต
+ดูรายละเอียดและคิวข้อความใน [คู่มือ Auto Upload](docs/AUTO_UPLOAD.md#การแจ้งเตือน)
 
 มีสคริปต์ `run_autopilot.sh`/`.bat` และ `run_remote.sh`/`.bat` สำหรับช่วยเริ่มระบบ
 สคริปต์ Auto-Pilot มีขั้นตอนถอนแพ็กเกจที่ไม่อยู่ใน `requirements.txt`
