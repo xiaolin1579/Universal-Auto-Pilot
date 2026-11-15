@@ -426,6 +426,57 @@ def format_report(report_raw, platform='tg'):
                          .replace('<code>', '`').replace('</code>', '`')
     return report_raw
 
+
+async def update_repository():
+    """Keep Git/network/disk work off the remote bot's asyncio event loop."""
+    try:
+        fetched = await asyncio.to_thread(subprocess.run, ['git', 'fetch', 'origin', 'main'],
+                                          cwd=BASE_DIR, check=False, timeout=180)
+        if fetched.returncode != 0:
+            return False
+        reset = await asyncio.to_thread(subprocess.run, ['git', 'reset', '--hard', 'origin/main'],
+                                        cwd=BASE_DIR, check=False, timeout=30)
+        return reset.returncode == 0
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print('[Remote Update] Git failed:', type(exc).__name__)
+        return False
+
+
+async def start_telegram_polling(tg_bot):
+    """The library retries polling errors; also recover startup/session failures."""
+    skip_pending = True
+
+    async def close_session():
+        try:
+            await tg_bot.close_session()
+        except Exception as exc:
+            print('[Telegram] Session cleanup failed:', type(exc).__name__)
+
+    try:
+        while True:
+            try:
+                print('🤖 [Telegram] กำลังเริ่มเปิดระบบ Telegram Long Polling...')
+                initial_start = skip_pending
+                skip_pending = False
+                await tg_bot.infinity_polling(
+                    skip_pending=initial_start,
+                    timeout=60,
+                    request_timeout=90,
+                    allowed_updates=['message', 'callback_query'],
+                )
+                # A normal return means polling was explicitly stopped.
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Exception text can contain a bot token or signed request URL.
+                print('⚠️ [Telegram] ขัดข้อง/Timeout:', type(exc).__name__)
+                await close_session()
+                print('🔄 [Telegram] กำลังเชื่อมต่อใหม่ใน 10 วินาที...')
+                await asyncio.sleep(10)
+    finally:
+        await close_session()
+
 # --- MAIN RUNNER ---
 async def main():
     CONF = load_config()
@@ -610,10 +661,10 @@ async def main():
                             await tg_bot.send_message(chat_id, "⏳ กำลังส่งสัญญาณหยุดบอทหลัก...")
                             if os.name != 'nt':
                                 stop_cmd = "pkill -15 -f 'python3 -u main.py'"
-                                os.system(stop_cmd)
+                                await asyncio.to_thread(os.system, stop_cmd)
                             else:
                                 stop_cmd = 'wmic process where "commandline like \'%main.py%\'" delete'
-                                os.system(stop_cmd)
+                                await asyncio.to_thread(os.system, stop_cmd)
 
                             await asyncio.sleep(15)
 
@@ -630,13 +681,12 @@ async def main():
                         await tg_bot.send_message(chat_id, "⏳ กำลังส่งสัญญาณหยุดบอทหลัก...")
                         if is_process_running("python3 -u main.py"):
                             stop_cmd = "pkill -15 -f 'python3 -u main.py'" if os.name != 'nt' else 'wmic process where "commandline like \'%main.py%\'" delete'
-                            os.system(stop_cmd)
+                            await asyncio.to_thread(os.system, stop_cmd)
                             await asyncio.sleep(15)
 
-                        git_cmd = f"cd {BASE_DIR} && git fetch --all && git reset --hard origin/main"
-                        git_result = os.system(git_cmd)
+                        git_ok = await update_repository()
 
-                        if git_result != 0:
+                        if not git_ok:
                             await tg_bot.send_message(chat_id, "⚠️ <b>Git Update Failed:</b> ตรวจสอบการเชื่อมต่อหรือ Git Conflict", parse_mode='HTML')
                         else:
                             await tg_bot.send_message(chat_id, "📥 ดึงโค้ดเวอร์ชันล่าสุดสำเร็จ... กำลังเริ่มบอทใหม่")
@@ -672,22 +722,7 @@ async def main():
                     await tg_bot.send_message(chat_id, "♻️ รีสตาร์ท Remote...")
                     os._exit(0)
 
-            async def start_telegram_polling():
-                while True:
-                    try:
-                        print("🤖 [Telegram] กำลังเริ่มเปิดระบบ Telegram Long Polling...")
-                        await tg_bot.infinity_polling(
-                            skip_pending=True, 
-                            timeout=60, 
-                            request_timeout=60,
-                            allowed_updates=["message", "callback_query"]
-                        )
-                    except Exception as e:
-                        print(f"⚠️ [Telegram] ขัดข้อง/Timeout: {e}")
-                        print("🔄 [Telegram] กำลังเชื่อมต่อใหม่ใน 10 วินาที...")
-                        await asyncio.sleep(10)
-
-            tasks.append(start_telegram_polling())
+            tasks.append(start_telegram_polling(tg_bot))
             
         except Exception as e: print(f"❌ TG Error: {e}")
 
