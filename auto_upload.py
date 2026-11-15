@@ -381,8 +381,15 @@ class UploadWorker:
         if self.enable_publish and job['state'] in ('draft', 'prepared'):
             self.ledger.confirm_for_publish(key)
             job = self.ledger.get(key)
+        if job['state'] == 'draft':
+            readiness = job.get('readiness', {})
+            names = [str(name) for group in ('missing_fields', 'invalid_fields', 'unknown_fields', 'missing_confirmations')
+                     for name in readiness.get(group, [])]
+            raise UploadBlocked('Destination form is incomplete: ' + (', '.join(names) or 'inspect the job fields'))
         if job['state'] != 'prepared':
-            raise UploadBlocked('Only prepared jobs can be published; uncertain jobs require reconciliation')
+            if job['state'] in ('submitting', 'publication_uncertain'):
+                raise UploadBlocked('Uncertain submission requires reconciliation before publication')
+            raise UploadBlocked('Only prepared jobs can be published (current state: ' + job['state'] + ')')
         # Revalidate live source; Cleaner holds it while this job is active.
         source = Path(job['source_artifact']).read_bytes()
         live = client.inventory(job['source_hash'])

@@ -52,7 +52,8 @@ def message_for(job, error=None):
     label = labels.get(job.get('state'))
     if not label:
         return None
-    if error and job['state'] not in ('publication_uncertain', 'submitting', 'adding', 'seed_uncertain', 'verification_failed'):
+    needs_input = job['state'] == 'draft' and error and error.startswith('Destination form is incomplete:')
+    if error and not needs_input and job['state'] not in ('publication_uncertain', 'submitting', 'adding', 'seed_uncertain', 'verification_failed'):
         label = '⚠️ Auto Upload: งานหยุดรอตรวจสอบ'
     lines = ['<b>' + label + '</b>', _text(job.get('metadata', {}).get('title')),
              'BEARBIT (' + _text(job.get('source_zone')) + ') → ' + _text(job.get('target_site'))
@@ -60,13 +61,15 @@ def message_for(job, error=None):
              'โหนด: ' + _text(job.get('source_node')), 'สถานะ: ' + _text(job['state']),
              'Job: ' + _text(job['id'])]
     if error:
-        lines.append('เหตุผล: ' + _text(error, 400))
+        lines.append('เหตุผล: ' + ('ข้อมูลแบบฟอร์มยังไม่ครบ จึงยังไม่ได้ส่งอัปโหลด' if needs_input else _text(error, 400)))
     if job['state'] == 'draft':
         readiness = job.get('readiness', {})
         missing = [str(v) for key in ('missing_fields', 'invalid_fields', 'unknown_fields', 'missing_confirmations')
                    for v in readiness.get(key, [])]
         if missing:
-            lines.append('ข้อมูลที่ต้องตรวจ: ' + _text(', '.join(missing)))
+            field_labels = {'c100type': 'ประเภทเนื้อหา', 'c100type2': 'ประเภทย่อย', 'c100cat': 'ประเทศ/หมวด'} if job.get('target_site') == 'BITSUSE' else {}
+            names = [field_labels[name] + ' (' + name + ')' if name in field_labels else name for name in missing]
+            lines.append('ข้อมูลที่ต้องตรวจ: ' + _text(', '.join(names)))
     url = _listing(job['target_site'], job.get('listing') or {})
     if url:
         lines.append('รายการปลายทาง: ' + url)
