@@ -53,6 +53,7 @@ from upload_client import QbitUploadClient
 from storage_telemetry import parse_size_gib, read_swizzin_storage_stats
 from node_config import load_config as load_node_config
 import torrentdd_cross_seed
+import unlimitz_login
 # Metainfo parsing is shared with the auto-upload worker.
 from torrent_metainfo import (
     _bencode_value_end, _decode_bencode_value, _torrent_text,
@@ -6280,6 +6281,13 @@ async def ensure_site_logged_in(page: uc.Tab, site_cfg: dict) -> bool:
     if page is None:
         print("🚨 ตรวจพบ page เป็น None, ส่งสัญญาณรีเซ็ต...")
         return False # ลูปหลักจะได้รับค่านี้แล้วไปสร้าง instance ใหม่
+    if unlimitz_login.is_unlimitz(site_cfg):
+        try:
+            await load_cookies_to_browser(page, site_cfg)
+            return await unlimitz_login.ensure_logged_in(page, site_cfg, primary_ocr=ocr)
+        except Exception:
+            print("⚠️ [UNLIMITZ] เตรียม session สำหรับล็อกอินไม่สำเร็จ")
+            return False
     site_key = site_cfg['name']
     base_url = site_cfg.get('base_url', '').rstrip('/')
     target_list = site_cfg.get('target_urls', [])
@@ -6343,6 +6351,8 @@ async def ensure_site_logged_in(page: uc.Tab, site_cfg: dict) -> bool:
         return await universal_login(page, site_cfg)
 
 async def universal_login(page: uc.Tab, site_cfg: dict) -> bool:
+    if unlimitz_login.is_unlimitz(site_cfg):
+        return await unlimitz_login.login(page, site_cfg, primary_ocr=ocr)
     site_key = site_cfg['name']
     base_url = site_cfg.get('base_url', '').rstrip('/')
     
