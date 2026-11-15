@@ -29,7 +29,7 @@ Cross-Seed โดยใช้ `torrent_mapping.json` เป็นฐานข้
 | เชื่อมต่อ อ่านรายการ และเพิ่มงานดาวน์โหลด | รองรับ Web API | รองรับ XML-RPC |
 | อ่านพื้นที่ Swizzin แบบ quota → mount | รองรับ | รองรับ |
 | ตรวจไฟล์ร่วมก่อน Cleaner ลบ | รองรับ | รองรับ; ระงับการลบหากเก็บไฟล์ไว้ไม่ได้ |
-| เพิ่มและ recheck งานจากคิว Auto Upload | รองรับ torrent v1 | ยังไม่รองรับ |
+| เพิ่มและ recheck งานจากคิว Auto Upload | รองรับ torrent v1 | รองรับ torrent v1 ผ่าน XML-RPC |
 
 ตัวอ่าน H&R/Quest ที่ยืนยันข้อมูลสดรองรับ **BearBit** ก่อน เว็บไซต์อื่นต้องมีตัวอ่าน
 ที่รองรับจึงจะยืนยันสถานะ `clear` ได้ ดูรายละเอียดใน
@@ -226,8 +226,9 @@ python auto_upload_cli.py inspect-form --site BITSUSE --category 181
 python auto_upload_cli.py inspect-form --site TORRENTDD --category 19
 ```
 
-คิวนี้รองรับ **qBittorrent และ torrent v1** รวม padding ที่ประกาศไว้ใน metainfo
-ส่วน rTorrent, torrent v2/hybrid และ symlink ยังไม่รองรับในขั้นเพิ่มงานจากคิวนี้
+คิวนี้รองรับ **qBittorrent/rTorrent และ torrent v1** รวม padding ที่ประกาศไว้ใน metainfo
+rTorrent เพิ่มแบบหยุดผ่าน `load.raw` ตรวจ hash ด้วย `d.check_hash` และเริ่ม seed หลังตรวจครบเท่านั้น
+ส่วน torrent v2/hybrid และ symlink ยังไม่รองรับในขั้นเพิ่มงานจากคิวนี้
 ให้หยุดบอทหลักก่อนใช้ CLI ที่เปิดเบราว์เซอร์ เพื่อใช้ browser profile ครั้งละโปรเซส
 อ่านขั้นตอนเตรียม ตรวจ เผยแพร่ seed และกู้สถานะใน [AUTO_UPLOAD.md](docs/AUTO_UPLOAD.md)
 และตาราง [กฎหมวดหมู่](docs/UPLOAD_CATEGORY_RULES.md)

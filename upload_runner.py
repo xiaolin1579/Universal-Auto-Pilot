@@ -20,7 +20,7 @@ def ledger_for(app):
 def client_for(app, node):
     factory = app.CLIENTS.adapter_for(node).upload_factory
     if factory is None:
-        raise UploadBlocked('This client does not support export/manifest/paused-add/recheck capabilities for upload')
+        raise UploadBlocked('This client does not support inventory/files/paused-add/recheck/resume capabilities for upload')
     return factory(node)
 
 

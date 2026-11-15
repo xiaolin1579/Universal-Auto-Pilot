@@ -98,7 +98,7 @@ python auto_upload_cli.py check-job JOB_ID
   hash ปลายทางต้องต่างจากต้นทาง และยังต้องเพิ่มแบบหยุดไว้พร้อม recheck ก่อน seed
 - หาก POST ได้ผลไม่ชัดเจน งานจะเป็น `publication_uncertain` และไม่ส่งซ้ำอัตโนมัติ
   ใช้ `reconcile JOB_ID --url 'https://www.torrentdd.com/details.php?id=456'` หลังตรวจรายการจริง
-- การเพิ่มงานจากคิวนี้รองรับ qBittorrent และ torrent v1 ตามระบบเดิม
+- การเพิ่มงานจากคิวนี้รองรับ qBittorrent/rTorrent และ torrent v1 ผ่าน adapter ของแต่ละ client
 
 ทดสอบอ่านฟอร์มและกรอกข้อมูลในเบราว์เซอร์จริงแล้ว แนบ metainfo ทดสอบและผ่านปุ่ม
 ตรวจรูปของเว็บ โดยบล็อก URL ที่ส่งอัปโหลดไว้ และไม่ได้เปลี่ยน torrent ใน seedbox

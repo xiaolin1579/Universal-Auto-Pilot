@@ -49,7 +49,7 @@ import urllib.parse
 from torrent_store import MappingStore, UPLOAD_HOLD_STATES
 from client_registry import ClientAdapter, ClientRegistry
 from cross_seed_search import search_keywords, search_zones
-from upload_client import QbitUploadClient
+from upload_client import QbitUploadClient, RtorrentUploadClient
 from storage_telemetry import parse_size_gib, read_swizzin_storage_stats
 from node_config import load_config as load_node_config
 import torrentdd_cross_seed
@@ -5425,7 +5425,8 @@ CLIENTS.register(ClientAdapter("qbit", QbitNode, QbitNode, _read_builtin_storage
                                close=lambda node: node.s.close(), upload_factory=QbitUploadClient))
 CLIENTS.register(ClientAdapter("rtorrent", RtorrentNode, RtorrentNode, _read_builtin_storage_inventory,
                                purge_reader=lambda node, torrent_hash: node.get_purge_snapshot(torrent_hash),
-                               supports_keep_files=False, close=lambda node: node.s.close()))
+                               supports_keep_files=False, close=lambda node: node.s.close(),
+                               upload_factory=RtorrentUploadClient))
 
 
 def _read_storage_inventory(node):
