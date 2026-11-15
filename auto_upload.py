@@ -21,23 +21,22 @@ class UploadRejected(UploadBlocked):
 
 
 def upload_title(job):
-    title = str(job['metadata']['title'])
-    limit = {'DEDBIT': 80, 'TORRENTDD': 200}.get(job['target_site'])
-    if limit is None or len(title) <= limit:
-        return title
-    base = re.sub(r'^(?:\[[^\]]+\]\s*[- ]*)+', '', title)
-    base = re.split(r'-\s*WEB[- ]?DL|\.H\.26[45]|-\s*BluRay', base, maxsplit=1, flags=re.I)[0].strip(' ._-')
-    quality = [tag.strip() for tag in re.findall(r'\[([^\]]+)\]', title)
-               if re.fullmatch(r'(?:[248]K|\d{3,4}p|HDR10\+?|HDR|DV|\d{2,3}fps)', tag.strip(), re.I)]
-    with_quality = base + (' [' + ' '.join(quality) + ']' if quality else '')
-    if len(with_quality) <= limit:
-        return with_quality
-    if len(base) <= limit:
-        return base
-    root = re.sub(r'\.(?:mkv|mp4|avi|torrent)$', '', str(job['metadata'].get('root_name') or ''), flags=re.I)
-    if root and len(root) <= limit:
-        return root
-    raise UploadBlocked('Source title needs an explicit shorter display title for this website')
+    from upload_titles import format_title, TitleError
+    try:
+        return format_title(job['metadata'], job['target_site'],
+                            job.get('field_overrides', {}).get('title'))
+    except TitleError as error:
+        raise UploadBlocked(str(error)) from None
+
+
+def upload_filename(job):
+    from upload_titles import torrent_filename, TitleError
+    try:
+        override = job.get('field_overrides', {}).get('title')
+        metadata = {'title': override} if override is not None else job['metadata']
+        return torrent_filename(metadata, job['target_site'])
+    except TitleError as error:
+        raise UploadBlocked(str(error)) from None
 
 
 ROUTES = UPLOAD_TARGETS
@@ -88,9 +87,23 @@ def effective_rule(job):
     return rule
 
 
-def write_artifact(directory, job_id, kind, content):
+def write_artifact(directory, job_id, kind, content, filename=None):
     directory = Path(directory).resolve(); directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path = directory / (job_id + '.' + kind + '.torrent')
+    if filename is not None:
+        if (not re.fullmatch(r'[0-9a-f]{64}', job_id) or kind not in {'source', 'prepared', 'submission', 'canonical'}
+                or filename in {'.', '..'} or not filename.endswith('.torrent')
+                or re.search(r'[/\\\x00-\x1f]', filename)):
+            raise UploadBlocked('Invalid upload artifact path')
+        root = directory
+        directory = root / job_id / kind
+        if ((root / job_id).is_symlink() or directory.is_symlink()
+                or not directory.resolve().is_relative_to(root)):
+            raise UploadBlocked('Artifact directory escapes its upload root')
+        (root / job_id).mkdir(exist_ok=True, mode=0o700)
+        directory.mkdir(exist_ok=True, mode=0o700)
+        path = directory / filename
+    else:
+        path = directory / (job_id + '.' + kind + '.torrent')
     fd, tmp = tempfile.mkstemp(dir=directory)
     try:
         with os.fdopen(fd, 'wb') as handle:
@@ -150,8 +163,9 @@ class UploadLedger:
                    and j['state'] != 'cancelled' for j in data['upload_jobs'].values()):
                 raise UploadBlocked('This source already has a job on this destination')
             # Write before the ledger pointer, under its lock; never overwrite a published artifact.
-            job['source_artifact'] = write_artifact(self.artifacts, key, 'source', source)
-            job['prepared_artifact'] = write_artifact(self.artifacts, key, 'prepared', variant)
+            filename = upload_filename(job)
+            job['source_artifact'] = write_artifact(self.artifacts, key, 'source', source, filename)
+            job['prepared_artifact'] = write_artifact(self.artifacts, key, 'prepared', variant, filename)
             data['upload_jobs'][key] = job
             group = data['content_groups'].setdefault(signature, {'id': signature, 'hashes': [], 'primary_site': 'BEARBIT'})
             if job['source_hash'] not in group['hashes']: group['hashes'].append(job['source_hash'])
@@ -172,15 +186,16 @@ class UploadLedger:
             'metadata', 'rule', 'readiness', 'form_schema', 'duplicate_check',
             'source_verified_at', 'field_overrides', 'created_at', 'updated_at', 'target_hash', 'listing') if k in job}
         public['target_title'] = upload_title(job)
+        public['torrent_filename'] = upload_filename(job)
         public['effective_fields'] = effective_rule(job).get('fields', {})
         public['effective_confirmations'] = effective_rule(job).get('confirmations', {})
         # Artifact files contain announce credentials; expose only their content identity.
         return public
 
     def configure_job(self, key, changes):
-        if not isinstance(changes, dict) or set(changes) - {'fields', 'confirmations'}:
-            raise UploadBlocked('Job configuration accepts only fields and confirmations')
-        if any(not isinstance(v, dict) for v in changes.values()):
+        if not isinstance(changes, dict) or set(changes) - {'fields', 'confirmations', 'title'}:
+            raise UploadBlocked('Job configuration accepts only fields, confirmations and display title')
+        if any(not isinstance(v, dict) for k, v in changes.items() if k != 'title'):
             raise UploadBlocked('Job overrides must be dictionaries')
         def apply(data):
             from upload_sites import form_readiness
@@ -196,7 +211,13 @@ class UploadLedger:
                 raise UploadBlocked('Only the factual form confirmations can be configured')
             overrides = job.setdefault('field_overrides', {})
             for section, values in changes.items():
-                overrides.setdefault(section, {}).update(deepcopy(values))
+                if section == 'title':
+                    if not isinstance(values, str) or not values.strip():
+                        raise UploadBlocked('Display title must be nonempty text')
+                    overrides['title'] = values
+                else:
+                    overrides.setdefault(section, {}).update(deepcopy(values))
+            upload_title(job)
             readiness = form_readiness(job['form_schema'], effective_rule(job))
             if readiness['invalid_fields']:
                 raise UploadBlocked('Invalid destination field value in job override')
@@ -267,7 +288,7 @@ class UploadLedger:
                     or any(infohash(r['client_info'].get('hash')) == target for r in data['torrents'])):
                 raise UploadBlocked('Canonical hash already belongs to another source or variant')
             current.update(state='verified', target_hash=target, updated_at=stamp(),
-                canonical_artifact=write_artifact(self.artifacts, key, 'canonical', content))
+                canonical_artifact=write_artifact(self.artifacts, key, 'canonical', content, upload_filename(job)))
             group['hashes'].append(target)
             listing = current['listing']; site = job['target_site']; tid = str(listing['torrent_id'])
             site_key = site + ':' + tid
@@ -333,7 +354,7 @@ class UploadWorker:
         # Duplicate search navigates away: refresh nonce and validate fields once more.
         form = await adapter.load_form(job)
         variant = create_variant(source, job['target_site'], job['target_zone'], job['target_category'], form['announce'])
-        path = write_artifact(self.ledger.artifacts, key, 'submission', variant)
+        path = write_artifact(self.ledger.artifacts, key, 'submission', variant, upload_filename(job))
         await adapter.fill(job, path)
         self.ledger.claim_submission(key, job, evidence)
         try:

@@ -1,5 +1,5 @@
 """Client capabilities used by the upload worker. Initial implementation: qBittorrent."""
-from auto_upload import UploadBlocked
+from auto_upload import UploadBlocked, upload_filename
 from torrent_store import infohash
 
 
@@ -36,7 +36,7 @@ class QbitUploadClient:
 
     def add_paused(self, content, job):
         response = self.request('POST', 'torrents/add',
-            files={'torrents': ('cross-seed.torrent', content, 'application/x-bittorrent')},
+            files={'torrents': (upload_filename(job), content, 'application/x-bittorrent')},
             data={'paused': 'true', 'stopped': 'true', 'skip_checking': 'false', 'autoTMM': 'false',
                   'savepath': job['save_path'], 'contentLayout': 'Original',
                   'category': job['target_site'], 'tags': 'AutoPilot,Cross-Seed'})
