@@ -1987,7 +1987,7 @@ def load_xvfb_config():
         print(f"⚠️ [Config] เกิดข้อผิดพลาดในการอ่าน Xvfb_enable ({e}), ใช้ค่าเริ่มต้น: False")
         return False
 
-async def launch_any_browser(sitename="default", custom_args=None):
+async def launch_any_browser(sitename="default", custom_args=None, *, enable_images=False):
     global _global_display, _active_browser_instance, _current_profile_path
     
     # 1. ปิดเฉพาะ Browser ของ profile ที่ติดตามได้; หากไม่สำเร็จให้หยุดแบบ fail-closed
@@ -2070,7 +2070,7 @@ async def launch_any_browser(sitename="default", custom_args=None):
         "--disable-infobars",
         "--no-zygote",
         "--disable-gpu",
-        "--blink-settings=imagesEnabled=false",
+        "--blink-settings=imagesEnabled=true" if enable_images else "--blink-settings=imagesEnabled=false",
         "--disable-gl-extensions",
         "--disable-software-rasterizer",
         "--disable-extensions",

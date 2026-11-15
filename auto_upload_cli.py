@@ -9,11 +9,11 @@ from upload_sites import listing_identity
 
 
 def parser():
-    p = argparse.ArgumentParser(description='BearBit -> Dedbit/Bitsuse auto upload')
+    p = argparse.ArgumentParser(description='BearBit -> Dedbit/Bitsuse/TorrentDD auto upload')
     sub = p.add_subparsers(dest='command', required=True)
     sub.add_parser('status')
     inspect_form = sub.add_parser('inspect-form')
-    inspect_form.add_argument('--site', choices=('DEDBIT', 'BITSUSE'), required=True)
+    inspect_form.add_argument('--site', choices=('DEDBIT', 'BITSUSE', 'TORRENTDD'), required=True)
     inspect_form.add_argument('--category', required=True)
     run = sub.add_parser('run'); run.add_argument('--once', action='store_true')
     run.add_argument('--interval', type=int, default=300)
@@ -21,6 +21,9 @@ def parser():
         prepare = sub.add_parser(name)
         prepare.add_argument('--node', required=True); prepare.add_argument('--hash', required=True)
         prepare.add_argument('--url', required=True); prepare.add_argument('--zone', choices=('normal', 'special'), required=True)
+        if name == 'prepare':
+            prepare.add_argument('--target-site', choices=('DEDBIT', 'BITSUSE', 'TORRENTDD'),
+                                 help='Destination; required when more than one category rule matches')
     configure = sub.add_parser('configure')
     configure.add_argument('job_id'); configure.add_argument('--file', required=True)
     for name in ('show', 'check-job', 'publish', 'seed', 'reconcile', 'reconcile-seed', 'cancel'):
@@ -37,13 +40,17 @@ async def execute(args, app):
                  'target_site': j['target_site'], 'target_category': j['target_category'],
                  'source_node': j['source_node']} for j in ledger.store.read()['upload_jobs'].values()]
     if args.command == 'inspect-form':
-        from upload_sites import upload_form, SITES
+        from torrent_metainfo import upload_route_supported
+        zone = next((z for z in ('normal', 'special') if upload_route_supported(args.site, z, args.category)), None)
+        if zone is None:
+            raise UploadBlocked('Destination category is not available in a supported upload zone')
         session = UploadSession(app)
         try:
             adapter = await session.adapter(args.site)
-            html, url = await adapter.open(adapter.origin + SITES[args.site][1])
-            spec = upload_form(args.site, html, url, args.category)
-            return {'site': args.site, 'category': args.category, 'fields': spec['fields'],
+            spec = await adapter.load_form({'target_site': args.site, 'target_zone': zone,
+                'target_category': str(args.category), 'metadata': {},
+                'rule': {'fields': {}, 'confirmations': {}}}, require_ready=False)
+            return {'site': args.site, 'zone': zone, 'category': args.category, 'fields': spec['fields'],
                     'acknowledgements': spec['acknowledgements']}
         finally:
             await session.close()
@@ -111,7 +118,8 @@ async def execute(args, app):
                         'total_size_bytes': manifest['total_size_bytes'], 'files': len(manifest['files']),
                         'padding_files': sum(bool(f.get('is_padding')) for f in manifest['files'])}
             if args.command == 'prepare':
-                result = await prepare_job(app, session, node, args.hash, args.url, args.zone)
+                result = await prepare_job(app, session, node, args.hash, args.url, args.zone,
+                                           getattr(args, 'target_site', None))
             elif args.command == 'check-job':
                 return await worker.check_job(job['id'], await session.adapter(job['target_site']), client)
             elif args.command == 'publish':

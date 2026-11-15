@@ -16,6 +16,7 @@ SITES = {
     'BEARBIT': ('https://bearbit.org', None, {'normal': '/viewno18sbx.php', 'special': '/viewbrsb.php'}),
     'DEDBIT': ('https://www.dedbit.com', '/upload.php', {'normal': '/browse.php'}),
     'BITSUSE': ('https://www.bitsuse.com', '/bs_upload.php', {'special': '/bs_browse.php'}),
+    'TORRENTDD': ('https://www.torrentdd.com', '/upload.php', {'normal': '/browse.php', 'special': '/browse18.php'}),
 }
 
 
@@ -155,6 +156,9 @@ def bearbit_metadata(html, details_url):
 
 
 def upload_form(site, html, current_url, category):
+    if site == 'TORRENTDD':
+        from torrentdd_upload import upload_form as torrentdd_form
+        return torrentdd_form(html, current_url, category)
     trusted_url(site, current_url)
     if urlsplit(current_url).path != SITES[site][1]:
         raise UploadBlocked('Upload form redirected')
@@ -199,11 +203,18 @@ def form_readiness(spec, rule):
     fields = rule.get('fields', {})
     if not isinstance(fields, dict):
         raise UploadBlocked('Category fields must be a dictionary')
-    missing = [name for name in spec['fields'] if fields.get(name) is None or not str(fields.get(name, '')).strip()]
+    missing = [name for name, field in spec['fields'].items() if field.get('required', True)
+               and (fields.get(name) is None or not str(fields.get(name, '')).strip())]
     invalid = [name for name, value in fields.items() if name in spec['fields']
                and (type(value) is not str or (str(value).strip() and spec['fields'][name]['options'] is not None
                and str(value) not in spec['fields'][name]['options']))]
     unknown = sorted(set(fields) - set(spec['fields']))
+    for name, value in fields.items():
+        field = spec['fields'].get(name, {})
+        if field.get('pattern') and (type(value) is not str or re.fullmatch(field['pattern'], value) is None):
+            invalid.append(name)
+        if field.get('format') == 'public_url' and value and (type(value) is not str or not public_url(value)):
+            invalid.append(name)
     confirmations = rule.get('confirmations', {})
     missing_ack = [a for a in spec['acknowledgements'] if a != 'ack3' and confirmations.get(a) is not True]
     return {'ready': not (missing or invalid or unknown or missing_ack),
@@ -230,6 +241,10 @@ def duplicate_search_keywords(metadata, site=None):
         phrases = [chr(34) + name + chr(34) for name in phrases if name]
         if phrases:
             return list(dict.fromkeys(phrases))[:4]
+    if site == 'TORRENTDD':
+        # A displayed Thai episode title need not contain SxxExx from the file.
+        # Check both language aliases before declaring the destination clear.
+        return list(dict.fromkeys(terms + aliases))[:6]
     # The primary title can start with a country/quality badge. Searching that
     # badge alone creates unrelated results; prefer the file's release identity.
     if not terms:
@@ -241,6 +256,19 @@ def duplicate_search_keywords(metadata, site=None):
                 terms.append(alias)
                 break
     return list(dict.fromkeys(terms))[:4]
+
+
+def source_search_keywords(metadata):
+    """Keep release identity first, then discover a site's translated display title.
+
+    These terms prove nothing alone: read_source still requires the exact source
+    listing ID in its enabled zone and a download matching the live source hash.
+    """
+    terms = search_keywords(metadata.get('root_name'))
+    terms.extend(_name_aliases(metadata))
+    if not terms:
+        terms = search_keywords(metadata.get('title'))
+    return list(dict.fromkeys(term for term in terms if str(term).strip()))[:8]
 
 
 def candidate_relevant(metadata, candidate_title):
@@ -314,6 +342,9 @@ class BrowserSite:
                             + ', query_match=' + str(navigation_query(current) == navigation_query(url)) + ')')
 
     async def download_listing(self, url):
+        if self.site == 'TORRENTDD':
+            from torrentdd_upload import download_listing
+            return await download_listing(self, url)
         listing = listing_identity(self.site, url)
         html, current = await self.open(listing['details_url'])
         if listing_identity(self.site, current) != listing:
@@ -389,12 +420,13 @@ class BrowserSite:
             raise UploadBlocked('This source zone is disabled in site configuration')
         from torrent_metainfo import _extract_torrent_manifest
         root_name = _extract_torrent_manifest(content)['root_name']
-        keywords = list(dict.fromkeys(search_keywords(metadata['title']) + search_keywords(root_name)))
+        keywords = source_search_keywords({**metadata, 'root_name': root_name})
         found = False
         for keyword in keywords:
             query = self.origin + path + '?' + urlencode({'search': keyword, 'incldead': 1, 'searchin': 0, 'sortby': 0})
             html, actual = await self.open(query)
-            if urlsplit(actual).path != path:
+            trusted_url('BEARBIT', actual)
+            if urlsplit(actual).path != path or navigation_query(actual) != navigation_query(query):
                 raise UploadBlocked('BearBit zone search redirected')
             soup = BeautifulSoup(html, 'html.parser')
             if not soup.select_one('input[name="search"]'):
@@ -421,6 +453,10 @@ class BrowserSite:
 
     async def load_form(self, job, require_ready=True):
         if self.site != job['target_site']: raise UploadBlocked('Wrong destination adapter')
+        if self.site == 'TORRENTDD':
+            from torrentdd_upload import zone_for_category
+            if job.get('target_zone') != zone_for_category(job['target_category']):
+                raise UploadBlocked('TorrentDD category and destination zone disagree')
         if self.enabled_paths is not None and SITES[self.site][2][job.get('target_zone', 'special' if self.site == 'BITSUSE' else 'normal')] not in self.enabled_paths:
             raise UploadBlocked('Destination zone is disabled in site configuration')
         html, current = await self.open(self.origin + SITES[self.site][1])
@@ -434,6 +470,9 @@ class BrowserSite:
         return self.form
 
     async def check_duplicates(self, job, max_pages=10, max_candidates=80):
+        if self.site == 'TORRENTDD':
+            from torrentdd_upload import check_duplicates
+            return await check_duplicates(self, job, max_pages, max_candidates)
         path = SITES[self.site][2][job['target_zone']]
         keywords = duplicate_search_keywords(job['metadata'], self.site)
         if not keywords: raise UploadBlocked('No usable duplicate search keyword')
@@ -490,6 +529,9 @@ class BrowserSite:
                 'pages': page_count, 'candidates_checked': len(checked), 'unrelated_results_skipped': len(skipped), 'method': 'authenticated_search_and_payload'}
 
     async def fill(self, job, artifact):
+        if self.site == 'TORRENTDD':
+            from torrentdd_upload import fill
+            return await fill(self, job, artifact)
         if not self.form: raise UploadBlocked('Upload form has not been validated')
         rule = effective_rule(job)
         values = {'type': job['target_category'], 'name': upload_title(job),
@@ -538,6 +580,9 @@ class BrowserSite:
         return listing if can_edit else None
 
     async def submit(self, job):
+        if self.site == 'TORRENTDD':
+            from torrentdd_upload import submit
+            return await submit(self, job)
         # This is the only publication action. Worker has durably claimed submitting.
         await self.tab.evaluate("document.getElementById('frmupload').requestSubmit()")
         for _ in range(30):

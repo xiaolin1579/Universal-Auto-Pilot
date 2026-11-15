@@ -4,7 +4,7 @@ import asyncio
 import os
 from pathlib import Path
 from urllib.parse import urlsplit
-from auto_upload import UploadLedger, UploadWorker, select_rule
+from auto_upload import UploadLedger, UploadWorker, select_rule, select_rules
 from upload_sites import BrowserSite
 
 
@@ -35,7 +35,7 @@ class UploadSession:
         if config is None: raise UploadBlocked('Site is not enabled: ' + site)
         if self.browser is None:
             args = ['--proxy-server=' + os.environ['HTTPS_PROXY']] if os.environ.get('HTTPS_PROXY') else []
-            self.browser = await self.app.launch_any_browser('auto_upload', args)
+            self.browser = await self.app.launch_any_browser('auto_upload', args, enable_images=True)
         tab = await self.browser.get('about:blank', new_tab=True)
         if not await self.app.ensure_site_logged_in(tab, config):
             raise RuntimeError('Site login failed: ' + site)
@@ -51,14 +51,19 @@ class UploadSession:
             self.app.kill_xvfb()
 
 
-async def prepare_job(app, session, node, source_hash, details_url, zone):
+async def prepare_job(app, session, node, source_hash, details_url, zone, target_site=None):
     client = client_for(app, node)
     source_adapter = await session.adapter('BEARBIT')
     metadata, content = await source_adapter.read_source(details_url, source_hash, zone)
-    rule = select_rule(app.CFG.get('AUTO_UPLOAD', {}).get('rules', []), metadata)
+    rule = select_rule(app.CFG.get('AUTO_UPLOAD', {}).get('rules', []), metadata, target_site)
+    return await _prepare_destination(app, session, client, source_hash, metadata, content, rule)
+
+
+async def _prepare_destination(app, session, client, source_hash, metadata, content, rule):
     # Destination form must be current and compatible before an artifact is prepared.
     dest = await session.adapter(rule['target_site'])
-    spec = await dest.load_form({'target_site': rule['target_site'], 'target_category': str(rule['target_category']), 'rule': rule}, require_ready=False)
+    spec = await dest.load_form({'target_site': rule['target_site'], 'target_zone': metadata['zone'], 'metadata': metadata,
+                                'target_category': str(rule['target_category']), 'rule': rule}, require_ready=False)
     inventory, files = await asyncio.to_thread(lambda: (client.inventory(source_hash), client.files(source_hash)))
     return await asyncio.to_thread(ledger_for(app).prepare, content, inventory, files, metadata, rule,
                                    spec['announce'], readiness=spec['readiness'], form_schema=spec)
@@ -106,8 +111,9 @@ async def run_cycle(app, active_nodes):
         if len(outcomes) >= limit: return outcomes
         # Queue only hashes linked to BearBit by verified, authenticated site_records.
         data = ledger.store.read()
-        existing = {j['source_hash'] for j in data['upload_jobs'].values()}
-        zones = sorted({r.get('source_zone') for r in cfg.get('rules', []) if r.get('enable') is True})
+        existing = {(j['source_hash'], j['target_site']) for j in data['upload_jobs'].values()}
+        configured = [r for r in cfg.get('rules', []) if isinstance(r, dict) and r.get('enable') is True]
+        zones = sorted({r.get('source_zone') for r in configured if r.get('source_zone') in ('normal', 'special')})
         for node in nodes.values():
             if app.CLIENTS.adapter_for(node).upload_factory is None: continue
             inventory = await asyncio.to_thread(node.get_all_torrents_info)
@@ -116,15 +122,31 @@ async def run_cycle(app, active_nodes):
                          if t.get('progress') == 1 and t.get('amount_left') == 0}
             for record in data['site_records'].values():
                 source_hash = record.get('infohash')
-                if record['site'] != 'BEARBIT' or source_hash not in completed or source_hash in existing: continue
+                if record['site'] != 'BEARBIT' or source_hash not in completed: continue
                 url = 'https://bearbit.org/details.php?id=' + record['torrent_id']
                 for zone in zones:
+                    pending = {r.get('target_site') for r in configured if r.get('source_zone') == zone
+                               and (source_hash, r.get('target_site')) not in existing}
+                    if not pending: continue
                     try:
-                        job = await prepare_job(app, session, node, source_hash, url, zone)
-                        outcomes.append({'id': job['id'], 'state': job['state']}); existing.add(source_hash)
-                        break
+                        client = client_for(app, node)
+                        source_adapter = await session.adapter('BEARBIT')
+                        metadata, content = await source_adapter.read_source(url, source_hash, zone)
+                        rules = select_rules(cfg.get('rules', []), metadata)
                     except Exception as exc:
                         print('[Auto Upload] Source not ready:', source_hash[:12], zone, str(exc) if isinstance(exc, UploadBlocked) else type(exc).__name__)
+                        continue
+                    for rule in rules:
+                        pair = (source_hash, rule['target_site'])
+                        if pair in existing: continue
+                        try:
+                            job = await _prepare_destination(app, session, client, source_hash, metadata, content, rule)
+                            outcomes.append({'id': job['id'], 'state': job['state']})
+                            existing.add(pair)
+                        except Exception as exc:
+                            print('[Auto Upload] Destination not ready:', source_hash[:12], rule['target_site'],
+                                  str(exc) if isinstance(exc, UploadBlocked) else type(exc).__name__)
+                        if len(outcomes) >= limit: return outcomes
                 if len(outcomes) >= limit: return outcomes
         return outcomes
     finally:

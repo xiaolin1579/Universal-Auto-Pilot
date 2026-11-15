@@ -13,6 +13,7 @@ import re
 import stat
 import tempfile
 import time
+from torrent_metainfo import upload_route_supported
 
 SCHEMA_VERSION = 2
 KINDS = ('hr', 'quest_seed')
@@ -143,7 +144,8 @@ class MappingStore:
                     or job['source_hash'] != infohash(job['source_hash'])
                     or not isinstance(job.get('source_node'), str)
                     or not str(job.get('save_path') or '').startswith('/')
-                    or {'normal': 'DEDBIT', 'special': 'BITSUSE'}.get(job.get('source_zone')) != job.get('target_site')
+                    or not upload_route_supported(job.get('target_site'), job.get('source_zone'), job.get('target_category'))
+                    or job.get('target_zone') != job.get('source_zone')
                     or job.get('content_group_id') not in data['content_groups']
                     or not isinstance(job.get('rule'), dict)):
                 raise ValueError('Invalid upload job')

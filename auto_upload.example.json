@@ -32,6 +32,24 @@
           "c100cat": ""
         },
         "confirmations": {"ack2": false}
+      },
+      {
+        "enable": false,
+        "source_zone": "normal",
+        "source_category": "กรอกชื่อหมวด BearBit ของงานจริงก่อนเปิดใช้ตัวอย่าง TorrentDD",
+        "target_site": "TORRENTDD",
+        "target_category": "19",
+        "fields": {},
+        "confirmations": {"cf1": false, "cf2": false}
+      },
+      {
+        "enable": false,
+        "source_zone": "special",
+        "source_category": "กรอกชื่อหมวด BearBit ของงานจริงก่อนเปิดใช้ตัวอย่าง TorrentDD",
+        "target_site": "TORRENTDD",
+        "target_category": "35",
+        "fields": {},
+        "confirmations": {"cf1": false, "cf2": false}
       }
     ]
   }

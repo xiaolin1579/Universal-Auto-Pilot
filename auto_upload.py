@@ -1,4 +1,4 @@
-"""Durable BearBit -> Dedbit/Bitsuse upload workflow, independent of browser/client SDKs."""
+"""Durable BearBit upload workflow, independent of browser/client SDKs."""
 from copy import deepcopy
 import hashlib
 import os
@@ -7,7 +7,8 @@ from pathlib import Path
 import tempfile
 from torrent_store import infohash, stamp, UPLOAD_STATES as STATES, UPLOAD_HOLD_STATES as HOLD_STATES
 from torrent_metainfo import (_extract_torrent_info_hash, payload_signature,
-                              create_variant, verify_completed)
+                              create_variant, verify_completed, UPLOAD_TARGETS,
+                              upload_route_supported, valid_target_announce)
 
 class UploadBlocked(ValueError):
     """A safe, operator-readable reason that contains no server response or secret."""
@@ -21,7 +22,7 @@ class UploadRejected(UploadBlocked):
 
 def upload_title(job):
     title = str(job['metadata']['title'])
-    limit = 80 if job['target_site'] == 'DEDBIT' else None
+    limit = {'DEDBIT': 80, 'TORRENTDD': 200}.get(job['target_site'])
     if limit is None or len(title) <= limit:
         return title
     base = re.sub(r'^(?:\[[^\]]+\]\s*[- ]*)+', '', title)
@@ -39,26 +40,42 @@ def upload_title(job):
     raise UploadBlocked('Source title needs an explicit shorter display title for this website')
 
 
-ROUTES = {'normal': 'DEDBIT', 'special': 'BITSUSE'}
-def select_rule(rules, metadata):
-    """Category IDs are site-specific: never infer them from a numeric source ID."""
+ROUTES = UPLOAD_TARGETS
+def select_rules(rules, metadata):
+    """Select one explicit category rule per destination for a verified source."""
     zone = metadata.get('zone')
-    if zone not in ROUTES or metadata.get('zone_verified') is not True:
+    if zone not in ROUTES or metadata.get('zone_verified') is not True or metadata.get('site') != 'BEARBIT':
         raise UploadBlocked('BearBit zone is not verified')
-    matches = [r for r in rules if r.get('enable') is True
+    matches = [r for r in rules if isinstance(r, dict) and r.get('enable') is True
                and r.get('source_zone') == zone
                and str(r.get('source_category')) == str(metadata.get('category'))]
-    if len(matches) != 1 or matches[0].get('target_site') != ROUTES[zone]:
-        raise UploadBlocked('Exactly one explicit category rule is required for this BearBit category')
-    rule = matches[0]
-    if not isinstance(rule.get('fields', {}), dict) or not isinstance(rule.get('confirmations', {}), dict):
-        raise UploadBlocked('Category fields and confirmations must be dictionaries')
-    if set(rule.get('confirmations', {})) - {'ack2', 'ack4'}:
-        raise UploadBlocked('Only factual confirmations ack2/ack4 can be configured')
-    if set(rule) - {'enable', 'source_zone', 'source_category', 'target_site', 'target_category',
-                    'fields', 'confirmations', 'short_description'}:
-        raise UploadBlocked('Unsupported category rule fields')
-    return deepcopy(rule)
+    if not matches:
+        raise UploadBlocked('An explicit category rule is required for this BearBit category')
+    destinations = set()
+    for rule in matches:
+        site = rule.get('target_site')
+        if (site in destinations or not upload_route_supported(site, zone, rule.get('target_category'))):
+            raise UploadBlocked('Exactly one supported category rule per destination is required')
+        destinations.add(site)
+        if not isinstance(rule.get('fields', {}), dict) or not isinstance(rule.get('confirmations', {}), dict):
+            raise UploadBlocked('Category fields and confirmations must be dictionaries')
+        allowed = {'cf1', 'cf2'} if site == 'TORRENTDD' else {'ack2', 'ack4'}
+        if (set(rule.get('confirmations', {})) - allowed
+                or any(type(value) is not bool for value in rule.get('confirmations', {}).values())):
+            raise UploadBlocked('Only factual website confirmations can be configured')
+        if set(rule) - {'enable', 'source_zone', 'source_category', 'target_site', 'target_category',
+                        'fields', 'confirmations', 'short_description'}:
+            raise UploadBlocked('Unsupported category rule fields')
+    return deepcopy(matches)
+
+
+def select_rule(rules, metadata, target_site=None):
+    matches = select_rules(rules, metadata)
+    if target_site is not None:
+        matches = [rule for rule in matches if rule['target_site'] == str(target_site).upper()]
+    if len(matches) != 1:
+        raise UploadBlocked('Select an explicit destination when multiple upload rules match')
+    return matches[0]
 
 
 def effective_rule(job):
@@ -66,6 +83,8 @@ def effective_rule(job):
     overrides = job.get('field_overrides', {})
     for key in ('fields', 'confirmations'):
         rule.setdefault(key, {}).update(overrides.get(key, {}))
+    if job.get('target_site') == 'TORRENTDD':
+        rule['fields'].setdefault('poster', job.get('metadata', {}).get('picture', ''))
     return rule
 
 
@@ -232,15 +251,12 @@ class UploadLedger:
             raise UploadBlocked('Published torrent payload differs, or hash is unchanged')
         # Only destination announce hosts; source credentials must not reach the client.
         from torrent_metainfo import _extract_torrent_manifest
-        from urllib.parse import urlsplit
-        hosts = {'DEDBIT': {'tracker.cab'}, 'BITSUSE': {'bitsuse.com', 'www.bitsuse.com'}}[job['target_site']]
         from torrent_metainfo import _decode_bencode_value
         decoded, _ = _decode_bencode_value(content)
         if decoded[b'info'].get(b'private') != 1 or any(k in decoded for k in (b'url-list', b'httpseeds', b'nodes')):
             raise UploadBlocked('Canonical torrent is not private or contains alternate data sources')
         urls = _extract_torrent_manifest(content)['announce_urls']
-        if not urls or any(urlsplit(u).hostname not in hosts or urlsplit(u).scheme not in ('http', 'https')
-                           or urlsplit(u).path != '/announce.php' for u in urls):
+        if not urls or any(not valid_target_announce(job['target_site'], url) for url in urls):
             raise UploadBlocked('Canonical torrent has an unrecognized tracker')
         def apply(data):
             current = data['upload_jobs'][key]
@@ -372,6 +388,8 @@ class UploadWorker:
         if job['state'] != 'rechecking':
             return job
         row = client.inventory(job['target_hash'])
+        if row.get('save_path') != job['save_path']:
+            raise UploadBlocked('Target save path changed during recheck')
         state = str(row.get('state', '')).lower()
         if state.startswith('checking'):
             return self.ledger.transition(key, {'rechecking'}, 'rechecking', recheck_observed=True)
@@ -383,6 +401,8 @@ class UploadWorker:
         if not client.resume(job['target_hash']):
             raise RuntimeError('Resume not confirmed')
         confirmed = client.inventory(job['target_hash'])
+        if confirmed.get('save_path') != job['save_path']:
+            raise UploadBlocked('Target save path changed after resume')
         verify_completed(Path(job['canonical_artifact']).read_bytes(), confirmed, client.files(job['target_hash']))
         if str(confirmed.get('state', '')).lower() not in ('uploading', 'stalledup', 'forcedup'):
             return self.ledger.get(key)

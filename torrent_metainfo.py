@@ -297,15 +297,42 @@ def payload_signature(content):
     return hashlib.sha256(bencode(layout)).hexdigest()
 
 
-def create_variant(content, site, zone, category, announce):
+UPLOAD_TARGETS = {'normal': frozenset({'DEDBIT', 'TORRENTDD'}),
+                  'special': frozenset({'BITSUSE', 'TORRENTDD'})}
+UPLOAD_ANNOUNCE_HOSTS = {'DEDBIT': frozenset({'tracker.cab'}),
+                         'BITSUSE': frozenset({'bitsuse.com', 'www.bitsuse.com'}),
+                         'TORRENTDD': frozenset({'sv-seed.com'})}
+
+
+def upload_route_supported(site, zone, category=None):
+    if site not in UPLOAD_TARGETS.get(zone, ()):
+        return False
+    if site == 'TORRENTDD':
+        # Confirmed on the authenticated upload form; IDs are site-specific.
+        allowed = set(range(34, 39)) if zone == 'special' else set(range(1, 34)) | {40}
+        return str(category) in {str(value) for value in allowed}
+    return True
+
+
+def valid_target_announce(site, announce):
+    """Shared allowlist for prepared and website-canonical upload artifacts."""
     from urllib.parse import urlsplit
+    try:
+        parsed = urlsplit(announce)
+        return (parsed.scheme in ('http', 'https')
+                and parsed.hostname in UPLOAD_ANNOUNCE_HOSTS.get(site, ())
+                and parsed.path == '/announce.php' and not parsed.username
+                and not parsed.password and not parsed.fragment
+                and parsed.port in (None, 80 if parsed.scheme == 'http' else 443))
+    except (TypeError, ValueError):
+        return False
+
+
+def create_variant(content, site, zone, category, announce):
     site = str(site).upper()
-    if (site, zone) not in (('DEDBIT', 'normal'), ('BITSUSE', 'special')):
-        raise ValueError('Unsupported upload route')
-    parsed = urlsplit(announce)
-    hosts = {'DEDBIT': {'tracker.cab'}, 'BITSUSE': {'bitsuse.com', 'www.bitsuse.com'}}
-    if (parsed.scheme not in ('http', 'https') or parsed.hostname not in hosts[site]
-            or parsed.path != '/announce.php' or parsed.username or parsed.password):
+    if not upload_route_supported(site, zone, category):
+        raise ValueError('Unsupported upload route or category')
+    if not valid_target_announce(site, announce):
         raise ValueError('Unrecognized target announce')
     signature = payload_signature(content)
     decoded, _ = _decode_bencode_value(bytes(content))

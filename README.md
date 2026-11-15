@@ -13,7 +13,7 @@ Cross-Seed โดยใช้ `torrent_mapping.json` เป็นฐานข้
   ภาระ H&R/Quest Seed ความสัมพันธ์ Cross-Seed และคิวอัปโหลด
 - **Cross-Seed** ค้นหาในโซนที่เปิดไว้ของ BearBit, Bitsuse, Dedbit, TorrentDD และ Unlimitz พร้อมลองคำค้น
   สำรองที่คงรหัสตอน/รหัสไฟล์ และตรวจ manifest ก่อนเพิ่มงาน
-- **Auto Upload และ Cross-Seed** จาก BearBit โซนปกติไป Dedbit และโซนพิเศษไป Bitsuse
+- **Auto Upload และ Cross-Seed** จาก BearBit โซนปกติไป Dedbit/TorrentDD และโซนพิเศษไป Bitsuse/TorrentDD
   ใช้รายละเอียดจากต้นฉบับ สร้าง infohash แยก และตรวจไฟล์ก่อนเริ่ม seed
 - **Cleaner และการคืนพื้นที่** ตรวจภาระการ seed และการใช้ไฟล์ร่วมกันก่อนลบ
   งานที่ยังยืนยันสถานะไม่ได้จะคงการป้องกันไว้
@@ -182,10 +182,14 @@ Auto Upload ใช้ไฟล์ที่โหลดครบแล้วจ�
 |---|---|
 | BearBit โซนปกติ | Dedbit |
 | BearBit โซนพิเศษ | Bitsuse |
+| BearBit โซนปกติ | TorrentDD โซนปกติ |
+| BearBit โซนพิเศษ | TorrentDD โซนพิเศษ |
 
 เพิ่มส่วน `AUTO_UPLOAD` จาก [auto_upload.example.json](auto_upload.example.json)
 ลงใน config เดิม แล้วตั้งกฎหมวดจาก [auto_upload.rules.json](auto_upload.rules.json)
-มีชุดกฎเริ่มต้น 37 หมวด โดยช่องที่ข้อมูลไม่ครบต้องเติมตามงานจริง
+มีชุดกฎเริ่มต้น 37 หมวดสำหรับ Dedbit/Bitsuse โดยช่องที่ข้อมูลไม่ครบต้องเติมตามงานจริง
+ตัวอย่าง TorrentDD ใน `auto_upload.example.json` ปิดไว้และต้องกรอกหมวดต้นทางก่อนใช้
+ตั้งหลายปลายทางสำหรับ hash ต้นทางเดียวกันได้ โดยแยกงานและตรวจซ้ำต่อเว็บไซต์
 สวิตช์ในตัวอย่างเริ่มต้นปิดทุกขั้น:
 
 | สวิตช์ใน `AUTO_UPLOAD` | ขั้นตอนที่อนุญาต |
@@ -207,6 +211,7 @@ python auto_upload_cli.py --help
 python auto_upload_cli.py status
 python auto_upload_cli.py inspect-form --site DEDBIT --category 35
 python auto_upload_cli.py inspect-form --site BITSUSE --category 181
+python auto_upload_cli.py inspect-form --site TORRENTDD --category 19
 ```
 
 คิวนี้รองรับ **qBittorrent และ torrent v1** รวม padding ที่ประกาศไว้ใน metainfo
@@ -214,6 +219,10 @@ python auto_upload_cli.py inspect-form --site BITSUSE --category 181
 ให้หยุดบอทหลักก่อนใช้ CLI ที่เปิดเบราว์เซอร์ เพื่อใช้ browser profile ครั้งละโปรเซส
 อ่านขั้นตอนเตรียม ตรวจ เผยแพร่ seed และกู้สถานะใน [AUTO_UPLOAD.md](docs/AUTO_UPLOAD.md)
 และตาราง [กฎหมวดหมู่](docs/UPLOAD_CATEGORY_RULES.md)
+ดูข้อจำกัดรูป poster, confirmations และหมวดของ TorrentDD ใน
+[TORRENTDD_AUTO_UPLOAD.md](docs/TORRENTDD_AUTO_UPLOAD.md)
+ทดสอบเผยแพร่จริงบน TorrentDD โซนปกติหมวดซีรีส์จีนแล้ว พร้อมตรวจ canonical torrent,
+recheck จนครบ และเริ่ม seed ด้วยไฟล์เดิมบน client ต้นทาง
 
 ## พื้นที่เก็บข้อมูลและ Cleaner
 
@@ -260,6 +269,7 @@ Cleaner ตรวจ H&R/Quest, manual hold และงานอัปโหล
 | `stats_history.json` / `stats_cache.json` | สถิติและข้อมูลสำหรับรายงาน |
 | [docs/TORRENT_MAPPING.md](docs/TORRENT_MAPPING.md) | schema การย้ายข้อมูล ภาระการ seed และการเพิ่ม client |
 | [docs/AUTO_UPLOAD.md](docs/AUTO_UPLOAD.md) | ตั้งค่าและใช้งาน Auto Upload/Cross-Seed |
+| [docs/TORRENTDD_AUTO_UPLOAD.md](docs/TORRENTDD_AUTO_UPLOAD.md) | หมวด ฟอร์ม และวิธีเตรียมอัปโหลดไป TorrentDD |
 | [docs/UPLOAD_CATEGORY_RULES.md](docs/UPLOAD_CATEGORY_RULES.md) | ตารางจับคู่หมวด BearBit กับเว็บปลายทาง |
 | [docs/STORAGE.md](docs/STORAGE.md) | กติกาเลือก quota/mount และการตั้งค่าพื้นที่ |
 | [docs/NODE_CONFIG.md](docs/NODE_CONFIG.md) | การอ้างบัญชี/ดิสก์ นโยบาย Cleaner และการย้าย config |

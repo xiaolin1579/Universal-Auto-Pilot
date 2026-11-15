@@ -1,6 +1,8 @@
 # อัปโหลดจาก BearBit และ Cross-Seed
 
-เส้นทางที่รองรับคือ **BearBit โซนปกติ → Dedbit** และ **BearBit โซนพิเศษ → Bitsuse**
+เส้นทางที่รองรับคือ **BearBit โซนปกติ → Dedbit หรือ TorrentDD โซนปกติ** และ
+**BearBit โซนพิเศษ → Bitsuse หรือ TorrentDD โซนพิเศษ** สามารถตั้งกฎให้ต้นทางหนึ่งงาน
+ส่งไปหลายเว็บไซต์ได้ โดยเก็บงานแยกตาม hash ต้นทางและเว็บปลายทาง
 ระบบอ่านรายละเอียดจาก BearBit เป็นข้อมูลหลัก ใช้ชื่อ คำอธิบาย และรูปภาพจากต้นฉบับ
 โดยแปลง HTML เป็น BBCode และตัด script, form และลิงก์ที่มีข้อมูลยืนยันตัวตนออก
 เก็บ URL ต้นทางไว้ภายใน mapping และใช้ `[quote]…[/quote]` สำหรับบล็อกอ้างอิง
@@ -11,9 +13,12 @@
 [`auto_upload.example.json`](../auto_upload.example.json) ไปเพิ่มใน `config.json` เดิม
 อย่านำตัวอย่างไปแทนที่ config ทั้งไฟล์ ตัวอย่างยังไม่ใช่กฎที่เปิดใช้งานได้ทันที
 ต้องกรอกหมวดและรายละเอียดให้ตรงกับงานที่จะส่งก่อน
-มีชุดกฎเริ่มต้น 37 หมวดที่ตรวจจากเว็บจริงใน
+มีชุดกฎเริ่มต้น 37 หมวดสำหรับ Dedbit/Bitsuse ที่ตรวจจากเว็บจริงใน
 [`auto_upload.rules.json`](../auto_upload.rules.json) และตาราง
 [UPLOAD_CATEGORY_RULES.md](UPLOAD_CATEGORY_RULES.md) โดยช่องที่ต้นฉบับไม่ให้ข้อมูลจะเว้นว่าง
+ตัวอย่าง TorrentDD ใน `auto_upload.example.json` ปิดใช้งานไว้และใช้ชื่อหมวดต้นทาง
+เป็นข้อความให้กรอก ต้องระบุหมวดจากงานจริงก่อนเปิดใช้ ดูรายละเอียดที่
+[TORRENTDD_AUTO_UPLOAD.md](TORRENTDD_AUTO_UPLOAD.md)
 
 ## หมวดและฟอร์มจริง
 
@@ -21,13 +26,18 @@
 
 - Dedbit: `https://www.dedbit.com/upload.php`
 - Bitsuse: `https://www.bitsuse.com/bs_upload.php`
+- TorrentDD: `https://www.torrentdd.com/upload.php`
 
-ทั้งสองเว็บใช้ฟอร์ม `frmupload` ส่ง multipart ไป `takeupload.php` มี CSRF และ announce
+Dedbit/Bitsuse ใช้ฟอร์ม `frmupload` ส่ง multipart ไป `takeupload.php` มี CSRF และ announce
 เฉพาะบัญชี ระบบอ่านค่าใหม่ก่อนส่งแต่ละครั้งและใช้ session เดียวกันกับที่ล็อกอิน
 หาก action, หมวด, ช่องกรอก หรือ checkbox เปลี่ยนไป ระบบจะหยุดงานนั้นเพื่อให้ตรวจสอบ
+TorrentDD ใช้ฟอร์มชื่อ `upload` ไม่มี form ID และส่ง multipart ไป `takeupload.php`
+ตัวอ่านตรวจรูปแบบช่องกรอกและอ่าน announce ของบัญชีจากหน้าเว็บใหม่ก่อนส่ง
 
 กฎหนึ่งรายการจับคู่ `source_zone` และ **ข้อความในแถว Category ของหน้ารายละเอียด BearBit**
 กับ `target_site` และ `target_category` ของปลายทาง ต้องมีกฎที่เปิดใช้งานตรงกันเพียงหนึ่งข้อ
+ต่อเว็บไซต์ปลายทาง หากมีหลายปลายทาง คำสั่ง `prepare` ต้องระบุ `--target-site`
+ส่วนคิวอัตโนมัติจะเตรียมแต่ละปลายทางแยกกันภายใต้ `max_jobs_per_cycle`
 ไม่ใช้เลขหมวดของ BearBit เป็นเลขหมวดปลายทาง และไม่เลือกค่าหมวดย่อยตัวแรกให้อัตโนมัติ
 
 Dedbit มีหมวดปกติ เช่น `35` ภาพยนตร์, `7` ซีรีส์, `22` การ์ตูนอนิเมะ ส่วน Bitsuse
@@ -40,6 +50,12 @@ Dedbit มีหมวดปกติ เช่น `35` ภาพยนตร์
 เกี่ยวกับเงื่อนไขเนื้อหาของหมวดปกติ ต้องกำหนดตามข้อเท็จจริงของงานเอง
 ส่วน `ack3` ที่ยืนยันไม่พบไฟล์ซ้ำ ระบบเลือกได้หลังค้นหาทุกหน้าที่เกี่ยวข้องและตรวจ payload
 ของผลลัพธ์สำเร็จเท่านั้น หากค้นหาไม่ครบหรือดาวน์โหลด metadata ของผลลัพธ์ไม่ได้จะไม่ส่งฟอร์ม
+
+TorrentDD ใช้ `cf1` ยอมรับการรับผิดชอบ seed จนมีผู้ดาวน์โหลดเสร็จอย่างน้อยหนึ่งคน
+และ `cf2` ยอมรับว่าได้อ่านข้อตกลงการอัปโหลดแล้ว ทั้งสองค่าเริ่มต้นเป็น `false`
+ให้กำหนดตามข้อเท็จจริงก่อนส่งงาน รูป poster ใช้ `metadata.picture` ของ BearBit เป็นค่าเริ่มต้น
+หรือกำหนด `fields.poster` เฉพาะงาน เว็บต้องตรวจรูปสำเร็จก่อนส่งฟอร์ม
+ช่อง `code_id` เป็นรหัสของผู้ขอไฟล์ด่วน ใส่ได้เมื่อมีข้อมูลและปล่อยว่างได้
 
 ## วิธีทำงาน
 
@@ -84,8 +100,11 @@ browser profile เดียวกัน
 python auto_upload_cli.py status
 python auto_upload_cli.py inspect-form --site DEDBIT --category 35
 python auto_upload_cli.py inspect-form --site BITSUSE --category 181
+python auto_upload_cli.py inspect-form --site TORRENTDD --category 19
+python auto_upload_cli.py inspect-form --site TORRENTDD --category 35
 python auto_upload_cli.py inspect-source --node 'ชื่อโหนด' --hash 'infohashต้นทาง' --url 'https://bearbit.org/details.php?id=123' --zone normal
 python auto_upload_cli.py prepare --node 'ชื่อโหนด' --hash 'infohashต้นทาง' --url 'https://bearbit.org/details.php?id=123' --zone normal
+python auto_upload_cli.py prepare --node 'ชื่อโหนด' --hash 'infohashต้นทาง' --url 'https://bearbit.org/details.php?id=123' --zone normal --target-site TORRENTDD
 python auto_upload_cli.py show JOB_ID
 python auto_upload_cli.py check-job JOB_ID
 python auto_upload_cli.py configure JOB_ID --file job-fields.json
@@ -115,7 +134,8 @@ python auto_upload_cli.py run --interval 300
 }
 ```
 
-กำหนดเฉพาะค่าที่ทราบจริง คำสั่งนี้รับช่องที่เว็บประกาศและ `ack2`/`ack4` ของงานนั้น
+กำหนดเฉพาะค่าที่ทราบจริง คำสั่งนี้รับช่องที่เว็บประกาศและ `ack2`/`ack4` ของ Dedbit/Bitsuse
+หรือ `cf1`/`cf2` ของ TorrentDD สำหรับงานนั้น
 ตรวจค่ากับตัวเลือกในฟอร์ม ไม่รับการตั้ง `ack3`, token หรือเปลี่ยนเว็บ/หมวดผ่าน override
 ค่าเฉพาะงานไม่เปลี่ยนกฎกลางและไม่กระทบงานอื่น ถ้าข้อมูลครบจึงเปลี่ยนเป็น `prepared`
 `confirmations: false` ในตัวอย่างหมายถึงยังไม่ยืนยันข้อความนั้น ไม่ใช่การอนุญาตให้ส่ง
