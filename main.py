@@ -4403,6 +4403,7 @@ class RtorrentNode:
         self.jobs = 0
         self.is_connected = False
         self.stat_msg = "Active/Total: 0/0"
+        self.native_disk_free_gb = None
 
     def _get_swizzin_storage_stats(self):
         if self.storage_reader is not None:
@@ -4410,6 +4411,28 @@ class RtorrentNode:
         def request(method, url, **kwargs):
             return self.s.request(method, url, auth=self.auth, **kwargs)
         return read_swizzin_storage_stats(self.url, request, mount=self.storage_mount)
+
+    def _get_native_disk_free_gb(self, torrent_hashes):
+        """rTorrent reports bytes per torrent directory; no path is available on an empty client."""
+        samples = []
+        for torrent_hash in torrent_hashes:
+            response = self.s.post(self.url,
+                data=xmlrpc.client.dumps((torrent_hash.upper(),), methodname='d.free_diskspace'),
+                auth=self.auth, headers=self.headers, timeout=10, verify=True, allow_redirects=False)
+            if response is None or response.status_code != 200:
+                raise RuntimeError('rTorrent native disk free request failed')
+            try:
+                values, _ = xmlrpc.client.loads(response.content)
+            except xmlrpc.client.Fault as exc:
+                # Explicit method absence is different from a network/data error or a full disk.
+                if (exc.faultCode == -32601 or (exc.faultCode == -506
+                        and "method 'd.free_diskspace' not defined" in exc.faultString.lower())):
+                    return None
+                raise RuntimeError('rTorrent native disk free RPC fault') from None
+            if len(values) != 1 or type(values[0]) is not int or values[0] < 0:
+                raise ValueError('Invalid rTorrent native disk free byte count')
+            samples.append(values[0] / (1024 ** 3))
+        return min(samples) if samples else None
 
     def login(self):
         try:
@@ -4469,13 +4492,14 @@ class RtorrentNode:
 
     def refresh_status(self):
         self.free_gb = 0.0
+        self.native_disk_free_gb = None
         _clear_storage_telemetry(self)
         self.stat_msg = "API UNKNOWN: Storage refresh not completed"
         if not self.is_connected:
             return False
 
         try:
-            # 1. ยิง XML-RPC ดึงข้อมูล (d.is_active=, d.size_bytes=, d.bytes_done=, d.hash=)
+            # 1. Read a complete, verified XML-RPC inventory before using any totals.
             xml = (
                 '<?xml version="1.0"?>'
                 '<methodCall>'
@@ -4485,7 +4509,7 @@ class RtorrentNode:
                 '<param><value><string>main</string></value></param>'
                 '<param><value><string>d.is_active=</string></value></param>'
                 '<param><value><string>d.size_bytes=</string></value></param>'
-                '<param><value><string>d.bytes_done=</string></value></param>'
+                '<param><value><string>d.completed_bytes=</string></value></param>'
                 '<param><value><string>d.hash=</string></value></param>'
                 '</params>'
                 '</methodCall>'
@@ -4494,7 +4518,8 @@ class RtorrentNode:
             r = None
             for attempt in range(3):
                 try:
-                    r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers, timeout=10, verify=True)
+                    r = self.s.post(self.url, data=xml, auth=self.auth, headers=self.headers,
+                                    timeout=10, verify=True, allow_redirects=False)
                     break
                 except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
                     if attempt < 2:
@@ -4516,54 +4541,46 @@ class RtorrentNode:
                 print(f"⚠️ [{self.name}] XML-RPC returned HTTP {r.status_code}")
                 return False
 
-            soup = BeautifulSoup(r.text, "xml")
-
             active = 0
             total_count = 0
             used_bytes = 0
-
-            # หาโหนดข้อมูล
-            torrent_nodes = soup.find_all("data")
-            if len(torrent_nodes) > 1:
-                for node in torrent_nodes[1:]:
-                    items = node.find_all("value", recursive=False)
-                    if len(items) >= 4:
-                        try:
-                            is_active = int(items[0].get_text().strip())
-                            bytes_done = int(items[2].get_text().strip())
-
-                            if is_active == 1:
-                                active += 1
-                            total_count += 1
-                            used_bytes += bytes_done
-                        except ValueError:
-                            pass
+            values, _ = xmlrpc.client.loads(r.content)
+            if len(values) != 1 or not isinstance(values[0], (list, tuple)):
+                raise ValueError('Invalid rTorrent storage inventory')
+            torrent_hashes = set()
+            for row in values[0]:
+                if not isinstance(row, (list, tuple)) or len(row) != 4:
+                    raise ValueError('Incomplete rTorrent storage inventory')
+                is_active, size_bytes, bytes_done, torrent_hash = row
+                if (any(type(v) is not int for v in row[:3]) or is_active not in (0, 1)
+                        or not 0 <= bytes_done <= size_bytes):
+                    raise ValueError('Invalid rTorrent storage inventory numbers')
+                if not isinstance(torrent_hash, str) or not re.fullmatch(r'(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})', torrent_hash):
+                    raise ValueError('Invalid rTorrent storage inventory hash')
+                torrent_hash = torrent_hash.lower()
+                if torrent_hash in torrent_hashes:
+                    raise ValueError('Duplicate rTorrent storage inventory hash')
+                torrent_hashes.add(torrent_hash)
+                active += is_active
+                total_count += 1
+                used_bytes += bytes_done
 
             used_gb = used_bytes / (1024**3)
             safety_buffer = float(self.storage_safety_buffer_gb)
             if not (0.0 <= safety_buffer < float("inf")):
                 raise ValueError("Invalid storage safety buffer")
 
-            # 2. ดึง Disk Free space
-            xml_disk = '<?xml version="1.0"?><methodCall><methodName>network.disk_free_4gb</methodName></methodCall>'
-            real_free_gb = 0.0
-
-            try:
-                r_free = self.s.post(self.url, data=xml_disk, auth=self.auth, headers=self.headers, timeout=10, verify=True)
-                if r_free and r_free.status_code == 200:
-                    free_soup = BeautifulSoup(r_free.text, "xml")
-                    free_node = free_soup.find(["i8", "int", "i4", "value"])
-                    if free_node:
-                        real_free_gb = (int(free_node.get_text().strip()) * 4096) / (1024**3)
-            except Exception as disk_err:
-                print(f"⚠️ [{self.name}] Disk free check warning: {disk_err}")
+            # 2. Native space is an optional physical ceiling, never a fabricated zero.
+            real_free_gb = self._get_native_disk_free_gb(sorted(torrent_hashes))
+            self.native_disk_free_gb = real_free_gb
+            native_label = f'{real_free_gb:.2f}GiB' if real_free_gb is not None else 'N/A'
 
             # Provider usage covers shared files and other clients too. Never
             # estimate provider quota by summing torrent sizes when configured.
             if self.storage_api == "swizzin":
                 storage = self._get_swizzin_storage_stats()
                 _apply_storage_telemetry(self, storage)
-                display_free = min(storage["free_gb"], real_free_gb)
+                display_free = storage['free_gb'] if real_free_gb is None else min(storage['free_gb'], real_free_gb)
                 self.free_gb = max(0.0, display_free - safety_buffer)
                 source_label = "Q" if storage["source"] == "quota" else "M"
                 mount_label = (f"Mount: {storage['disk_mount']} | "
@@ -4571,14 +4588,16 @@ class RtorrentNode:
                 self.stat_msg = (
                     f"Source: {storage['source']} | "
                     f"FREE({source_label}): {storage['free_gb']:.2f}GiB | "
-                    f"{mount_label}FREE(RT): {real_free_gb:.2f}GiB | "
+                    f"{mount_label}FREE(RT): {native_label} | "
                     f"Total: {total_count} | "
                     f"Used: {storage['used_gb']:.2f}GiB / {storage['total_gb']:.2f}GiB | "
-                    f"Safe: {self.free_gb:.2f}GiB"
+                    f"Buffer: {safety_buffer:.2f}GiB | Safe: {self.free_gb:.2f}GiB"
                 )
                 return True
 
             # 3. คำนวณพื้นที่ Quota & Display Free สำหรับ node เดิมที่ไม่มี provider
+            if real_free_gb is None:
+                raise RuntimeError('rTorrent disk space unverified; configure storage telemetry')
             quota_free_gb = max(0.0, self.quota_gb - used_gb) if self.quota_gb > 0 else float('inf')
 
             if self.quota_gb > 0:
@@ -4602,6 +4621,7 @@ class RtorrentNode:
 
         except Exception as e:
             self.free_gb = 0.0
+            self.native_disk_free_gb = None
             _clear_storage_telemetry(self)
             self.stat_msg = f"API ERROR: Storage refresh failed ({type(e).__name__})"
             print(f"⚠️ [{self.name}] rTorrent Refresh Status Error: {e}")
@@ -6063,7 +6083,9 @@ class NodeCleaner:
             return False
 
         try:
-            self.node.refresh_status()
+            if not self.node.refresh_status():
+                print(f"⚠️ [{self.node.name}] Reclaim aborted: storage status verification failed")
+                return False
             buffer_gb = 5.0 if is_emergency else 2.5
             target_free = required_gb + buffer_gb
             current_free = float(getattr(self.node, 'free_gb', 0.0))
