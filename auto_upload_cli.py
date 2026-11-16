@@ -27,9 +27,12 @@ def parser():
                                  help='Destination; required when more than one category rule matches')
     configure = sub.add_parser('configure')
     configure.add_argument('job_id'); configure.add_argument('--file', required=True)
-    for name in ('show', 'check-job', 'publish', 'seed', 'reconcile', 'reconcile-seed', 'cancel'):
+    for name in ('show', 'check-job', 'publish', 'seed', 'reconcile', 'reconcile-seed', 'cancel', 'retry-publication'):
         cmd = sub.add_parser(name); cmd.add_argument('job_id')
         if name == 'reconcile': cmd.add_argument('--url', required=True)
+        if name == 'retry-publication':
+            cmd.add_argument('--confirm-not-published', action='store_true', required=True,
+                             help='Confirm you checked destination My Uploads and this job was not published')
     return p
 
 
@@ -83,8 +86,13 @@ async def execute(args, app):
             if args.once: return None
             await asyncio.sleep(args.interval)
     job = None if args.command in ('prepare', 'inspect-source') else ledger.get(args.job_id)
-    if args.command in ('publish', 'seed', 'reconcile-seed') and not enabled_rule(cfg, job):
+    if args.command in ('publish', 'seed', 'reconcile-seed', 'retry-publication') and not enabled_rule(cfg, job):
         raise UploadBlocked('The job category rule is no longer enabled or has changed')
+    if args.command == 'retry-publication':
+        if getattr(args, 'confirm_not_published', False) is not True:
+            raise UploadBlocked('Confirm the job is absent from destination My Uploads before retrying')
+        if job['state'] != 'publication_uncertain' or job.get('listing') or job.get('target_hash'):
+            raise UploadBlocked('Only an uncertain publication without a recorded listing can be retried')
     if args.command == 'publish' and cfg.get('enable_publish') is not True:
         raise UploadBlocked('AUTO_UPLOAD.enable_publish must be true')
     if args.command in ('seed', 'reconcile-seed') and cfg.get('enable_seed') is not True:
@@ -126,15 +134,22 @@ async def execute(args, app):
             elif args.command == 'check-job':
                 return await worker.check_job(job['id'], await session.adapter(job['target_site']), client)
             elif args.command == 'publish':
-                result = await worker.publish(job['id'], await session.adapter(job['target_site']), client)
+                result = await worker.publish(job['id'], await session.adapter(job['target_site']), client,
+                                              allow_manual_retry=True)
+            elif args.command == 'retry-publication':
+                result = await worker.retry_publication(job['id'], await session.adapter(job['target_site']), client,
+                                                        confirmed_not_published=args.confirm_not_published)
             elif args.command == 'reconcile-seed':
                 result = await asyncio.to_thread(worker.reconcile_seed, job['id'], client)
             else:
                 result = await asyncio.to_thread(worker.seed, job['id'], client, cfg.get('enable_resume') is True)
         notices.record(result)
-        return {'id': result['id'], 'state': result['state'], 'target_site': result['target_site']}
+        outcome = {'id': result['id'], 'state': result['state'], 'target_site': result['target_site']}
+        if args.command == 'retry-publication':
+            outcome['manual_publish_required'] = True
+        return outcome
     except Exception as exc:
-        if job is not None and args.command in ('publish', 'seed', 'reconcile', 'reconcile-seed'):
+        if job is not None and args.command in ('publish', 'seed', 'reconcile', 'reconcile-seed', 'retry-publication'):
             current = ledger.get(job['id'])
             notices.record(current, safe_error(exc, current))
         raise
@@ -143,7 +158,7 @@ async def execute(args, app):
             if node is not None: app.CLIENTS.close(node)
             await session.close()
         finally:
-            if args.command in ('prepare', 'publish', 'seed', 'reconcile', 'reconcile-seed'):
+            if args.command in ('prepare', 'publish', 'seed', 'reconcile', 'reconcile-seed', 'retry-publication'):
                 await notices.flush()
 
 

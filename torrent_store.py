@@ -152,6 +152,14 @@ class MappingStore:
             target = job.get('target_hash')
             if target is not None and (not infohash(target) or target != infohash(target) or target == job['source_hash']):
                 raise ValueError('Invalid upload variant hash')
+            if 'publication_retry' in job and (
+                    not isinstance(job['publication_retry'], dict)
+                    or type(job['publication_retry'].get('manual_publish_required')) is not bool):
+                raise ValueError('Invalid publication retry guard')
+            if 'publication_history' in job and (
+                    not isinstance(job['publication_history'], list)
+                    or any(not isinstance(item, dict) for item in job['publication_history'])):
+                raise ValueError('Invalid publication history')
         for key, group in data['content_groups'].items():
             if (not isinstance(group, dict) or group.get('id') != key
                     or not re.fullmatch(r'[0-9a-f]{64}', key)

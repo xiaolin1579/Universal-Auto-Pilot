@@ -169,6 +169,13 @@ torrent บนเซิร์ฟเวอร์จริง
 
 ## คิวอัปโหลดและ variant
 
+เมื่อผู้ใช้ตรวจ My Uploads แล้วว่างานที่ค้าง `publication_uncertain` ไม่ถูกเผยแพร่จริง
+คำสั่ง `retry-publication --confirm-not-published` จะตรวจต้นทาง/ฟอร์ม/งานซ้ำใหม่ก่อนปลดงาน
+เก็บหลักฐานล่าสุดใน `publication_retry_check` และประวัติการส่งเดิมใน `publication_history`
+งานที่ปลดแล้วเป็น `draft`/`prepared` พร้อม `publication_retry.manual_publish_required: true`
+คิวอัตโนมัติจะข้ามจนกว่าจะสั่ง `publish` โดยตรง ไม่สูญเสียการป้องกัน source จาก Cleaner
+ดูขั้นตอนใน [คู่มือ Auto Upload](AUTO_UPLOAD.md#ยืนยันว่าไม่มีประกาศ-แล้วอนุญาตส่งใหม่)
+
 `upload_jobs` บันทึกสถานะเตรียม/ส่ง/ยืนยัน/recheck ของ BearBit → Dedbit/Bitsuse
 และป้องกันไฟล์จาก Cleaner ระหว่างดำเนินการ ส่วน `content_groups` เชื่อม hash
 ที่มี payload ตรงกันจาก layout และ piece hashes อ่านวิธีตั้งค่าและความหมายสถานะได้ที่

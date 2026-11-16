@@ -137,6 +137,9 @@ async def run_cycle(app, active_nodes):
                 continue
             if job['state'] in ('seeding', 'cancelled'):
                 continue
+            if job.get('publication_retry', {}).get('manual_publish_required') is True:
+                notices.record(job)
+                continue
             if job['state'] == 'draft' and cfg.get('enable_publish') is not True:
                 continue
             node = nodes.get(job['source_node'])

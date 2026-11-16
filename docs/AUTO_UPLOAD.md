@@ -252,6 +252,38 @@ query string, cookies หรือเนื้อหาหน้าเว็บ 
 งานเก่าที่มีเพียง `RuntimeError` จะไม่สามารถย้อนคืนรายละเอียดเหตุการณ์ที่ไม่ได้บันทึกไว้
 เมื่อพบรายการจริงและยืนยันแล้ว ให้ใช้ `reconcile` ตาม URL ของรายการ ไม่เปลี่ยนกลับเป็น `prepared` เพื่อส่งซ้ำ
 
+### ยืนยันว่าไม่มีประกาศ แล้วอนุญาตส่งใหม่
+
+หากตรวจ **My Uploads / รายการที่ฉันอัปโหลด** ของบัญชีปลายทางแล้วว่าไม่มีงานนี้จริง
+ใช้คำสั่งต่อไปนี้กับงาน `publication_uncertain` ที่ยังไม่มี listing/hash ปลายทางบันทึกไว้:
+
+```sh
+python auto_upload_cli.py retry-publication JOB_ID --confirm-not-published
+python auto_upload_cli.py show JOB_ID
+```
+
+ต้องอัปเดตโค้ดและรีสตาร์ทบอททุก instance ให้เป็นรุ่นที่รองรับคำสั่งนี้ก่อน
+`--confirm-not-published` เป็นการยืนยันผลตรวจของผู้ใช้ ไม่ใช่การสรุปจากผลค้นหาว่าง
+ไม่รับสถานะ `submitting` เพราะอาจยังมี process กำลังส่งอยู่
+
+คำสั่งตรวจ source ที่โหนดเดิม/path เดิม ไฟล์ครบ payload/variant เดิม ฟอร์มปลายทางสด
+และค้นหาซ้ำใหม่ หากพบงานซ้ำ, อาจซ้ำ, ค้นหาไม่ครบ หรือ API ผิดพลาด จะไม่อนุญาตส่งใหม่
+หลักฐานค้นหาที่ได้บันทึกใน `publication_retry_check`; ผลขัดข้องที่ยังไม่มีหลักฐานไม่เปลี่ยนสถานะงาน
+
+เมื่อตรวจผ่าน จะเก็บข้อมูลการส่งครั้งเดิมใน `publication_history`
+และกลับเป็น `prepared` หรือ `draft` หากฟอร์มยังขาดข้อมูล โดยคงการป้องกัน source จาก Cleaner
+งานมี `publication_retry.manual_publish_required: true` จึงไม่ถูกคิวอัตโนมัติส่ง แม้เปิด `enable_publish`
+ดู/แก้ข้อมูลด้วย `show`, `check-job`, `configure` ได้ตามเดิม แล้วสั่งส่งโดยตรงเมื่อพร้อม:
+
+```sh
+python auto_upload_cli.py publish JOB_ID
+```
+
+`publish` ยังต้องเปิด `AUTO_UPLOAD.enable`, `enable_publish` และกฎหมวดเดิม
+ตรวจต้นทาง ฟอร์ม และงานซ้ำใหม่อีกครั้งก่อน POST และใช้สิทธิ์ส่งใหม่นี้เมื่อเริ่มส่งจริงเท่านั้น
+ถ้าผลส่งครั้งใหม่ยังไม่ชัดเจน จะกลับ `publication_uncertain` และไม่ส่งซ้ำอัตโนมัติ
+คำสั่ง `retry-publication` เองไม่ส่งฟอร์มหรือเพิ่ม/เริ่ม torrent บน seedbox
+
 ## การแจ้งเตือน
 
 Auto Upload ส่งผ่าน `send_notify` เดียวกับระบบหลัก ใช้การตั้งค่า LINE, Telegram และ Discord เดิม
@@ -272,7 +304,7 @@ Auto Upload ส่งผ่าน `send_notify` เดียวกับระ�
 ผลการส่งแจ้งเตือนไม่เปลี่ยนสถานะ upload และไม่สั่งส่งฟอร์มหรือเพิ่มงานใน seedbox ซ้ำ
 งาน `seeding` เดิมที่ไม่มีข้อความรอส่งจะไม่แจ้งย้อนหลังเมื่ออัปเดตโค้ด
 
-ครอบคลุมบอทหลัก, CLI `run` และคำสั่ง `prepare`/`publish`/`seed`/`reconcile`/`reconcile-seed`
+ครอบคลุมบอทหลัก, CLI `run` และคำสั่ง `prepare`/`publish`/`seed`/`reconcile`/`reconcile-seed`/`retry-publication`
 คำสั่งตรวจสอบ เช่น `status`, `show`, `inspect-source` และ `check-job` ไม่ส่งแจ้งเตือน
 
 ## ข้อมูลใน mapping และ Cleaner

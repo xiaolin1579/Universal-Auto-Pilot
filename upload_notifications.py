@@ -62,11 +62,16 @@ def message_for(job, error=None):
     needs_input = job['state'] == 'draft' and error and error.startswith('Destination form is incomplete:')
     if error and not needs_input and job['state'] not in ('publication_uncertain', 'submitting', 'adding', 'seed_uncertain', 'verification_failed'):
         label = '⚠️ Auto Upload: งานหยุดรอตรวจสอบ'
+    manual_retry = job.get('publication_retry', {}).get('manual_publish_required') is True
+    if manual_retry and job['state'] == 'prepared' and not error:
+        label = '🔁 Auto Upload: อนุญาตส่งใหม่ รอคำสั่ง publish'
     lines = ['<b>' + label + '</b>', _text(job.get('metadata', {}).get('title')),
              'BEARBIT (' + _text(job.get('source_zone')) + ') → ' + _text(job.get('target_site'))
              + ' (' + _text(job.get('target_zone')) + ')',
              'โหนด: ' + _text(job.get('source_node')), 'สถานะ: ' + _text(job['state']),
              'Job: ' + _text(job['id'])]
+    if manual_retry and job['state'] in ('draft', 'prepared'):
+        lines.append('ส่งใหม่ด้วยคำสั่ง publish เท่านั้น คิวอัตโนมัติจะยังไม่ส่งงานนี้')
     if error:
         lines.append('เหตุผล: ' + ('ข้อมูลแบบฟอร์มยังไม่ครบ จึงยังไม่ได้ส่งอัปโหลด' if needs_input else _text(error, 400)))
     if job['state'] in ('publication_uncertain', 'submitting') and job.get('last_publication_failure'):

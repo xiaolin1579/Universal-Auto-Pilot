@@ -208,6 +208,9 @@ class UploadLedger:
                     job['state'] = 'prepared' if job['readiness']['ready'] else 'draft'
                 job['created_at'] = old['created_at']
                 job['prepare_revision'] = old.get('prepare_revision', 1) + 1
+                for field in ('publication_history', 'publication_retry', 'publication_retry_check'):
+                    if field in old:
+                        job[field] = deepcopy(old[field])
             if any(j['id'] != key and j['source_hash'] == job['source_hash'] and j['target_site'] == job['target_site']
                    and j['state'] != 'cancelled' for j in data['upload_jobs'].values()):
                 raise UploadBlocked('This source already has a job on this destination')
@@ -234,7 +237,8 @@ class UploadLedger:
             'target_site', 'target_zone', 'target_category', 'content_group_id', 'prepared_hash',
             'metadata', 'rule', 'readiness', 'form_schema', 'duplicate_check',
             'source_verified_at', 'field_overrides', 'created_at', 'updated_at', 'target_hash', 'listing',
-            'notifications', 'submission_started_at', 'last_publication_failure') if k in job}
+            'notifications', 'submission_started_at', 'last_publication_failure',
+            'publication_history', 'publication_retry', 'publication_retry_check') if k in job}
         public['target_title'] = upload_title(job)
         public['torrent_filename'] = upload_filename(job)
         public['effective_fields'] = effective_rule(job).get('fields', {})
@@ -302,7 +306,8 @@ class UploadLedger:
 
     @staticmethod
     def same_configuration(current, expected):
-        keys = ('source_hash', 'source_node', 'save_path', 'prepared_hash', 'metadata', 'rule', 'field_overrides')
+        keys = ('source_hash', 'source_node', 'save_path', 'prepared_hash', 'metadata', 'rule',
+                'field_overrides', 'publication_retry')
         return all(current.get(k) == expected.get(k) for k in keys)
 
     def claim_submission(self, key, expected, evidence):
@@ -312,7 +317,40 @@ class UploadLedger:
                 raise UploadBlocked('Job configuration changed during preflight; check the job again')
             current.update(state='submitting', duplicate_check={**evidence, 'checked_at': stamp()},
                            submission_started_at=stamp(), updated_at=stamp())
+            if current.get('publication_retry', {}).get('manual_publish_required') is True:
+                current['publication_retry'].update(manual_publish_required=False, consumed_at=stamp())
         self.store.update(apply)
+
+    def record_publication_retry(self, key, expected, evidence, spec):
+        """Keep an uncertain attempt's history; only a complete clear search can rearm it.
+
+        Re-armed jobs require an explicit CLI publish; the scheduler must not send them.
+        """
+        def apply(data):
+            current = data['upload_jobs'][key]
+            if (current['state'] != 'publication_uncertain' or current.get('listing') or current.get('target_hash')
+                    or current.get('updated_at') != expected.get('updated_at')
+                    or not self.same_configuration(current, expected)):
+                raise UploadBlocked('Uncertain job changed during retry checks; inspect it again')
+            checked_at = stamp()
+            current['publication_retry_check'] = {**deepcopy(evidence), 'checked_at': checked_at}
+            if evidence.get('status') == 'clear' and evidence.get('complete') is True:
+                attempt = {field: deepcopy(current[field]) for field in (
+                    'state', 'submission_started_at', 'last_publication_failure', 'last_submission_failure',
+                    'duplicate_check') if field in current}
+                attempt.update(resolution='operator_confirmed_not_published', resolved_at=checked_at)
+                current.setdefault('publication_history', []).append(attempt)
+                current.update(state='prepared' if spec['readiness']['ready'] else 'draft',
+                    readiness=deepcopy(spec['readiness']), source_verified_at=checked_at,
+                    form_schema={k: deepcopy(spec[k]) for k in ('fields', 'acknowledgements')},
+                    duplicate_check=deepcopy(current['publication_retry_check']),
+                    publication_retry={'method': 'operator_checked_my_uploads', 'confirmed_at': checked_at,
+                                       'manual_publish_required': True})
+                for field in ('submission_started_at', 'last_publication_failure', 'last_submission_failure'):
+                    current.pop(field, None)
+            current['updated_at'] = checked_at
+            return deepcopy(current)
+        return self.store.update(apply)
 
     def record_check(self, key, expected, evidence, readiness=None):
         def apply(data):
@@ -400,8 +438,38 @@ class UploadWorker:
         self.ledger.record_check(key, job, evidence, readiness=spec['readiness'])
         return self.ledger.review(key)
 
-    async def publish(self, key, adapter, client):
+    async def retry_publication(self, key, adapter, client, *, confirmed_not_published=False):
+        """Operator confirmed My Uploads is empty; revalidate without posting or adding torrents."""
         job = self.ledger.get(key)
+        if confirmed_not_published is not True:
+            raise UploadBlocked('Confirm the job is absent from destination My Uploads before retrying')
+        if job['state'] != 'publication_uncertain' or job.get('listing') or job.get('target_hash'):
+            raise UploadBlocked('Only an uncertain publication without a recorded listing can be retried')
+        live = client.inventory(job['source_hash'])
+        if client.name != job['source_node'] or live.get('save_path') != job['save_path']:
+            raise UploadBlocked('Source client or save path changed; cannot authorize a retry')
+        source = Path(job['source_artifact']).read_bytes()
+        verify_completed(source, live, client.files(job['source_hash']))
+        if payload_signature(source) != job['content_group_id']:
+            raise UploadBlocked('Source payload no longer matches the uncertain job')
+        spec = await adapter.load_form(job, require_ready=False)
+        if not isinstance(spec.get('readiness'), dict) or type(spec['readiness'].get('ready')) is not bool:
+            raise UploadBlocked('Destination form readiness could not be verified')
+        variant = create_variant(source, job['target_site'], job['target_zone'], job['target_category'], spec['announce'])
+        if _extract_torrent_info_hash(variant) != job['prepared_hash']:
+            raise UploadBlocked('Prepared variant no longer matches the uncertain job')
+        evidence = await adapter.check_duplicates(job)
+        if not isinstance(evidence, dict):
+            raise UploadBlocked('Duplicate search returned invalid evidence')
+        result = self.ledger.record_publication_retry(key, job, evidence, spec)
+        if evidence.get('status') != 'clear' or evidence.get('complete') is not True:
+            raise UploadBlocked(duplicate_block_reason(evidence, job['target_site']))
+        return result
+
+    async def publish(self, key, adapter, client, *, allow_manual_retry=False):
+        job = self.ledger.get(key)
+        if job.get('publication_retry', {}).get('manual_publish_required') is True and allow_manual_retry is not True:
+            raise UploadBlocked('Publication retry requires an explicit CLI publish command')
         if self.enable_publish and job['state'] in ('draft', 'prepared'):
             self.ledger.confirm_for_publish(key)
             job = self.ledger.get(key)
