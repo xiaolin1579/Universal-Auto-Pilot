@@ -25,3 +25,6 @@ httpx
 aiohttp
 qbittorrent-api
 bcoding
+
+# Deluge daemon SSL-RPC (Web UI ไม่ต้องใช้ codec นี้)
+rencode>=1.0.8,<2

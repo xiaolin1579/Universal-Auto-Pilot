@@ -5452,7 +5452,7 @@ CLIENTS.register(ClientAdapter('deluge',
     lambda cfg: DelugeNode(cfg, storage_reader=_read_shared_storage, mapper=add_or_update_torrent),
     DelugeNode, lambda node: node.storage_inventory(),
     purge_reader=lambda node, target: node.get_purge_snapshot(target),
-    close=lambda node: node.s.close(), upload_factory=DelugeUploadClient))
+    close=lambda node: node.close(), upload_factory=DelugeUploadClient))
 
 
 def _read_storage_inventory(node):

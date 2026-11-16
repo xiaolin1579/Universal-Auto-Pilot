@@ -16,7 +16,7 @@ import tempfile
 import time
 from urllib.parse import urlsplit, urlunsplit
 
-from node_config import ConfigError, normalize_config, uses_shared_nodes
+from node_config import ConfigError, deluge_rpc_settings, normalize_config, uses_shared_nodes
 
 
 class ConfigEditorError(ValueError):
@@ -34,14 +34,14 @@ _CLEAN_FIELDS = {'enable', 'policy', 'allow_space_reclaim', 'min_ratio',
                  'min_time_minutes', 'max_time_minutes'}
 _LEGACY_CLEAN_FIELDS = {'enable', 'min_ratio', 'min_time', 'max_time', 'max_idle_hours'}
 _SHARED_NODE_FIELDS = {'id', 'name', 'type', 'url', 'enable', 'storage_id', 'auth',
-                       'cleaner', 'space_accounting', 'allow_sweeper_auto_resume', 'daemon_id'}
+                       'cleaner', 'space_accounting', 'allow_sweeper_auto_resume', 'daemon_id', 'rpc'}
 _LEGACY_NODE_FIELDS = {'name', 'type', 'url', 'enable', 'qb_user', 'qb_pass', 'rt_user',
                        'rt_pass', 'nginx', 'quota_gb', 'disk_type', 'clean_settings',
                        'allow_space_reclaim', 'provider_sso', 'provider_user', 'provider_pass',
                        'provider_auth_origin', 'storage_api', 'storage_mount',
                        'storage_safety_buffer_gb', 'storage_id', 'allow_sweeper_auto_resume',
                        'preallocated_downloads_accounted_in_free_space', 'deluge_user', 'deluge_pass',
-                       'http_basic_user', 'http_basic_pass', 'daemon_id'}
+                       'http_basic_user', 'http_basic_pass', 'daemon_id', 'rpc'}
 
 
 def _object(value):
@@ -175,7 +175,7 @@ def _validate(doc):
             for field in ('quota_gb', 'storage_safety_buffer_gb'):
                 if field in n:
                     _number(n[field])
-            if 'url' in n:
+            if 'url' in n and not deluge_rpc_settings(n):
                 _url(n['url'])
             if n.get('disk_type', 'HDD') not in ('HDD', 'SSD', 'NVME', 'HYBRID'):
                 raise ConfigEditorError('Unsupported disk type')
@@ -337,7 +337,8 @@ def add_node(raw, node):
     new = deepcopy(raw); candidate = deepcopy(node)
     candidate.setdefault('enable', False)
     if not shared:
-        _url(candidate.get('url'))
+        if not deluge_rpc_settings(candidate):
+            _url(candidate.get('url'))
         prefix = {'rtorrent': 'rt', 'deluge': 'deluge', 'qbit': 'qb'}[candidate['type']]
         if any(not isinstance(candidate.get(prefix + suffix), str) for suffix in ('_user', '_pass')):
             raise ConfigEditorError('New legacy nodes require username and password strings')
@@ -652,7 +653,12 @@ class Editor:
         node = _node(self.doc, ident)
         changes = _form(node, [('url', str, False), ('enable', bool, False), ('allow_sweeper_auto_resume', bool, False)])
         if node.get('type') == 'deluge':
-            changes.update(_form(node, [('daemon_id', str, False)]))
+            if urlsplit(changes.get('url', node['url'])).scheme == 'deluge+ssl':
+                changes['daemon_id'] = REMOVE
+                changes['rpc'] = self.rpc_form(node.get('rpc', {}))
+            else:
+                changes['rpc'] = REMOVE
+                changes.update(_form(node, [('daemon_id', str, False)]))
         if uses_shared_nodes(self.doc):
             changes.update(_form(node, [('storage_id', str, False)]))
             if input('แก้ auth references? [y/N]: ').strip().lower() == 'y':
@@ -678,11 +684,11 @@ class Editor:
             if not current.get('session'):
                 patch['session'].setdefault('type', 'qbit')
         elif kind == 'deluge':
-            print('Deluge Web ใช้รหัสผ่าน Web UI; username ใน credential เว้นว่างได้')
+            print('session.type: deluge_web = Web UI; deluge_rpc = username/password จากไฟล์ auth ของ daemon')
             session = current.get('session') or {'type': 'deluge_web'}
-            patch['session'] = _form(session, [('credential_ref', str, False)])
+            patch['session'] = _form(session, [('type', str, False), ('credential_ref', str, False)])
             if not current.get('session'):
-                patch['session']['type'] = 'deluge_web'
+                patch['session'].setdefault('type', 'deluge_web')
         basic = current.get('http_basic') or {}
         value = _answer('HTTP Basic credential_ref (-=ไม่ใช้)', basic.get('credential_ref'))
         if value is None:
@@ -691,18 +697,28 @@ class Editor:
             patch['http_basic'] = {'credential_ref': value}
         return patch
 
+    def rpc_form(self, current):
+        print('RPC protocol: 2 สำหรับ Deluge 2.x, 1.3 สำหรับ 1.3.15; TLS ใช้ CA หรือ SHA-256 certificate pin อย่างใดอย่างหนึ่ง')
+        return _form(current, [('protocol', str, False), ('tls_ca_file', str, False),
+                               ('tls_cert_sha256', str, False)])
+
     def add_node(self):
         shared = uses_shared_nodes(self.doc)
         name = input('ชื่อ node (ต้องคงชื่อไว้หลังเริ่มใช้งาน): ').strip()
         kind = input('type [qbit/rtorrent/deluge]: ').strip()
         node = {'name': name, 'type': kind, 'url': input('URL: ').strip(), 'enable': False}
         if kind == 'deluge':
-            daemon = input('daemon_id (ว่างได้เมื่อมี daemon เดียว): ').strip()
-            if daemon: node['daemon_id'] = daemon
+            if urlsplit(node['url']).scheme == 'deluge+ssl':
+                node['rpc'] = _merge({}, self.rpc_form({}))
+            else:
+                daemon = input('daemon_id (ว่างได้เมื่อมี daemon เดียว): ').strip()
+                if daemon: node['daemon_id'] = daemon
         if shared:
             node['id'] = input('id: ').strip()
             node['storage_id'] = input('storage_id: ').strip()
-            node['auth'] = _merge({}, self.auth_form(kind, {}))
+            initial = ({'session': {'type': 'deluge_rpc'}}
+                       if kind == 'deluge' and urlsplit(node['url']).scheme == 'deluge+ssl' else {})
+            node['auth'] = _merge(initial, self.auth_form(kind, initial))
         else:
             prefix = {'rtorrent': 'rt', 'deluge': 'deluge'}.get(kind, 'qb')
             node[prefix + '_user'] = input('Username: ')

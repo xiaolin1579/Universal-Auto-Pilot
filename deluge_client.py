@@ -1,4 +1,4 @@
-"""Deluge Web JSON-RPC adapter, negotiated by capabilities for 1.3.x and 2.x."""
+"""Deluge Web JSON-RPC / daemon SSL-RPC adapter for 1.3.x and 2.x."""
 import base64
 import math
 import posixpath
@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 import requests
 
 from auto_upload import UploadBlocked, upload_filename
+from deluge_rpc import DaemonRPC, DaemonRPCError
 from torrent_metainfo import _extract_torrent_manifest, payload_signature, verify_completed
 from torrent_store import infohash
 
@@ -60,11 +61,28 @@ class DelugeNode:
     def __init__(self, cfg, *, storage_reader=None, mapper=None):
         self.name = cfg['name']; self.url = cfg['url'].rstrip('/')
         self.client_id = cfg.get('id')
-        parsed = urlsplit(self.url)
-        if (parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username
+        try:
+            parsed = urlsplit(self.url)
+            parsed.port
+        except ValueError:
+            raise DelugeError('Invalid Deluge connection URL') from None
+        self._daemon_rpc = None
+        if parsed.scheme == 'deluge+ssl':
+            if cfg.get('daemon_id') is not None or cfg.get('nginx') or cfg.get('http_basic_user') is not None:
+                raise DelugeError('Daemon RPC does not use daemon_id or HTTP Basic authentication')
+            try:
+                self._daemon_rpc = DaemonRPC(self.url, cfg.get('rpc'))
+            except DaemonRPCError as exc:
+                raise DelugeError(str(exc)) from None
+            if not isinstance(cfg.get('deluge_user'), str) or not cfg['deluge_user'].strip():
+                raise DelugeError('Daemon RPC requires a Deluge auth-file username')
+        elif (parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username
                 or parsed.password or parsed.query or parsed.fragment):
             raise DelugeError('Invalid Deluge Web URL')
+        elif 'rpc' in cfg:
+            raise DelugeError('Deluge RPC settings require a daemon RPC URL')
         self.endpoint = self.url if parsed.path.endswith('/json') else self.url + '/json'
+        self.username = cfg.get('deluge_user', '')
         self.password = cfg.get('deluge_pass', '')
         if not isinstance(self.password, str):
             raise DelugeError('Deluge Web password must be text')
@@ -92,6 +110,12 @@ class DelugeNode:
 
     def _raw_rpc(self, method, params=()):
         with self._lock:
+            if self._daemon_rpc is not None:
+                try:
+                    return self._daemon_rpc.call(method, params)
+                except DaemonRPCError as exc:
+                    self.is_connected = False
+                    raise DelugeError(str(exc)) from None
             self._request_id += 1
             ident = self._request_id
             try:
@@ -116,6 +140,8 @@ class DelugeNode:
                 raise DelugeError('Deluge transport or response failed: ' + type(exc).__name__) from None
 
     def _check_daemon(self):
+        if self._daemon_rpc is not None:
+            return  # The TLS socket is bound to the configured daemon, independent of Web UI.
         if self._raw_rpc('web.connected') is not True:
             raise DelugeError('Deluge daemon disconnected')
         status = self._raw_rpc('web.get_host_status', [self.daemon_id])
@@ -136,6 +162,8 @@ class DelugeNode:
         with self._lock:
             self.is_connected = False
             try:
+                if self._daemon_rpc is not None:
+                    return self._login_rpc()
                 if self._raw_rpc('auth.login', [self.password]) is not True:
                     raise DelugeError('Deluge Web authentication rejected')
                 hosts = self._raw_rpc('web.get_hosts')
@@ -166,9 +194,44 @@ class DelugeNode:
                 print(f'✅ [{self.name}] Login successful: Deluge={self.version}, Web JSON-RPC')
                 return True
             except DelugeError as exc:
+                if self._daemon_rpc is not None:
+                    self._daemon_rpc.close()
                 self.stat_msg = str(exc)
                 print(f'⚠️ [{self.name}] {exc}')
                 return False
+
+    def _login_rpc(self):
+        try:
+            self.methods = set()
+            self.version = 'unknown'
+            self._daemon_rpc.connect()
+            kwargs = {} if self._daemon_rpc.legacy else {'client_version': 'Universal-Auto-Pilot'}
+            level = self._daemon_rpc.call('daemon.login', [self.username, self.password], **kwargs)
+            if type(level) is not int or level < 5:
+                raise DelugeError('Deluge daemon authentication rejected or insufficient permissions')
+            self._set_version(self._raw_rpc('daemon.info'))
+            if not self.version.startswith(('1.3.', '2.0.', '2.1.', '2.2.')):
+                raise DelugeError('Deluge daemon version is outside the supported Swizzin version families')
+            if self._daemon_rpc.legacy != self.version.startswith('1.3.'):
+                raise DelugeError('Deluge daemon version does not match rpc.protocol')
+            methods = self._raw_rpc('daemon.get_method_list')
+            if not isinstance(methods, (list, tuple)) or any(not isinstance(m, str) for m in methods):
+                raise DelugeError('Invalid Deluge capability list')
+            self.methods = set(methods)
+            if 'core.get_torrents_status' not in self.methods:
+                raise DelugeError('Deluge torrent inventory capability unavailable')
+            self.is_connected = True
+            print(f'✅ [{self.name}] Login successful: Deluge={self.version}, Daemon SSL-RPC')
+            return True
+        except DaemonRPCError as exc:
+            raise DelugeError(str(exc)) from None
+
+    def close(self):
+        with self._lock:
+            self.is_connected = False
+            if self._daemon_rpc is not None:
+                self._daemon_rpc.close()
+            self.s.close()
 
     def rpc(self, method, params=(), *, mutation=False):
         with self._lock:

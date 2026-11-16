@@ -26,12 +26,13 @@ Cross-Seed โดยใช้ `torrent_mapping.json` เป็นฐานข้
 
 | ความสามารถ | qBittorrent | rTorrent | Deluge |
 |---|---|---|---|
-| เชื่อมต่อ อ่านรายการ และเพิ่มงานดาวน์โหลด | Web API | XML-RPC | Web JSON-RPC 1.3.x/2.x |
+| เชื่อมต่อ อ่านรายการ และเพิ่มงานดาวน์โหลด | Web API | XML-RPC | Web JSON-RPC / Daemon SSL-RPC |
 | อ่านพื้นที่ Swizzin แบบ quota → mount | รองรับ | รองรับ | รองรับ |
 | ตรวจไฟล์ร่วมก่อน Cleaner ลบ | รองรับ | ระงับการลบหากเก็บไฟล์ไว้ไม่ได้ | รองรับ |
 | เพิ่มและ recheck งานจากคิว Auto Upload | torrent v1 | torrent v1 | torrent v1 พร้อมหลักฐาน Checking |
 
-Deluge ใช้ Web UI ตาม [คู่มือ Deluge](docs/DELUGE.md) และ [ตัวอย่าง node](deluge.node.example.json)
+Deluge รองรับ Web UI และ Daemon SSL-RPC ตาม [คู่มือ Deluge](docs/DELUGE.md)
+มีตัวอย่าง [Web node](deluge.node.example.json) และ [RPC node](deluge-rpc.node.example.json)
 ตรวจความสามารถ API ก่อนทำงาน ไม่รับรอง Web UI ทุกเวอร์ชันที่ใช้ API คนละแบบ
 
 ตัวอ่าน H&R/Quest ที่ยืนยันข้อมูลสดรองรับ **BearBit** ก่อน เว็บไซต์อื่นต้องมีตัวอ่าน
@@ -102,9 +103,11 @@ python -c "import json; from pathlib import Path; json.loads(Path('config.json')
 | `TELEGRAM_CONFIG` / `DISCORD_CONFIG` / `LINE_CONFIG` | การแจ้งเตือนและรีโมทตามช่องทางที่รองรับ |
 
 ในรูปแบบเดิม `NODES[].type` ใช้ `qbit`, `rtorrent` หรือ `deluge` พร้อมบัญชี `qb_user`/`qb_pass`
-หรือ `rt_user`/`rt_pass` ตามชนิด client ส่วน Deluge ใช้ `deluge_pass` ของ Web UI
-และ `deluge_user` เว้นว่างได้ โดย `nginx` ใช้เปิด HTTP Basic Auth
-สำหรับ qBittorrent ที่อยู่หลัง reverse proxy ส่วน OnlyOneSeedbox ใช้
+หรือ `rt_user`/`rt_pass` ตามชนิด client ส่วน Deluge Web ใช้ `deluge_pass` ของ Web UI
+และ `deluge_user` เว้นว่างได้ โดย `nginx` ใช้เปิด HTTP Basic Auth สำหรับ client หลัง reverse proxy
+Deluge Daemon RPC ใช้ URL `deluge+ssl://host:port`, `deluge_user`/`deluge_pass`
+จากไฟล์ auth ของ daemon และตั้ง `rpc` ตามคู่มือ ไม่ใช้ HTTP Basic
+ส่วน OnlyOneSeedbox ใช้
 `provider_sso`, `provider_user` และ `provider_pass` สำหรับล็อกอินผ่านผู้ให้บริการ
 
 เปิดเฉพาะเว็บไซต์ โซน และโหนดที่จะใช้งาน ก่อนเปิดการลบหรือเผยแพร่ให้ตรวจเงื่อนไข

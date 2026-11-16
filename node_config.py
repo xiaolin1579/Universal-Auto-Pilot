@@ -10,6 +10,8 @@ from pathlib import Path
 import re
 from urllib.parse import urlsplit
 
+from deluge_rpc import DaemonRPCError, validate_rpc_config
+
 
 class ConfigError(ValueError):
     """A configuration error whose message contains field names, never values."""
@@ -69,6 +71,28 @@ def _known(value, allowed, field):
         raise ConfigError(field + " contains unsupported fields")
 
 
+def deluge_rpc_settings(node):
+    """Validate transport-specific fields in shared and legacy documents."""
+    url = node.get('url')
+    try:
+        is_rpc = isinstance(url, str) and urlsplit(url).scheme == 'deluge+ssl'
+    except ValueError:
+        raise ConfigError('Invalid node URL') from None
+    if is_rpc:
+        if node.get('type') != 'deluge':
+            raise ConfigError('A daemon RPC URL requires type deluge')
+        try:
+            validate_rpc_config(url, node.get('rpc'))
+        except DaemonRPCError as exc:
+            raise ConfigError(str(exc)) from None
+        if (node.get('daemon_id') is not None or node.get('nginx') is True
+                or node.get('http_basic_user') is not None):
+            raise ConfigError('Daemon RPC does not use daemon_id or HTTP Basic')
+    elif 'rpc' in node:
+        raise ConfigError('NODES.rpc requires a Deluge daemon RPC URL')
+    return is_rpc
+
+
 def normalize_config(raw):
     """Return a legacy-compatible view; raw input and on-disk data are untouched."""
     _object(raw, "config")
@@ -77,6 +101,10 @@ def normalize_config(raw):
     if not isinstance(nodes, list) or any(not isinstance(n, dict) for n in nodes):
         raise ConfigError("NODES must be a list of objects")
     if not uses_shared_nodes(config):
+        for node in nodes:
+            if deluge_rpc_settings(node) and (not isinstance(node.get('deluge_user'), str)
+                                            or not node['deluge_user'].strip()):
+                raise ConfigError('Daemon RPC requires a Deluge auth-file username')
         return config
 
     credentials = _object(config.get("CREDENTIALS", {}), "CREDENTIALS")
@@ -119,7 +147,9 @@ def normalize_config(raw):
         by_id[ident] = node
         names.add(name_key)
         _bool(node.get("enable", False), "NODES.enable")
-        _url(node.get("url"), "NODES.url")
+        is_rpc = deluge_rpc_settings(node)
+        if not is_rpc:
+            _url(node.get("url"), "NODES.url")
         if node.get("type") not in ("qbit", "rtorrent", "deluge"):
             raise ConfigError("Unsupported shared-config client type")
         storage_id = _text(node.get("storage_id"), "NODES.storage_id")
@@ -146,9 +176,12 @@ def normalize_config(raw):
         elif node['type'] == 'deluge':
             session = _object(auth.get('session'), 'auth.session')
             _known(session, {'type', 'credential_ref'}, 'auth.session')
-            if session.get('type') != 'deluge_web':
-                raise ConfigError('Deluge requires a deluge_web session')
+            expected = 'deluge_rpc' if is_rpc else 'deluge_web'
+            if session.get('type') != expected:
+                raise ConfigError('Deluge URL and auth.session.type must select the same transport')
             node['deluge_user'], node['deluge_pass'] = credential(session.get('credential_ref'))
+            if is_rpc and (basic is not None or not node['deluge_user'].strip()):
+                raise ConfigError('Daemon RPC requires an auth-file username and no HTTP Basic')
             if 'daemon_id' in node:
                 _text(node['daemon_id'], 'NODES.daemon_id')
         else:
@@ -219,6 +252,8 @@ def normalize_config(raw):
         if kind == "swizzin":
             if source.get("provider_sso"):
                 raise ConfigError("Swizzin telemetry does not support a provider SSO source")
+            if urlsplit(source['url']).scheme not in ('http', 'https'):
+                raise ConfigError('Swizzin telemetry.via_node must reference an HTTP(S) node on the same storage')
             node["_storage_reader"] = {
                 "url": source["url"],
                 "http_basic_user": source.get("http_basic_user"),

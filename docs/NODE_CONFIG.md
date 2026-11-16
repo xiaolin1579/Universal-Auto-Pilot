@@ -16,10 +16,12 @@
 
 - qBittorrent ใช้ `auth.session.type: "qbit"` และระบุ HTTP Basic เพิ่มได้
   บัญชี Basic และบัญชีในโปรแกรมสามารถเป็นคนละบัญชีกัน
-- rTorrent ใช้ `auth.http_basic` ตัว client รองรับ Digest fallback ตามเดิม
+- rTorrent ใช้ `auth.http_basic` ตัว client รองรับ Digest fallback ตามเดิม และไม่ใช้ `auth.session`
 - Deluge ใช้ `auth.session.type: "deluge_web"` กับ credential ของ Web UI และมี HTTP Basic แยกได้
   รองรับ `daemon_id` เมื่อ Web UI มีหลาย daemon ดู [คู่มือ Deluge](DELUGE.md)
-  และยังไม่รองรับ `auth.session`
+- Deluge Daemon RPC ใช้ `auth.session.type: "deluge_rpc"` กับบัญชีจากไฟล์ auth ของ daemon
+  และ URL `deluge+ssl://host:port`; ตั้ง `rpc.protocol` และ CA/certificate pin ตามคู่มือ
+  หากใช้ Swizzin quota/mount ต้องให้ `telemetry.via_node` อ้าง node HTTP(S) บน storage เดียวกัน
 - OnlyOneSeedbox ใช้ `auth.session.type: "onlyone_sso"` กับ qBittorrent
   โดย `credential_ref` เป็นบัญชีผู้ให้บริการ ไม่ตั้ง HTTP Basic ร่วมกับ SSO
   `origin` เป็นตัวเลือกสำหรับตรวจสอบ origin ของบริการ ต้องอยู่ใน origin

@@ -1,0 +1,31 @@
+{
+  "CREDENTIALS": {
+    "deluge-daemon": {"username": "YOUR_DAEMON_USER", "password": "CHANGE_ME_DAEMON_PASSWORD"}
+  },
+  "STORAGES": {
+    "deluge-data": {
+      "disk_type": "HDD",
+      "quota_gib": 0,
+      "safety_buffer_gib": 2,
+      "telemetry": {"type": "client"}
+    }
+  },
+  "NODES": [
+    {
+      "id": "deluge-rpc-1",
+      "name": "Deluge RPC",
+      "type": "deluge",
+      "enable": false,
+      "url": "deluge+ssl://seedbox.example:58846",
+      "storage_id": "deluge-data",
+      "auth": {
+        "session": {"type": "deluge_rpc", "credential_ref": "deluge-daemon"}
+      },
+      "rpc": {
+        "protocol": "2",
+        "tls_cert_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "cleaner": {"enable": false, "allow_space_reclaim": false}
+    }
+  ]
+}
