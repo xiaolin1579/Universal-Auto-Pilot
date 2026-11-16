@@ -247,13 +247,15 @@ async def fill(adapter, job, artifact):
 
 async def submit(adapter, job):
     from upload_sites import listing_identity, trusted_url, authenticated
+    adapter._publication_context = {'stage': 'prepare_submit', 'page_path': '/upload.php'}
     snapshot = getattr(adapter, '_torrentdd_submission', None)
     if (not snapshot or snapshot['job_id'] != job.get('id') or snapshot['prepared_hash'] != job.get('prepared_hash')
             or hashlib.sha256(Path(snapshot['path']).read_bytes()).hexdigest() != snapshot['sha256']):
-        raise RuntimeError('TorrentDD submission artifact changed; reconcile before another POST')
+        raise UploadBlocked('TorrentDD submission artifact changed; reconcile before another POST')
     expected = {key: snapshot[key] for key in ('values', 'file_name', 'file_size')}
     adapter._torrentdd_submission = None
     # The durable worker has already recorded submitting before this call.
+    adapter._publication_context['stage'] = 'submit'
     sent = await adapter.tab.evaluate("""(() => {
         if (location.origin !== 'https://www.torrentdd.com' || location.pathname !== '/upload.php') return false;
         const form = document.querySelector('form[name=upload]');
@@ -279,15 +281,17 @@ async def submit(adapter, job):
         return true;
     })()""".replace('EXPECTED', json.dumps(expected, ensure_ascii=True)), return_by_value=True)
     if sent is not True:
-        raise RuntimeError('TorrentDD submission not confirmed; reconcile before another POST')
+        raise UploadBlocked('TorrentDD submission not confirmed; reconcile before another POST')
+    adapter._publication_context['stage'] = 'await_result'
     for _ in range(30):
         await asyncio.sleep(1)
         current = await adapter.tab.evaluate('window.location.href')
         trusted_url('TORRENTDD', current)
+        adapter._publication_context['page_path'] = urlsplit(current).path
         try:
             listing = listing_identity('TORRENTDD', current)
             authenticated(BeautifulSoup(await adapter.tab.get_content(), 'html.parser'), 'TORRENTDD', current)
             return listing
         except ValueError:
             continue
-    raise RuntimeError('TorrentDD publication result uncertain; reconcile without another POST')
+    raise UploadBlocked('TorrentDD publication result unconfirmed; inspect the destination and reconcile without another POST')

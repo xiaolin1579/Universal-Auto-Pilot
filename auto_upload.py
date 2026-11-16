@@ -66,6 +66,18 @@ def duplicate_block_reason(evidence, site):
     return 'Duplicate search incomplete: ' + reason
 
 
+def publication_failure(adapter, error):
+    """Persist controlled diagnostics; never store exception text or full URLs."""
+    context = getattr(adapter, '_publication_context', None)
+    context = context if isinstance(context, dict) else {}
+    stages = {'prepare_submit', 'submit', 'await_result', 'resolve_listing'}
+    paths = {'/upload.php', '/bs_upload.php', '/takeupload.php', '/browse.php', '/bs_browse.php',
+             '/details.php', '/bs_details.php', '/login.php', '/bs_login.php'}
+    return {'stage': context.get('stage') if context.get('stage') in stages else 'unknown',
+            'page_path': context.get('page_path') if context.get('page_path') in paths else 'unknown',
+            'error_type': type(error).__name__, 'checked_at': stamp()}
+
+
 def select_rules(rules, metadata):
     """Select one explicit category rule per destination for a verified source."""
     zone = metadata.get('zone')
@@ -211,7 +223,7 @@ class UploadLedger:
             'target_site', 'target_zone', 'target_category', 'content_group_id', 'prepared_hash',
             'metadata', 'rule', 'readiness', 'form_schema', 'duplicate_check',
             'source_verified_at', 'field_overrides', 'created_at', 'updated_at', 'target_hash', 'listing',
-            'notifications') if k in job}
+            'notifications', 'submission_started_at', 'last_publication_failure') if k in job}
         public['target_title'] = upload_title(job)
         public['torrent_filename'] = upload_filename(job)
         public['effective_fields'] = effective_rule(job).get('fields', {})
@@ -287,7 +299,8 @@ class UploadLedger:
             current = data['upload_jobs'][key]
             if current['state'] != 'prepared' or not self.same_configuration(current, expected):
                 raise UploadBlocked('Job configuration changed during preflight; check the job again')
-            current.update(state='submitting', duplicate_check={**evidence, 'checked_at': stamp()}, updated_at=stamp())
+            current.update(state='submitting', duplicate_check={**evidence, 'checked_at': stamp()},
+                           submission_started_at=stamp(), updated_at=stamp())
         self.store.update(apply)
 
     def record_check(self, key, expected, evidence, readiness=None):
@@ -418,8 +431,9 @@ class UploadWorker:
             self.ledger.transition(key, {'submitting'}, 'prepared',
                 last_submission_failure={'code': exc.code, 'title_limit': exc.title_limit, 'verified_at': stamp()})
             raise
-        except BaseException:
-            self.ledger.transition(key, {'submitting'}, 'publication_uncertain')
+        except BaseException as exc:
+            self.ledger.transition(key, {'submitting'}, 'publication_uncertain',
+                                   last_publication_failure=publication_failure(adapter, exc))
             raise
         return await self.verify_publication(key, adapter)
 

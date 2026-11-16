@@ -135,7 +135,8 @@ async def execute(args, app):
         return {'id': result['id'], 'state': result['state'], 'target_site': result['target_site']}
     except Exception as exc:
         if job is not None and args.command in ('publish', 'seed', 'reconcile', 'reconcile-seed'):
-            notices.record(ledger.get(job['id']), safe_error(exc))
+            current = ledger.get(job['id'])
+            notices.record(current, safe_error(exc, current))
         raise
     finally:
         try:

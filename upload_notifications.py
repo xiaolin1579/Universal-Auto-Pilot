@@ -7,8 +7,15 @@ from auto_upload import UploadBlocked
 from torrent_store import stamp
 
 
-def safe_error(error):
-    return str(error) if isinstance(error, UploadBlocked) else type(error).__name__
+def safe_error(error, job=None):
+    if isinstance(error, UploadBlocked):
+        return str(error)
+    if job and job.get('state') == 'publication_uncertain':
+        failure = job.get('last_publication_failure', {})
+        stage = failure.get('stage')
+        if stage in ('prepare_submit', 'submit', 'await_result', 'resolve_listing', 'unknown'):
+            return 'Publication unconfirmed at ' + stage + ' (' + type(error).__name__ + '); inspect destination before retry'
+    return type(error).__name__
 
 
 def _text(value, limit=300):
@@ -62,6 +69,10 @@ def message_for(job, error=None):
              'Job: ' + _text(job['id'])]
     if error:
         lines.append('เหตุผล: ' + ('ข้อมูลแบบฟอร์มยังไม่ครบ จึงยังไม่ได้ส่งอัปโหลด' if needs_input else _text(error, 400)))
+    if job['state'] in ('publication_uncertain', 'submitting') and job.get('last_publication_failure'):
+        failure = job['last_publication_failure']
+        lines.append('ขั้นตอนล่าสุด: ' + _text(failure.get('stage'), 40)
+                     + ' | หน้า: ' + _text(failure.get('page_path'), 60))
     if job['state'] == 'draft':
         readiness = job.get('readiness', {})
         missing = [str(v) for key in ('missing_fields', 'invalid_fields', 'unknown_fields', 'missing_confirmations')

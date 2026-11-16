@@ -161,8 +161,11 @@ async def run_cycle(app, active_nodes):
             except Exception as exc:
                 # No response bodies/URLs/cookies/announce tokens in logs.
                 current = ledger.get(job['id'])
-                notices.record(current, safe_error(exc))
-                outcomes.append({'id': job['id'], 'state': current['state'], 'error': safe_error(exc)})
+                notices.record(current, safe_error(exc, current))
+                outcome = {'id': job['id'], 'state': current['state'], 'error': safe_error(exc, current)}
+                if current['state'] == 'publication_uncertain' and current.get('last_publication_failure'):
+                    outcome['publication_failure'] = current['last_publication_failure']
+                outcomes.append(outcome)
         if len(outcomes) >= limit: return outcomes
         # Queue only hashes linked to BearBit by verified, authenticated site_records.
         data = ledger.store.read()

@@ -342,6 +342,9 @@ class BrowserSite:
                 # Verify navigation did not advance while the DOM was being read.
                 if await self.tab.evaluate('window.location.href') == current:
                     authenticated(BeautifulSoup(html, 'html.parser'), self.site, current)
+                    context = getattr(self, '_publication_context', None)
+                    if isinstance(context, dict) and context.get('stage') == 'resolve_listing':
+                        context['page_path'] = actual.path
                     return html, current
             if actual.path.endswith(('login.php', 'signin.php')) and loaded == 'complete':
                 raise UploadBlocked('Site session expired during navigation')
@@ -613,15 +616,19 @@ class BrowserSite:
         return listing if can_edit else None
 
     async def submit(self, job):
+        self._publication_context = {'stage': 'prepare_submit'}
         if self.site == 'TORRENTDD':
             from torrentdd_upload import submit
             return await submit(self, job)
         # This is the only publication action. Worker has durably claimed submitting.
+        self._publication_context = {'stage': 'submit'}
         await self.tab.evaluate("document.getElementById('frmupload').requestSubmit()")
+        self._publication_context = {'stage': 'await_result'}
         for _ in range(30):
             await asyncio.sleep(1)
             current = await self.tab.evaluate('window.location.href')
             trusted_url(self.site, current)
+            self._publication_context['page_path'] = urlsplit(current).path
             if urlsplit(current).path == '/takeupload.php':
                 rejected = known_upload_rejection(await self.tab.get_content())
                 if rejected:
@@ -632,7 +639,8 @@ class BrowserSite:
                 return listing
             except ValueError: pass
         if self.site == 'BITSUSE' and urlsplit(current).path == '/bs_browse.php':
+            self._publication_context['stage'] = 'resolve_listing'
             listing = await self.resolve_publication(job)
             if listing:
                 return listing
-        raise RuntimeError('Publication result uncertain; reconcile this job without another POST')
+        raise UploadBlocked('Publication result unconfirmed; inspect the destination and reconcile without another POST')
