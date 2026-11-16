@@ -50,6 +50,7 @@ from torrent_store import MappingStore, UPLOAD_HOLD_STATES
 from client_registry import ClientAdapter, ClientRegistry
 from cross_seed_search import search_keywords, search_zones
 from upload_client import QbitUploadClient, RtorrentUploadClient
+from deluge_client import DelugeNode, DelugeUploadClient
 from storage_telemetry import parse_size_gib, read_swizzin_storage_stats
 from node_config import load_config as load_node_config
 import torrentdd_cross_seed
@@ -5447,6 +5448,11 @@ CLIENTS.register(ClientAdapter("rtorrent", RtorrentNode, RtorrentNode, _read_bui
                                purge_reader=lambda node, torrent_hash: node.get_purge_snapshot(torrent_hash),
                                supports_keep_files=False, close=lambda node: node.s.close(),
                                upload_factory=RtorrentUploadClient))
+CLIENTS.register(ClientAdapter('deluge',
+    lambda cfg: DelugeNode(cfg, storage_reader=_read_shared_storage, mapper=add_or_update_torrent),
+    DelugeNode, lambda node: node.storage_inventory(),
+    purge_reader=lambda node, target: node.get_purge_snapshot(target),
+    close=lambda node: node.s.close(), upload_factory=DelugeUploadClient))
 
 
 def _read_storage_inventory(node):
@@ -5582,7 +5588,7 @@ class NodeCleaner:
         native_snapshot = adapter.purge_reader is not None
         if native_snapshot:
             inventory, rt_trackers = adapter.purge_reader(self.node, target)
-            error = "RTORRENT_RPC_UNAVAILABLE"
+            error = adapter.client_type.upper() + '_RPC_UNAVAILABLE'
         elif adapter.client_type == "qbit":
             inventory, error = self._purge_qbit_get_json(
                 "/api/v2/torrents/info", {"hashes": target}
@@ -12329,10 +12335,10 @@ def run_opt_in_new_hash_cross_seed(matches, active_nodes):
 
     # Fail closed if any enabled node cannot be inspected by this qBittorrent
     # API handler. Do not infer global absence from a partial inventory.
-    if any(str(item.get("type", "qbit")).casefold() == "rtorrent"
+    if any(str(item.get("type", "qbit")).casefold() != "qbit"
            for item in configured):
         print(
-            "⛔ [Cross-Seed New Hash] An enabled rTorrent node exists; "
+            "⛔ [Cross-Seed New Hash] An enabled non-qBittorrent node exists; "
             "cross-node duplicate check is unsupported. No additions."
         )
         return

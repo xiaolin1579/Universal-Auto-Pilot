@@ -1,7 +1,7 @@
 # Universal Auto-Pilot
 
 ระบบจัดการ torrent บน seedbox ด้วย Python และ **nodriver** สำหรับค้นหาและดาวน์โหลด
-ตามโซนของเว็บไซต์ กระจายงานไปยัง qBittorrent/rTorrent ติดตามภาระการ seed และทำ
+ตามโซนของเว็บไซต์ กระจายงานไปยัง qBittorrent/rTorrent/Deluge ติดตามภาระการ seed และทำ
 Cross-Seed โดยใช้ `torrent_mapping.json` เป็นฐานข้อมูลร่วมกัน
 
 ## ความสามารถปัจจุบัน
@@ -24,12 +24,15 @@ Cross-Seed โดยใช้ `torrent_mapping.json` เป็นฐานข้
 
 ความสามารถของแต่ละ client ยังต่างกัน:
 
-| ความสามารถ | qBittorrent | rTorrent |
-|---|---|---|
-| เชื่อมต่อ อ่านรายการ และเพิ่มงานดาวน์โหลด | รองรับ Web API | รองรับ XML-RPC |
-| อ่านพื้นที่ Swizzin แบบ quota → mount | รองรับ | รองรับ |
-| ตรวจไฟล์ร่วมก่อน Cleaner ลบ | รองรับ | รองรับ; ระงับการลบหากเก็บไฟล์ไว้ไม่ได้ |
-| เพิ่มและ recheck งานจากคิว Auto Upload | รองรับ torrent v1 | รองรับ torrent v1 ผ่าน XML-RPC |
+| ความสามารถ | qBittorrent | rTorrent | Deluge |
+|---|---|---|---|
+| เชื่อมต่อ อ่านรายการ และเพิ่มงานดาวน์โหลด | Web API | XML-RPC | Web JSON-RPC 1.3.x/2.x |
+| อ่านพื้นที่ Swizzin แบบ quota → mount | รองรับ | รองรับ | รองรับ |
+| ตรวจไฟล์ร่วมก่อน Cleaner ลบ | รองรับ | ระงับการลบหากเก็บไฟล์ไว้ไม่ได้ | รองรับ |
+| เพิ่มและ recheck งานจากคิว Auto Upload | torrent v1 | torrent v1 | torrent v1 พร้อมหลักฐาน Checking |
+
+Deluge ใช้ Web UI ตาม [คู่มือ Deluge](docs/DELUGE.md) และ [ตัวอย่าง node](deluge.node.example.json)
+ตรวจความสามารถ API ก่อนทำงาน ไม่รับรอง Web UI ทุกเวอร์ชันที่ใช้ API คนละแบบ
 
 ตัวอ่าน H&R/Quest ที่ยืนยันข้อมูลสดรองรับ **BearBit** ก่อน เว็บไซต์อื่นต้องมีตัวอ่าน
 ที่รองรับจึงจะยืนยันสถานะ `clear` ได้ ดูรายละเอียดใน
@@ -98,8 +101,9 @@ python -c "import json; from pathlib import Path; json.loads(Path('config.json')
 | `AUTO_UPLOAD` | กฎเส้นทางอัปโหลด หมวดปลายทาง และสวิตช์แต่ละขั้นตอน |
 | `TELEGRAM_CONFIG` / `DISCORD_CONFIG` / `LINE_CONFIG` | การแจ้งเตือนและรีโมทตามช่องทางที่รองรับ |
 
-ในรูปแบบเดิม `NODES[].type` ใช้ `qbit` หรือ `rtorrent` พร้อมบัญชี `qb_user`/`qb_pass`
-หรือ `rt_user`/`rt_pass` ตามชนิด client โดย `nginx` ใช้เปิด HTTP Basic Auth
+ในรูปแบบเดิม `NODES[].type` ใช้ `qbit`, `rtorrent` หรือ `deluge` พร้อมบัญชี `qb_user`/`qb_pass`
+หรือ `rt_user`/`rt_pass` ตามชนิด client ส่วน Deluge ใช้ `deluge_pass` ของ Web UI
+และ `deluge_user` เว้นว่างได้ โดย `nginx` ใช้เปิด HTTP Basic Auth
 สำหรับ qBittorrent ที่อยู่หลัง reverse proxy ส่วน OnlyOneSeedbox ใช้
 `provider_sso`, `provider_user` และ `provider_pass` สำหรับล็อกอินผ่านผู้ให้บริการ
 
@@ -226,7 +230,7 @@ python auto_upload_cli.py inspect-form --site BITSUSE --category 181
 python auto_upload_cli.py inspect-form --site TORRENTDD --category 19
 ```
 
-คิวนี้รองรับ **qBittorrent/rTorrent และ torrent v1** รวม padding ที่ประกาศไว้ใน metainfo
+คิวนี้รองรับ **qBittorrent/rTorrent/Deluge และ torrent v1** รวม padding ที่ประกาศไว้ใน metainfo
 rTorrent เพิ่มแบบหยุดผ่าน `load.raw` ตรวจ hash ด้วย `d.check_hash` และเริ่ม seed หลังตรวจครบเท่านั้น
 ส่วน torrent v2/hybrid และ symlink ยังไม่รองรับในขั้นเพิ่มงานจากคิวนี้
 ให้หยุดบอทหลักก่อนใช้ CLI ที่เปิดเบราว์เซอร์ เพื่อใช้ browser profile ครั้งละโปรเซส

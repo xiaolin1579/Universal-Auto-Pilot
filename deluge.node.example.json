@@ -1,0 +1,29 @@
+{
+  "CREDENTIALS": {
+    "deluge-web": {"username": "", "password": "CHANGE_ME_WEB_PASSWORD"},
+    "deluge-http": {"username": "YOUR_ACCOUNT", "password": "CHANGE_ME_HTTP_PASSWORD"}
+  },
+  "STORAGES": {
+    "deluge-data": {
+      "disk_type": "HDD",
+      "quota_gib": 0,
+      "safety_buffer_gib": 2,
+      "telemetry": {"type": "client"}
+    }
+  },
+  "NODES": [
+    {
+      "id": "deluge-1",
+      "name": "Deluge",
+      "type": "deluge",
+      "enable": false,
+      "url": "https://seedbox.example/deluge/",
+      "storage_id": "deluge-data",
+      "auth": {
+        "http_basic": {"credential_ref": "deluge-http"},
+        "session": {"type": "deluge_web", "credential_ref": "deluge-web"}
+      },
+      "cleaner": {"enable": false, "allow_space_reclaim": false}
+    }
+  ]
+}

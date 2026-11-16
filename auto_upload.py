@@ -78,6 +78,17 @@ def publication_failure(adapter, error):
             'error_type': type(error).__name__, 'checked_at': stamp()}
 
 
+def request_recheck(client, target):
+    result = client.recheck(target)
+    if isinstance(result, dict):
+        if result.get('accepted') is not True or type(result.get('observed')) is not bool:
+            raise UploadBlocked('Client recheck acknowledgement invalid')
+        return result['observed']
+    if result is not True:
+        raise RuntimeError('Recheck request not confirmed')
+    return False
+
+
 def select_rules(rules, metadata):
     """Select one explicit category rule per destination for a verified source."""
     zone = metadata.get('zone')
@@ -466,9 +477,8 @@ class UploadWorker:
                     raise UploadBlocked('Target hash already exists; reconcile it explicitly')
                 if not client.add_paused(content, job):
                     raise RuntimeError('Paused add not confirmed')
-                if not client.recheck(job['target_hash']):
-                    raise RuntimeError('Recheck request not confirmed')
-                self.ledger.transition(key, {'adding'}, 'rechecking', recheck_requested_at=stamp())
+                observed = request_recheck(client, job['target_hash'])
+                self.ledger.transition(key, {'adding'}, 'rechecking', recheck_requested_at=stamp(), recheck_observed=observed)
                 # A later pass must observe checking and then a completed paused state.
             except BaseException:
                 self.ledger.transition(key, {'adding'}, 'seed_uncertain')
@@ -524,7 +534,6 @@ class UploadWorker:
                     for f in m['files'] if not f.get('is_padding')]
         if sorted((f['path'], f['size_bytes']) for f in client.files(job['target_hash'])) not in (sorted(expected), sorted(ordinary)):
             raise UploadBlocked('Existing target manifest differs from canonical torrent')
-        if not client.recheck(job['target_hash']):
-            raise RuntimeError('Recheck request not confirmed')
+        observed = request_recheck(client, job['target_hash'])
         return self.ledger.transition(key, {'adding', 'seed_uncertain'}, 'rechecking',
-                                      recheck_requested_at=stamp(), recheck_observed=False)
+                                      recheck_requested_at=stamp(), recheck_observed=observed)

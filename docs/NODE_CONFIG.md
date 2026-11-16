@@ -17,6 +17,8 @@
 - qBittorrent ใช้ `auth.session.type: "qbit"` และระบุ HTTP Basic เพิ่มได้
   บัญชี Basic และบัญชีในโปรแกรมสามารถเป็นคนละบัญชีกัน
 - rTorrent ใช้ `auth.http_basic` ตัว client รองรับ Digest fallback ตามเดิม
+- Deluge ใช้ `auth.session.type: "deluge_web"` กับ credential ของ Web UI และมี HTTP Basic แยกได้
+  รองรับ `daemon_id` เมื่อ Web UI มีหลาย daemon ดู [คู่มือ Deluge](DELUGE.md)
   และยังไม่รองรับ `auth.session`
 - OnlyOneSeedbox ใช้ `auth.session.type: "onlyone_sso"` กับ qBittorrent
   โดย `credential_ref` เป็นบัญชีผู้ให้บริการ ไม่ตั้ง HTTP Basic ร่วมกับ SSO

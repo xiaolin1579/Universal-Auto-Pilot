@@ -120,13 +120,13 @@ def normalize_config(raw):
         names.add(name_key)
         _bool(node.get("enable", False), "NODES.enable")
         _url(node.get("url"), "NODES.url")
-        if node.get("type") not in ("qbit", "rtorrent"):
+        if node.get("type") not in ("qbit", "rtorrent", "deluge"):
             raise ConfigError("Unsupported shared-config client type")
         storage_id = _text(node.get("storage_id"), "NODES.storage_id")
         if storage_id not in storages:
             raise ConfigError("Unknown storage_id")
 
-        for key in ("qb_user", "qb_pass", "rt_user", "rt_pass", "http_basic_user",
+        for key in ("qb_user", "qb_pass", "rt_user", "rt_pass", "deluge_user", "deluge_pass", "http_basic_user",
                     "http_basic_pass", "provider_user", "provider_pass", "provider_auth_origin"):
             node.pop(key, None)
         auth = _object(node.get("auth"), "NODES.auth")
@@ -143,6 +143,14 @@ def normalize_config(raw):
             if auth.get("session") is not None or basic is None:
                 raise ConfigError("rTorrent requires HTTP auth and does not support auth.session")
             node["rt_user"], node["rt_pass"] = credential(basic.get("credential_ref"))
+        elif node['type'] == 'deluge':
+            session = _object(auth.get('session'), 'auth.session')
+            _known(session, {'type', 'credential_ref'}, 'auth.session')
+            if session.get('type') != 'deluge_web':
+                raise ConfigError('Deluge requires a deluge_web session')
+            node['deluge_user'], node['deluge_pass'] = credential(session.get('credential_ref'))
+            if 'daemon_id' in node:
+                _text(node['daemon_id'], 'NODES.daemon_id')
         else:
             session = _object(auth.get("session"), "auth.session")
             _known(session, {"type", "credential_ref", "origin"}, "auth.session")
@@ -220,7 +228,7 @@ def normalize_config(raw):
             raise ConfigError("OnlyOne telemetry requires its own qBittorrent SSO session")
 
     # Stale edits by legacy tools must not silently lose to the shared values.
-    aliases = {"qb_user", "qb_pass", "rt_user", "rt_pass", "http_basic_user",
+    aliases = {"qb_user", "qb_pass", "rt_user", "rt_pass", "deluge_user", "deluge_pass", "http_basic_user",
                "http_basic_pass", "nginx", "provider_sso", "provider_user",
                "provider_pass", "provider_auth_origin", "quota_gb", "disk_type",
                "storage_api", "storage_mount", "storage_safety_buffer_gb",

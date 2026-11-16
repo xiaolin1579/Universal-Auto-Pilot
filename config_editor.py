@@ -25,7 +25,7 @@ class ConfigEditorError(ValueError):
 
 REMOVE = object()
 _SECRET = re.compile(r'pass|token|secret|cookie|authorization|access.?key|api.?key|webhook', re.I)
-_RUNTIME_FIELDS = {'qb_user', 'qb_pass', 'rt_user', 'rt_pass', 'http_basic_user',
+_RUNTIME_FIELDS = {'qb_user', 'qb_pass', 'rt_user', 'rt_pass', 'deluge_user', 'deluge_pass', 'http_basic_user',
                    'http_basic_pass', 'nginx', 'provider_sso', 'provider_user',
                    'provider_pass', 'provider_auth_origin', 'quota_gb', 'disk_type',
                    'storage_api', 'storage_mount', 'storage_safety_buffer_gb',
@@ -34,13 +34,14 @@ _CLEAN_FIELDS = {'enable', 'policy', 'allow_space_reclaim', 'min_ratio',
                  'min_time_minutes', 'max_time_minutes'}
 _LEGACY_CLEAN_FIELDS = {'enable', 'min_ratio', 'min_time', 'max_time', 'max_idle_hours'}
 _SHARED_NODE_FIELDS = {'id', 'name', 'type', 'url', 'enable', 'storage_id', 'auth',
-                       'cleaner', 'space_accounting', 'allow_sweeper_auto_resume'}
+                       'cleaner', 'space_accounting', 'allow_sweeper_auto_resume', 'daemon_id'}
 _LEGACY_NODE_FIELDS = {'name', 'type', 'url', 'enable', 'qb_user', 'qb_pass', 'rt_user',
                        'rt_pass', 'nginx', 'quota_gb', 'disk_type', 'clean_settings',
                        'allow_space_reclaim', 'provider_sso', 'provider_user', 'provider_pass',
                        'provider_auth_origin', 'storage_api', 'storage_mount',
                        'storage_safety_buffer_gb', 'storage_id', 'allow_sweeper_auto_resume',
-                       'preallocated_downloads_accounted_in_free_space'}
+                       'preallocated_downloads_accounted_in_free_space', 'deluge_user', 'deluge_pass',
+                       'http_basic_user', 'http_basic_pass', 'daemon_id'}
 
 
 def _object(value):
@@ -331,13 +332,13 @@ def update_node(raw, node_id_or_name, changes):
 def add_node(raw, node):
     shared = uses_shared_nodes(raw)
     _keys(node, _SHARED_NODE_FIELDS if shared else _LEGACY_NODE_FIELDS)
-    if node.get('type') not in ('qbit', 'rtorrent'):
-        raise ConfigEditorError('New nodes must use qbit or rtorrent')
+    if node.get('type') not in ('qbit', 'rtorrent', 'deluge'):
+        raise ConfigEditorError('New nodes must use qbit, rtorrent or deluge')
     new = deepcopy(raw); candidate = deepcopy(node)
     candidate.setdefault('enable', False)
     if not shared:
         _url(candidate.get('url'))
-        prefix = 'rt' if candidate['type'] == 'rtorrent' else 'qb'
+        prefix = {'rtorrent': 'rt', 'deluge': 'deluge', 'qbit': 'qb'}[candidate['type']]
         if any(not isinstance(candidate.get(prefix + suffix), str) for suffix in ('_user', '_pass')):
             raise ConfigEditorError('New legacy nodes require username and password strings')
         candidate.setdefault('clean_settings', {'enable': False})
@@ -650,6 +651,8 @@ class Editor:
             self.edit_node_cleaner(ident); return
         node = _node(self.doc, ident)
         changes = _form(node, [('url', str, False), ('enable', bool, False), ('allow_sweeper_auto_resume', bool, False)])
+        if node.get('type') == 'deluge':
+            changes.update(_form(node, [('daemon_id', str, False)]))
         if uses_shared_nodes(self.doc):
             changes.update(_form(node, [('storage_id', str, False)]))
             if input('แก้ auth references? [y/N]: ').strip().lower() == 'y':
@@ -657,7 +660,7 @@ class Editor:
             if input('แก้ space_accounting? [y/N]: ').strip().lower() == 'y':
                 changes['space_accounting'] = _form(node.get('space_accounting', {}), [('safety_buffer_gib', float, False), ('preallocated_in_free_space', bool, False)])
         else:
-            prefix = 'rt' if node.get('type') == 'rtorrent' else 'qb'
+            prefix = {'rtorrent': 'rt', 'deluge': 'deluge'}.get(node.get('type'), 'qb')
             changes.update(_form(node, [(prefix + '_user', str, False), (prefix + '_pass', str, True),
                                        ('quota_gb', float, False), ('disk_type', str, False), ('nginx', bool, False),
                                        ('storage_api', str, False), ('storage_mount', str, False),
@@ -674,6 +677,12 @@ class Editor:
             patch['session'] = _form(session, fields)
             if not current.get('session'):
                 patch['session'].setdefault('type', 'qbit')
+        elif kind == 'deluge':
+            print('Deluge Web ใช้รหัสผ่าน Web UI; username ใน credential เว้นว่างได้')
+            session = current.get('session') or {'type': 'deluge_web'}
+            patch['session'] = _form(session, [('credential_ref', str, False)])
+            if not current.get('session'):
+                patch['session']['type'] = 'deluge_web'
         basic = current.get('http_basic') or {}
         value = _answer('HTTP Basic credential_ref (-=ไม่ใช้)', basic.get('credential_ref'))
         if value is None:
@@ -685,14 +694,17 @@ class Editor:
     def add_node(self):
         shared = uses_shared_nodes(self.doc)
         name = input('ชื่อ node (ต้องคงชื่อไว้หลังเริ่มใช้งาน): ').strip()
-        kind = input('type [qbit/rtorrent]: ').strip()
+        kind = input('type [qbit/rtorrent/deluge]: ').strip()
         node = {'name': name, 'type': kind, 'url': input('URL: ').strip(), 'enable': False}
+        if kind == 'deluge':
+            daemon = input('daemon_id (ว่างได้เมื่อมี daemon เดียว): ').strip()
+            if daemon: node['daemon_id'] = daemon
         if shared:
             node['id'] = input('id: ').strip()
             node['storage_id'] = input('storage_id: ').strip()
             node['auth'] = _merge({}, self.auth_form(kind, {}))
         else:
-            prefix = 'rt' if kind == 'rtorrent' else 'qb'
+            prefix = {'rtorrent': 'rt', 'deluge': 'deluge'}.get(kind, 'qb')
             node[prefix + '_user'] = input('Username: ')
             node[prefix + '_pass'] = getpass.getpass('Password: ')
             node['quota_gb'] = 0
