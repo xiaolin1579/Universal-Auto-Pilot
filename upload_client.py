@@ -1,16 +1,18 @@
 """Client capabilities used by the upload worker: qBittorrent and rTorrent."""
 from auto_upload import UploadBlocked, upload_filename
 from torrent_store import infohash
+from torrent_metainfo import _extract_torrent_info_hash
+from upload_logging import log_event
 
 
 class QbitUploadClient:
     def __init__(self, node):
         self.node, self.name = node, node.name
 
-    def request(self, method, endpoint, **kwargs):
+    def request(self, method, endpoint, *, expected_statuses=(200,), **kwargs):
         response = self.node._execute_request(method, self.node.url.rstrip('/') + '/api/v2/' + endpoint,
                                               verify=True, allow_redirects=False, timeout=30, **kwargs)
-        if response is None or response.status_code != 200:
+        if response is None or response.status_code not in expected_statuses:
             raise RuntimeError('qBittorrent upload capability request failed: ' + endpoint)
         return response
 
@@ -35,15 +37,36 @@ class QbitUploadClient:
         return [{'path': r['name'], 'size_bytes': r['size'], 'progress': r.get('progress')} for r in rows]
 
     def add_paused(self, content, job):
-        response = self.request('POST', 'torrents/add',
+        target = _extract_torrent_info_hash(content)
+        if target != job.get('target_hash'):
+            raise UploadBlocked('qBittorrent target artifact hash changed')
+        response = self.request('POST', 'torrents/add', expected_statuses=(200, 202),
             files={'torrents': (upload_filename(job), content, 'application/x-bittorrent')},
-            data={'paused': 'true', 'stopped': 'true', 'skip_checking': 'false', 'autoTMM': 'false',
+            data={'paused': 'true', 'stopped': 'true', 'skip_checking': 'false', 'seedMode': 'false', 'autoTMM': 'false',
                   'savepath': job['save_path'], 'contentLayout': 'Original',
                   'category': job['target_site'], 'tags': 'AutoPilot,Cross-Seed'})
-        return response.text.strip().lower() in ('ok.', 'ok')
+        # WebAPI 2.14+ returns a JSON batch summary instead of legacy Ok.
+        confirmed = response.status_code == 200 and response.text.strip().lower() in ('ok.', 'ok')
+        counts = {}
+        if not confirmed:
+            try:
+                result = response.json()
+            except ValueError:
+                result = None
+            if isinstance(result, dict):
+                keys = ('success_count', 'pending_count', 'failure_count')
+                if all(type(result.get(k)) is int and result[k] >= 0 for k in keys):
+                    counts = {k: result[k] for k in keys}
+                    ids = result.get('added_torrent_ids')
+                    confirmed = (response.status_code == 200
+                        and [counts[k] for k in keys] == [1, 0, 0]
+                        and isinstance(ids, list) and len(ids) == 1 and infohash(ids[0]) == target)
+        log_event('stage', job, stage='qbit_add_response', status=response.status_code, counts=counts,
+                  reason='add_confirmed' if confirmed else 'add_unconfirmed')
+        return confirmed
 
     def recheck(self, target):
-        self.request('POST', 'torrents/recheck', data={'hashes': target})
+        self.request('POST', 'torrents/recheck', expected_statuses=(200, 204), data={'hashes': target})
         return True
 
     def recheck_complete(self, target):
@@ -57,7 +80,7 @@ class QbitUploadClient:
             response = self.node._execute_request('POST', self.node.url.rstrip('/') + '/api/v2/' + endpoint,
                 data={'hashes': target}, verify=True, allow_redirects=False, timeout=30)
             if response is not None and response.status_code == 404: continue
-            return response is not None and response.status_code == 200
+            return response is not None and response.status_code in (200, 204)
         return False
 
 

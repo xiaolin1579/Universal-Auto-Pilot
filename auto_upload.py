@@ -740,9 +740,12 @@ class UploadWorker:
 
     def reconcile_seed(self, key, client):
         job = self.ledger.get(key)
-        log_event('stage', job, stage='reconcile_seed')
+        if job['state'] in ('verified', 'rechecking'):
+            raise UploadBlocked('Job is ' + job['state'] + '; use seed ' + job['id']
+                                + '. reconcile-seed only recovers adding/seed_uncertain jobs')
         if job['state'] not in ('adding', 'seed_uncertain') or client.name != job['source_node']:
             raise UploadBlocked('Only an uncertain add on its source client can be reconciled')
+        log_event('stage', job, stage='reconcile_seed')
         row = client.inventory(job['target_hash'])
         if row.get('save_path') != job['save_path']:
             raise UploadBlocked('Existing target save path differs from the verified source')

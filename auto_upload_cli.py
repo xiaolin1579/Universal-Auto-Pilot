@@ -116,6 +116,9 @@ async def execute(args, app):
         raise UploadBlocked('AUTO_UPLOAD.enable_publish must be true')
     if args.command in ('seed', 'reconcile-seed') and cfg.get('enable_seed') is not True:
         raise UploadBlocked('AUTO_UPLOAD.enable_seed must be true')
+    if args.command == 'reconcile-seed' and job['state'] in ('verified', 'rechecking'):
+        raise UploadBlocked('Job is ' + job['state'] + '; use seed ' + job['id']
+                            + '. reconcile-seed only recovers adding/seed_uncertain jobs')
     session = UploadSession(app); node = None
     notices = UploadNotifications(app, ledger)
     try:

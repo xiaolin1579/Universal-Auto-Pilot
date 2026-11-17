@@ -242,6 +242,21 @@ python auto_upload_cli.py cancel JOB_ID
 จะไม่เพิ่มซ้ำ ใช้ `reconcile-seed` เพื่อตรวจงานที่มีอยู่จริงและสั่ง recheck ใหม่โดยไม่เพิ่มงาน
 หากไม่มี hash ปลายทางใน client จะคงสถานะเดิมไว้ให้ตรวจสอบ
 
+เลือกคำสั่งตามสถานะของคิว ไม่ใช่ตามสถานะที่เห็นใน WebUI เพียงอย่างเดียว:
+
+| สถานะคิว | คำสั่ง |
+|---|---|
+| `verified` | `seed JOB_ID` เพื่อเพิ่มแบบหยุดและขอ recheck |
+| `adding` / `seed_uncertain` | `reconcile-seed JOB_ID` เพื่อตรวจ hash ที่มีอยู่และขอ recheck โดยไม่เพิ่มซ้ำ |
+| `rechecking` | `seed JOB_ID` เพื่อตรวจความคืบหน้า และเริ่ม seed เฉพาะเมื่อตรวจครบและเปิด `enable_resume` |
+| `seeding` | ไม่ต้อง reconcile ขั้นเพิ่มงานอีก |
+
+qBittorrent adapter รองรับทั้งผลเพิ่มงานแบบ `Ok.` เดิมและ JSON batch summary
+ของ WebAPI 2.14 ขึ้นไป สำหรับไฟล์ที่ส่งครั้งละหนึ่งรายการ JSON ต้องยืนยันสำเร็จ
+หนึ่งรายการ ไม่มี pending/failure และ hash ที่เพิ่มต้องตรงกับ canonical torrent
+ผลไม่ครบหรือยัง pending จะยังคงเข้าสู่ `seed_uncertain` เพื่อกู้จาก inventory
+โดยไม่ส่ง add ซ้ำ คำสั่ง recheck/start รองรับ HTTP 204 ของ client รุ่นใหม่ด้วย
+
 `publication_uncertain` หมายถึงเริ่มขั้นตอนส่งแล้วแต่ยังยืนยันผลไม่ได้ ไม่ได้ยืนยันว่าเว็บสร้างรายการแล้ว
 และการค้นหาปัจจุบันที่ไม่พบรายการก็ไม่ใช่หลักฐานว่าปลอดภัยที่จะส่งซ้ำ
 ระบบบันทึก `submission_started_at` ก่อนเรียกส่ง และเมื่อเกิดปัญหาจะเก็บ
