@@ -2,7 +2,7 @@
 
 HTML is content, never executable configuration. Hidden tokens stay in the live form.
 """
-from auto_upload import UploadBlocked, UploadRejected, effective_rule, upload_title
+from auto_upload import UploadBlocked, UploadRejected, effective_rule, upload_title, validate_metainfo_size
 import asyncio
 import json
 import re
@@ -68,11 +68,16 @@ def authenticated(soup, site=None, current_url=None):
         raise UploadBlocked('Authenticated page is required')
 
 
+def upload_failure_page(soup):
+    headings = soup.find_all(['h1', 'h2', 'h3'])
+    return bool(soup.title
+                and soup.title.get_text(' ', strip=True).casefold().startswith('upload failed!')
+                and any(h.get_text(' ', strip=True).casefold() == 'upload failed!' for h in headings))
+
+
 def known_upload_rejection(html):
     soup = BeautifulSoup(html, 'html.parser')
-    headings = soup.find_all(['h1', 'h2', 'h3'])
-    if (not soup.title or not soup.title.get_text(' ', strip=True).casefold().startswith('upload failed!')
-            or not any(h.get_text(' ', strip=True).casefold() == 'upload failed!' for h in headings)):
+    if not upload_failure_page(soup):
         return None
     text = ' '.join(soup.get_text(' ', strip=True).split())
     match = re.search(r'Torrent name.*?รับได้ไม่เกิน\s*(\d+)', text, re.I)
@@ -195,7 +200,15 @@ def upload_form(site, html, current_url, category):
     announce = form.select_one('input[name="passkey"]')
     if not announce or not announce.get('value'):
         raise UploadBlocked('Destination announce missing')
-    return {'announce': announce['value'], 'fields': fields, 'acknowledgements': sorted(ack)}
+    limits = form.select('input[name=MAX_FILE_SIZE]')
+    limit = None
+    if limits:
+        value = limits[0].get('value', '')
+        if len(limits) != 1 or not re.fullmatch(r'[0-9]{1,12}', value) or int(value) <= 0:
+            raise UploadBlocked('Destination metainfo size limit is invalid')
+        limit = int(value)
+    return {'announce': announce['value'], 'fields': fields, 'acknowledgements': sorted(ack),
+            'max_file_size': limit}
 
 
 def form_readiness(spec, rule):
@@ -569,6 +582,7 @@ class BrowserSite:
             from torrentdd_upload import fill
             return await fill(self, job, artifact)
         if not self.form: raise UploadBlocked('Upload form has not been validated')
+        validate_metainfo_size(Path(artifact).stat().st_size, self.form)
         rule = effective_rule(job)
         values = {'type': job['target_category'], 'name': upload_title(job),
                   'descr': job['metadata']['description'], 'picture': job['metadata'].get('picture', ''),
@@ -630,9 +644,16 @@ class BrowserSite:
             trusted_url(self.site, current)
             self._publication_context['page_path'] = urlsplit(current).path
             if urlsplit(current).path == '/takeupload.php':
-                rejected = known_upload_rejection(await self.tab.get_content())
+                html = await self.tab.get_content()
+                rejected = known_upload_rejection(html)
                 if rejected:
+                    self._publication_context['response_code'] = rejected.code
                     raise rejected
+                if upload_failure_page(BeautifulSoup(html, 'html.parser')):
+                    self._publication_context['response_code'] = 'upload_failed_unclassified'
+                    # An unknown server failure does not prove the POST had no side effects.
+                    # Keep the job uncertain until its destination listing is checked.
+                    raise UploadBlocked('Destination returned Upload failed; inspect the destination before retrying')
             try:
                 listing = listing_identity(self.site, current)
                 authenticated(BeautifulSoup(await self.tab.get_content(), 'html.parser'), self.site, current)

@@ -20,6 +20,18 @@ class UploadRejected(UploadBlocked):
         super().__init__('Upload explicitly rejected by the website: ' + code)
 
 
+def validate_metainfo_size(size, spec):
+    """Honor the live form's PHP MAX_FILE_SIZE before claiming or sending a POST."""
+    limit = (spec or {}).get('max_file_size')
+    if limit is None:
+        return
+    if type(limit) is not int or limit <= 0:
+        raise UploadBlocked('Destination metainfo size limit is invalid')
+    if size > limit:
+        raise UploadBlocked(f'Torrent metainfo exceeds destination limit: {size} > {limit} bytes; '
+                            'a larger piece size requires rehashing the source files')
+
+
 def upload_title(job):
     from upload_titles import format_title, TitleError
     try:
@@ -73,7 +85,9 @@ def publication_failure(adapter, error):
     stages = {'prepare_submit', 'submit', 'await_result', 'resolve_listing'}
     paths = {'/upload.php', '/bs_upload.php', '/takeupload.php', '/browse.php', '/bs_browse.php',
              '/details.php', '/bs_details.php', '/login.php', '/bs_login.php'}
-    return {'stage': context.get('stage') if context.get('stage') in stages else 'unknown',
+    codes = {'title_too_long', 'upload_failed_unclassified'}
+    return {'response_code': context.get('response_code') if context.get('response_code') in codes else 'unknown',
+            'stage': context.get('stage') if context.get('stage') in stages else 'unknown',
             'page_path': context.get('page_path') if context.get('page_path') in paths else 'unknown',
             'error_type': type(error).__name__, 'checked_at': stamp()}
 
@@ -178,6 +192,7 @@ class UploadLedger:
         key_text = ':'.join((manifest['info_hash'], rule['target_site'], metadata['zone'], str(rule['target_category'])))
         key = hashlib.sha256(key_text.encode()).hexdigest()
         variant = create_variant(source, rule['target_site'], metadata['zone'], rule['target_category'], announce)
+        validate_metainfo_size(len(variant), form_schema)
         variant_hash = _extract_torrent_info_hash(variant)
         if readiness is not None and type(readiness.get('ready')) is not bool:
             raise UploadBlocked('Invalid draft readiness')
@@ -434,6 +449,9 @@ class UploadWorker:
             raise UploadBlocked('Source client or save path changed')
         verify_completed(Path(job['source_artifact']).read_bytes(), live, client.files(job['source_hash']))
         spec = await adapter.load_form(job, require_ready=False)
+        variant = create_variant(Path(job['source_artifact']).read_bytes(), job['target_site'],
+                                 job['target_zone'], job['target_category'], spec['announce'])
+        validate_metainfo_size(len(variant), spec)
         evidence = await adapter.check_duplicates(job)
         self.ledger.record_check(key, job, evidence, readiness=spec['readiness'])
         return self.ledger.review(key)
@@ -456,6 +474,7 @@ class UploadWorker:
         if not isinstance(spec.get('readiness'), dict) or type(spec['readiness'].get('ready')) is not bool:
             raise UploadBlocked('Destination form readiness could not be verified')
         variant = create_variant(source, job['target_site'], job['target_zone'], job['target_category'], spec['announce'])
+        validate_metainfo_size(len(variant), spec)
         if _extract_torrent_info_hash(variant) != job['prepared_hash']:
             raise UploadBlocked('Prepared variant no longer matches the uncertain job')
         evidence = await adapter.check_duplicates(job)
@@ -490,6 +509,7 @@ class UploadWorker:
         verify_completed(source, live, client.files(job['source_hash']))
         form = await adapter.load_form(job)
         variant = create_variant(source, job['target_site'], job['target_zone'], job['target_category'], form['announce'])
+        validate_metainfo_size(len(variant), form)
         if _extract_torrent_info_hash(variant) != job['prepared_hash']:
             raise UploadBlocked('Prepared variant no longer matches the rule')
         self.ledger.record_check(key, job, {'status': 'unknown', 'complete': False, 'reason': 'check_in_progress'})
@@ -500,6 +520,7 @@ class UploadWorker:
         # Duplicate search navigates away: refresh nonce and validate fields once more.
         form = await adapter.load_form(job)
         variant = create_variant(source, job['target_site'], job['target_zone'], job['target_category'], form['announce'])
+        validate_metainfo_size(len(variant), form)
         path = write_artifact(self.ledger.artifacts, key, 'submission', variant, upload_filename(job))
         await adapter.fill(job, path)
         self.ledger.claim_submission(key, job, evidence)
