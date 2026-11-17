@@ -130,6 +130,13 @@ class MappingStore:
         for site, kinds in data['site_sync'].items():
             if not isinstance(kinds, dict) or any(not isinstance(v, dict) for v in kinds.values()):
                 raise ValueError('Invalid site synchronization evidence')
+            for proof in kinds.values():
+                if proof.get('verification_method') == 'authenticated_complete_site_page_hashes':
+                    hashes, ids = proof.get('required_hashes'), proof.get('required_ids')
+                    if (not isinstance(hashes, list) or any(not isinstance(h, str) or infohash(h) != h for h in hashes)
+                            or not isinstance(ids, list) or any(not isinstance(tid, str) or not tid.isdigit() for tid in ids)
+                            or len(set(ids)) != len(ids) or len(set(hashes)) != len(hashes)):
+                        raise ValueError('Invalid complete obligation hash evidence')
         MappingStore._validate_uploads(data)
         data['schema_version'] = SCHEMA_VERSION
         return data
@@ -303,6 +310,120 @@ class MappingStore:
         return SiteView({r['torrent_id']: deepcopy(r['legacy_state'])
                          for r in self.read()['site_records'].values() if r['site'] == site})
 
+    def reconcile_verified_listings(self):
+        """Bind exact, already verified listing identities; never match titles.
+
+        Adding a binding cannot itself release protection. New records need a
+        fresh authenticated obligation observation after this transaction.
+        """
+        from upload_sites import listing_identity
+        def apply(data):
+            candidates = {}
+            def collect(site, tid, url, target):
+                if not infohash(target): return
+                try:
+                    identity = listing_identity(site, url)
+                except (ValueError, KeyError, TypeError):
+                    return
+                if str(tid) != identity['torrent_id']: return
+                key = site + ':' + identity['torrent_id']
+                candidates.setdefault(key, {}).setdefault(infohash(target), identity)
+            for row in data['torrents']:
+                for listing in row.get('site_listings', []):
+                    if isinstance(listing, dict) and listing.get('verified') is True:
+                        collect(str(listing.get('site_key', '')).upper(), listing.get('torrent_id'),
+                                listing.get('details_url'), row['client_info'].get('hash'))
+            for job in data['upload_jobs'].values():
+                metadata = job.get('metadata', {})
+                if metadata.get('site') == 'BEARBIT' and infohash(metadata.get('infohash')) == job['source_hash']:
+                    url = metadata.get('details_url')
+                    try:
+                        identity = listing_identity('BEARBIT', url)
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                    collect('BEARBIT', identity['torrent_id'], url, job['source_hash'])
+                if job.get('target_hash') and job.get('listing') and job.get('canonical_artifact'):
+                    collect(job['target_site'], job['listing'].get('torrent_id'),
+                            job['listing'].get('details_url'), job['target_hash'])
+            result = {'created': 0, 'bound': 0, 'conflicts': 0}
+            for key, hashes in candidates.items():
+                if len(hashes) != 1:
+                    result['conflicts'] += 1
+                    continue
+                target, identity = next(iter(hashes.items()))
+                previous = data['site_records'].get(key)
+                if previous and previous.get('infohash') not in (None, target):
+                    result['conflicts'] += 1
+                    continue
+                if previous:
+                    if previous.get('infohash') is None:
+                        previous['infohash'] = target
+                        previous['legacy_state']['hash'] = target
+                        result['bound'] += 1
+                    continue  # Preserve all H&R, Quest and manual-hold evidence.
+                site, tid = key.split(':', 1)
+                data['site_records'][key] = {'site': site, 'torrent_id': tid, 'infohash': target,
+                    'legacy_state': {'hash': target, 'url': identity['details_url']},
+                    'obligations': {kind: {'status': 'unknown'} for kind in KINDS},
+                    'binding_evidence': {'method': 'verified_mapping_listing', 'checked_at': stamp()}}
+                result['created'] += 1
+            return result
+        return self.update(apply)
+
+    def record_required_snapshot(self, site, kind, required_ids, ttl_seconds=900):
+        """Persist a complete read-only obligation page without maintenance actions."""
+        if kind not in KINDS or ttl_seconds <= 0:
+            raise ValueError('Invalid obligation snapshot')
+        site = str(site).upper(); ids = {str(tid) for tid in required_ids}
+        if any(not tid.isdigit() for tid in ids):
+            raise ValueError('Invalid required listing identity')
+        now = utcnow()
+        def apply(data):
+            proof = {'checked_at': stamp(now), 'expires_at': stamp(now + timedelta(seconds=ttl_seconds)),
+                     'verification_method': 'authenticated_complete_site_page', 'status': 'ok'}
+            data['site_sync'].setdefault(site, {})[kind] = proof
+            for tid in ids:
+                data['site_records'].setdefault(site + ':' + tid,
+                    {'site': site, 'torrent_id': tid, 'infohash': None, 'legacy_state': {}, 'obligations': {}})
+            field = 'hr' if kind == 'hr' else 'seed_quest'
+            for record in data['site_records'].values():
+                if record['site'] != site: continue
+                required = record['torrent_id'] in ids
+                record['obligations'][kind] = {**proof, 'status': 'required' if required else 'clear'}
+                record['legacy_state'][field] = required
+            data['site_sync'][site][kind]['required_ids'] = sorted(ids)
+            return {'site': site, 'kind': kind, 'required': len(ids)}
+        return self.update(apply)
+
+    def bind_obligation_listing(self, site, torrent_id, target):
+        """Bind a hash read from this exact authenticated listing's metainfo."""
+        target = infohash(target)
+        if not target: raise ValueError('Invalid obligation listing hash')
+        key = str(site).upper() + ':' + str(torrent_id)
+        def apply(data):
+            record = data['site_records'][key]
+            if record.get('infohash') not in (None, target):
+                raise ValueError('Obligation listing hash conflicts with verified mapping')
+            record['infohash'] = target
+            record['legacy_state']['hash'] = target
+        self.update(apply)
+
+    def finalize_required_snapshot(self, site, kind):
+        """Hash membership is usable only when every required listing is bound."""
+        site = str(site).upper()
+        if kind not in KINDS: raise ValueError('Invalid obligation kind')
+        def apply(data):
+            proof = data['site_sync'].get(site, {}).get(kind, {})
+            ids = proof.get('required_ids')
+            if proof.get('status') != 'ok' or not fresh(proof) or not isinstance(ids, list):
+                return False
+            hashes = [infohash(data['site_records'].get(site + ':' + tid, {}).get('infohash')) for tid in ids]
+            if any(h is None for h in hashes): return False
+            proof['required_hashes'] = sorted(set(hashes))
+            proof['verification_method'] = 'authenticated_complete_site_page_hashes'
+            return True
+        return self.update(apply)
+
     @staticmethod
     def _merge_view(data, site, records):
         site = str(site).upper()
@@ -367,6 +488,12 @@ class MappingStore:
                     continue
                 required = r['torrent_id'] in ids and r['legacy_state'].get(field) is True
                 r['obligations'][kind] = {**evidence, 'status': 'required' if required else 'clear'}
+            required_rows = [r for r in data['site_records'].values()
+                             if r['site'] == site and r['obligations'][kind]['status'] == 'required']
+            evidence['required_ids'] = sorted(r['torrent_id'] for r in required_rows)
+            if all(infohash(r.get('infohash')) for r in required_rows):
+                evidence['required_hashes'] = sorted({infohash(r['infohash']) for r in required_rows})
+                evidence['verification_method'] = 'authenticated_complete_site_page_hashes'
         self.update(apply)
 
     def record_failure(self, site, kind):
@@ -387,7 +514,7 @@ class MappingStore:
                           manual_hold_updated_at=stamp())
         self.update(apply)
 
-    def protection_status(self, torrent_hash, required_sites=()):
+    def protection_status(self, torrent_hash, required_sites=(), *, policy_sites=()):
         target = infohash(torrent_hash)
         if not target:
             return 'UNKNOWN'
@@ -397,23 +524,33 @@ class MappingStore:
             return 'PROTECTED'
         rows = [r for r in data['site_records'].values() if r.get('infohash') == target]
         sites = {str(s).upper() for s in required_sites}
+        policy_sites = set(policy_sites) & {'DEDBIT', 'BITSUSE'}
         sites.update(r['site'] for r in rows)
         if any(r.get('manual_hold') or any(o.get('status') == 'required' for o in r['obligations'].values()) for r in rows):
             return 'PROTECTED'
-        if not rows:
-            return 'UNKNOWN' if sites else 'NOT_FOUND'
+        if not rows and not sites:
+            return 'NOT_FOUND'
         for site in sites:
             linked = [r for r in rows if r['site'] == site]
-            if not linked:
-                return 'UNKNOWN'
             # Unresolved protected site listings may refer to this hash.
             if any(r['site'] == site and not r.get('infohash') and
                    (r.get('manual_hold') or any(o.get('status') == 'required' for o in r['obligations'].values()))
                    for r in data['site_records'].values()):
                 return 'UNKNOWN'
+            if site in policy_sites:
+                continue  # Explicit operator policy; never fabricate H&R clear evidence.
             for kind in KINDS:
                 sync = data['site_sync'].get(site, {}).get(kind, {})
                 if sync.get('status') != 'ok' or not fresh(sync):
+                    return 'UNKNOWN'
+                # A complete authenticated page with every required listing's
+                # hash verified proves absence without guessing a listing ID.
+                hashes = sync.get('required_hashes')
+                if (sync.get('verification_method') == 'authenticated_complete_site_page_hashes'
+                        and isinstance(hashes, list) and all(infohash(h) == h for h in hashes)):
+                    if target in hashes: return 'PROTECTED'
+                    continue
+                if not linked:
                     return 'UNKNOWN'
                 if any(r['obligations'].get(kind, {}).get('status') != 'clear' or
                        not fresh(r['obligations'][kind]) for r in linked):

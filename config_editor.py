@@ -427,7 +427,7 @@ def update_cleaner(raw, changes, node_id=None):
             node = _node(new, node_id)
             node['cleaner'] = _merge(node.get('cleaner', {}), changes)
         else:
-            _keys(changes, {'enable', 'defaults', 'policies'})
+            _keys(changes, {'enable', 'defaults', 'policies', 'site_obligations'})
             new['CLEANER'] = _merge(new.get('CLEANER', {}), changes)
     elif node_id is not None:
         _keys(changes, _LEGACY_CLEAN_FIELDS | {'allow_space_reclaim'})
@@ -610,7 +610,7 @@ class Editor:
             fields = [('enable', bool, False), ('min_ratio', float, False), ('min_time', float, False), ('max_time', float, False)]
             self.commit(update_cleaner(self.doc, _form(self.doc.get('GLOBAL_CLEAN', {}), fields)))
             return
-        action = input('1) สวิตช์กลาง  2) ค่าเริ่มต้น node  3) นโยบาย  4) Cleaner ของ node  0) กลับ: ').strip()
+        action = input('1) สวิตช์กลาง  2) ค่าเริ่มต้น node  3) นโยบาย  4) Cleaner ของ node  5) ภาระรายเว็บ  0) กลับ: ').strip()
         cleaner = self.doc.get('CLEANER', {})
         if action == '1':
             self.commit(update_cleaner(self.doc, _form(cleaner, [('enable', bool, False)])))
@@ -623,6 +623,10 @@ class Editor:
             selected = self.pick_node()
             if selected:
                 self.edit_node_cleaner(selected)
+        elif action == '5':
+            print('verified_obligations = ตรวจ H&R/Quest; cleaner_policy = ใช้เกณฑ์ ratio/เวลาของ node')
+            changes = _form(cleaner.get('site_obligations', {}), [('DEDBIT', str, False), ('BITSUSE', str, False)])
+            self.commit(update_cleaner(self.doc, {'site_obligations': changes}))
 
     def pick_node(self):
         return _pick({n.get('id', n.get('name')): None for n in self.doc.get('NODES', [])}, 'เลือก node')

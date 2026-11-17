@@ -101,7 +101,11 @@ MAPPING_FILE = os.path.join(BASE_DIR, "torrent_mapping.json")
 # Exact tracker hostname aliases supplied and verified by operator.
 PURGE_TRACKER_HOST_ALIASES = {
     "files.bit-sv.net": "BEARBIT",
+    "files.bit-sv.cc": "BEARBIT",
     "tracker.cab": "DEDBIT",
+    "bitsuse.com": "BITSUSE",
+    "www.bitsuse.com": "BITSUSE",
+    "sv-seed.com": "TORRENTDD",
 }
 
 
@@ -525,6 +529,7 @@ def _atomic_save_mapping_file(data):
 
 async def initialize_mapping():
     await _store_call("initialize", DB_DIR, CFG.get("NODES", []))
+    await _store_call("reconcile_verified_listings")
     await load_mapping()
 
 
@@ -4044,14 +4049,14 @@ class QbitNode:
     def stop_torrent(self, hash_str):
         """สั่ง Stop (Pause) เฉพาะ Torrent ที่ระบุ"""
         try:
-            r = self._execute_request(
-                'POST',
-                f"{self.url}/api/v2/torrents/pause",
-                data={"hashes": hash_str},
-                headers={'Referer': self.url},
-                timeout=10
-            )
-            return r is not None and r.status_code == 200
+            for endpoint in ('stop', 'pause'):
+                r = self._execute_request('POST', f"{self.url}/api/v2/torrents/{endpoint}",
+                    data={'hashes': hash_str}, headers={'Referer': self.url}, timeout=10,
+                    verify=True, allow_redirects=False)
+                if r is not None and r.status_code == 404:
+                    continue  # Explicitly absent endpoint only; never retry an unknown result.
+                return r is not None and r.status_code in (200, 204)
+            return False
         except Exception as e:
             print(f" ⚠️ [{self.name}] Stop Error for {hash_str}: {e}")
             return False
@@ -5405,6 +5410,8 @@ def _read_builtin_storage_inventory(node):
             raise ValueError("Invalid inventory")
         for row in rows:
             torrent_hash = str(row["hash"]).lower()
+            if stop_event.is_set():
+                raise ValueError('Storage inventory interrupted by shutdown')
             root = _storage_path(row.get("content_path"))
             response = node._execute_request("GET", node.url + "/api/v2/torrents/files",
                                              params={"hash": torrent_hash}, timeout=15,
@@ -5429,6 +5436,8 @@ def _read_builtin_storage_inventory(node):
             return values[0]
         rows = read("d.multicall2", ("", "main", "d.hash=", "d.directory=", "d.base_path="))
         for row in rows:
+            if stop_event.is_set():
+                raise ValueError('Storage inventory interrupted by shutdown')
             if not isinstance(row, (list, tuple)) or len(row) != 3:
                 raise ValueError("Incomplete rTorrent storage row")
             torrent_hash, directory, root = row
@@ -5491,6 +5500,40 @@ class NodeCleaner:
         self.global_cfg = global_clean_cfg or {}
         self.site_key = getattr(self.node, "site_key", "UNKNOWN")
         self._db_cache = None
+        try:
+            self._event_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._event_loop = None
+
+    def enabled(self):
+        """The master and node switches govern every Cleaner entry point."""
+        return (self.global_cfg.get('enable', self.global_cfg.get('ENABLE', False)) is True
+                and (self.node_enable is None or self.node_enable is True))
+
+    def _policy_permits(self, target, live):
+        """Require the configured normal retention policy, even in emergency mode."""
+        import math
+        def values(row):
+            return (row.get('ratio'), row.get('ts_finished') or row.get('completion_on') or row.get('completed_on'),
+                    row.get('up_speed', row.get('upspeed')), row.get('leechers', row.get('num_leechs')))
+        raw = values(live)
+        if any(v is None for v in raw):
+            reader = getattr(self.node, 'get_all_torrents_info', None)
+            if not callable(reader): return False
+            try:
+                rows = reader()
+            except Exception:
+                return False
+            matches = [r for r in rows or [] if str(r.get('hash', '')).lower() == target]
+            if len(matches) != 1: return False
+            raw = values(matches[0])
+        try:
+            ratio, completed, speed, leechers = map(float, raw)
+            if any(not math.isfinite(v) or v < 0 for v in (ratio, completed, speed, leechers)) or completed <= 0:
+                return False
+            return bool(self._should_remove(ratio, (time.time()-completed)/3600, speed, leechers))
+        except (TypeError, ValueError, OverflowError):
+            return False
 
     @classmethod
     def clear_cache(cls):
@@ -5576,12 +5619,12 @@ class NodeCleaner:
 
     def _check_purge_authorization(self, t_hash):
         """
-        Phase A authorization.
+        Fresh authorization, including BearBit obligations.
 
         - Requires one exact Mapping record.
         - Requires a fresh complete inventory result from the native client API.
         - Requires recognized live tracker associations.
-        - BEARBIT remains blocked until Phase B freshness verification.
+        - Every associated site must have fresh, complete obligation evidence.
         - Does not mutate Mapping, DB, trackers or torrents.
         """
 
@@ -5676,10 +5719,7 @@ class NodeCleaner:
             for domain, site_name in aliases.items():
                 domain = str(domain).strip().lower().rstrip(".")
 
-                if (
-                    hostname == domain
-                    or hostname.endswith("." + domain)
-                ):
+                if hostname == domain:
                     matched_site = str(site_name).strip().upper()
                     break
 
@@ -5785,24 +5825,25 @@ class NodeCleaner:
 
         # H&R/Quest use the same central ledger as Cross-Seed and client sync.
         # No legacy DB or stale cached Boolean may authorize removal.
+        policies = self.global_cfg.get('site_obligations', {})
+        policy_sites = {site for site in ('DEDBIT', 'BITSUSE') if policies.get(site) == 'cleaner_policy'}
+        policy_sites &= tracker_sites | known_sites
+        if policy_sites and not self._policy_permits(target, live):
+            return False, 'CLEANER_POLICY_LIMITS_NOT_REACHED', live, sorted(tracker_sites)
         try:
-            protection = _mapping_store().protection_status(target, tracker_sites | known_sites)
+            protection = _mapping_store().protection_status(target, tracker_sites | known_sites, policy_sites=policy_sites)
         except (RuntimeError, ValueError):
             protection = "UNKNOWN"
         if protection != "NORMAL":
             return False, f"CENTRAL_OBLIGATIONS_{protection}", live, sorted(tracker_sites)
 
-        # 6. General authorization for recognized non-BEARBIT sites.
-        general_sites = tracker_sites - {"BEARBIT"}
-
-        if not general_sites:
-            return False, "NO_GENERAL_TRACKER_ASSOCIATION", live, []
-
-        site_label = "+".join(sorted(general_sites))
+        # Fresh central H&R/Quest evidence also authorizes BearBit. The old
+        # Phase-A exclusion made it impossible to reclaim even after proof.
+        site_label = "+".join(sorted(tracker_sites))
 
         return (
             True,
-            f"GENERAL_ASSOCIATED:{site_label}",
+            ('VERIFIED_CLEANER_POLICY:' if policy_sites else 'VERIFIED_OBLIGATIONS_CLEAR:') + site_label,
             live,
             sorted(tracker_sites),
         )
@@ -5854,6 +5895,9 @@ class NodeCleaner:
     def _hard_purge_sequence(self, t_hash):
         """Final fail-closed authorization gate before deletion."""
 
+        if not self.enabled() or stop_event.is_set():
+            return False
+
         try:
             allowed, reason, live, sites = (
                 self._check_purge_authorization(t_hash)
@@ -5878,6 +5922,15 @@ class NodeCleaner:
 
         site_label = ",".join(sites)
 
+        if stop_event.is_set() or not self.enabled():
+            return False
+
+        # File ownership checks can take long enough for H&R/Quest evidence
+        # to expire. Reauthorize immediately before any client mutation.
+        if not self._check_purge_authorization(t_hash)[0]:
+            print(f"🔒 [{self.node.name}] Purge evidence changed while checking file ownership")
+            return False
+
         print(
             f"🔎 [PURGE AUTH] ALLOWED "
             f"| class={reason} "
@@ -5899,6 +5952,14 @@ class NodeCleaner:
                 delete_files = self._can_delete_data(t_hash)
                 if not delete_files and not CLIENTS.adapter_for(self.node).supports_keep_files:
                     return False
+            if stop_event.is_set() or not self.enabled():
+                return False
+            final_allowed, _, final_live, _ = self._check_purge_authorization(t_hash)
+            if not final_allowed:
+                return False
+            if isinstance(self.node, QbitNode) and str(final_live.get('state', '')).lower() not in ('pausedup', 'stoppedup'):
+                print(f"🔒 [{self.node.name}] Stop not observed; deletion refused")
+                return False
             success = self.node.delete_torrent(t_hash, delete_files=delete_files)
 
             if success:
@@ -5921,17 +5982,13 @@ class NodeCleaner:
 
     def process(self, force_emergency=False):
         # 1. เช็คสถานะการเปิดใช้งาน
-        node_enable = self.node_enable
-        global_enable = self.global_cfg.get('enable', self.global_cfg.get('ENABLE', False))
         # Global is the master switch.
         # An explicit per-node clean_settings.enable=False must disable Cleaner.
-        is_enabled = bool(global_enable) and (
-            node_enable is None or bool(node_enable)
-        )
+        is_enabled = self.enabled()
 
         print(f"⚙️ [Cleaner Engine] Node: {self.node.name} | Status: {'ACTIVE' if is_enabled else 'DISABLED'}")
 
-        if not is_enabled:
+        if not is_enabled or stop_event.is_set():
             print(f"💤 [Cleaner Bypass] Skipped [{self.node.name}]")
             return
 
@@ -5988,8 +6045,8 @@ class NodeCleaner:
 
         msg = f"<b>🧹 Cleanup Summary</b> [{self.node.name}]:\n" + "\n".join(notify_lines)
         send_func = globals().get('send_notify')
-        if callable(send_func):
-            asyncio.create_task(send_func(msg))
+        if callable(send_func) and self._event_loop is not None and self._event_loop.is_running():
+            self._event_loop.call_soon_threadsafe(lambda: self._event_loop.create_task(send_func(msg)))
         else:
             print(f"📢 Notification:\n{msg}")
 
@@ -6013,6 +6070,9 @@ class NodeCleaner:
         if age_hours < 0 or age_hours >= 9000.0:
             return False
 
+        if not is_completely_idle:
+            return False
+
         # 🛡️ เกราะป้องกันขั้นที่ 2: งานเก่าแก่อายุเกิน 30 วัน ของจริง
         if age_hours > 720.0:
             if is_completely_idle or ratio >= 1.0:
@@ -6020,9 +6080,6 @@ class NodeCleaner:
             return False
 
         # ถ้าน้องทอร์เรนต์กำลัง "เรซซิ่ง" ดึงสปีดเชื่อม Peer อยู่ -> ห้ามลบเด็ดขาด
-        if not is_completely_idle:
-            return False
-
         # 🚨 [Max Time Exceeded] ค้างสล็อตจนชนเพดานสูงสุด
         if age_hours >= max_time:
             return "Max Time Exceeded", f"อายุชนเพดานสูงสุด: {max_time:.1f}h -> สั่งสับทิ้ง"
@@ -6048,6 +6105,8 @@ class NodeCleaner:
 
             now = time.time()
             for t in raw_torrents:
+                if stop_event.is_set() or not self.enabled():
+                    break
                 t_hash = t.get('hash')
                 if not t_hash: continue
 
@@ -6088,7 +6147,10 @@ class NodeCleaner:
         ปรับปรุงเป็น Instance Method ของ NodeCleaner
         เพิ่มเงื่อนไข: โหลดเสร็จแล้วอย่างน้อย 1 ชม. และเรโชอย่างน้อย 1.0
         """
-        if getattr(self.node, "allow_space_reclaim", True) is not True:
+        if not self.enabled() or stop_event.is_set():
+            print(f"🛡️ [{self.node.name}] Cleaner disabled or shutdown requested; reclaim skipped")
+            return False
+        if getattr(self.node, "allow_space_reclaim", False) is not True:
             print(
                 f"🛡️ [{self.node.name}] Space reclaim disabled by node config; "
                 "no reclaim scan or torrent action performed"
@@ -6103,7 +6165,7 @@ class NodeCleaner:
             target_free = required_gb + buffer_gb
             current_free = float(getattr(self.node, 'free_gb', 0.0))
             
-            if current_free >= target_free and not is_emergency:
+            if current_free >= target_free:
                 return True
 
             raw_torrents = self.node.get_all_torrents_info()
@@ -6210,13 +6272,23 @@ class NodeCleaner:
             
             # 4. Authorization / Purge
             for t in targets:
+                if stop_event.is_set() or not self.enabled():
+                    break
                 print(
                     f"🔎 [PURGE CANDIDATE] "
                     f"{t.get('name', 'Unknown')} "
                     f"| Size: {t['_calculated_size_gb']:.2f}GB "
                     f"| Ratio: {t['_calculated_ratio']:.2f}"
                 )
-                self._hard_purge_sequence(t['hash'])
+                if self._hard_purge_sequence(t['hash']):
+                    # A successful job removal may keep shared files. Re-read
+                    # available space and stop as soon as the target is met.
+                    if not self.node.refresh_status():
+                        return False
+                    if self._get_node_free_gb() >= target_free:
+                        print(f"📊 [RECLAIM RETURN AUDIT] free={self._get_node_free_gb():.2f}GB "
+                              f"target={target_free:.2f}GB ready=True")
+                        return True
 
             # RECLAIM_RETURN_AUDIT_V1
             # Never report success based on attempted candidates.
@@ -8282,7 +8354,7 @@ async def trigger_download_if_needed(t_id, t_name, t_size_gb, details_url, downl
                 effective_free = node_obj.free_gb - node_obj.get_downloading_size()
                 
                 if effective_free < needed_gb:
-                    cleaner.smart_reclaim_process(required_gb=(t_size_gb + 15.0), is_emergency=False)
+                    await asyncio.to_thread(cleaner.smart_reclaim_process, required_gb=(t_size_gb + 15.0), is_emergency=False)
                     node_obj.refresh_status()
                     effective_free = node_obj.free_gb - node_obj.get_downloading_size()
                     if effective_free < (t_size_gb + 5.0): # ยอมลด Buffer ลงนิดหน่อยในกรณีจำเป็น
@@ -11789,7 +11861,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
 
                                     # 3. Smart Reclaim ล้างดิสก์อัตโนมัติหากพื้นที่ไม่พอ
                                     if effective_free_gb < required_space and cleaner:
-                                        cleaner.smart_reclaim_process(required_gb=required_space, is_emergency=False)
+                                        await asyncio.to_thread(cleaner.smart_reclaim_process, required_gb=required_space, is_emergency=False)
                                         if hasattr(node_obj, 'refresh_status'):
                                             node_obj.refresh_status()
                                         
@@ -11800,7 +11872,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                     if effective_free_gb < (t_size_gb + 5.0):
                                         if cleaner:
                                             print(f"🔄 [{node_name}] Reclaim รอบแรกพื้นที่ไม่พอ Try Emergency Flush...")
-                                            cleaner.smart_reclaim_process(required_gb=required_space, is_emergency=True)
+                                            await asyncio.to_thread(cleaner.smart_reclaim_process, required_gb=required_space, is_emergency=True)
                                             if hasattr(node_obj, 'refresh_status'):
                                                 node_obj.refresh_status()
                                             
@@ -13321,6 +13393,11 @@ async def main():
             active_nodes = []
             node_status_buffer = []
 
+            # Refresh authenticated obligation evidence before any cleanup,
+            # including Cross-Seed cycles that skip maintenance actions.
+            from cleaner_obligations import refresh_before_cleaner
+            await refresh_before_cleaner(sys.modules[__name__])
+
             # =================================================================
             # 1. NODE SECTION (Checking & Cleanup & Update Trackers)
             # =================================================================
@@ -13338,7 +13415,8 @@ async def main():
 
                     is_system_emergency = pre_free < 15.0 
 
-                    NodeCleaner(node, n_cfg.get('clean_settings', {}), global_clean).process(force_emergency=is_system_emergency)
+                    await asyncio.to_thread(NodeCleaner(node, n_cfg.get('clean_settings', {}), global_clean).process,
+                                            force_emergency=is_system_emergency)
                     await asyncio.sleep(2)  
 
                     if hasattr(node, '_sweeper_force_start'):

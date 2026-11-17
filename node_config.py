@@ -118,7 +118,11 @@ def normalize_config(raw):
     credentials = _object(config.get("CREDENTIALS", {}), "CREDENTIALS")
     storages = _object(config.get("STORAGES", {}), "STORAGES")
     cleaner = _object(config.get("CLEANER", {}), "CLEANER")
-    _known(cleaner, {"enable", "defaults", "policies"}, "CLEANER")
+    _known(cleaner, {"enable", "defaults", "policies", "site_obligations"}, "CLEANER")
+    site_obligations = _object(cleaner.get('site_obligations', {}), 'CLEANER.site_obligations')
+    _known(site_obligations, {'DEDBIT', 'BITSUSE'}, 'CLEANER.site_obligations')
+    if any(mode not in ('verified_obligations', 'cleaner_policy') for mode in site_obligations.values()):
+        raise ConfigError('Invalid CLEANER.site_obligations mode')
     defaults = _object(cleaner.get("defaults", {}), "CLEANER.defaults")
     policies = _object(cleaner.get("policies", {}), "CLEANER.policies")
     cleaner_fields = {"enable", "allow_space_reclaim", "policy", "min_ratio",
@@ -284,6 +288,7 @@ def normalize_config(raw):
     # Preserve unrelated root fields. New Cleaner is authoritative in this view.
     config["GLOBAL_CLEAN"] = {"enable": master, "min_ratio": 1.5,
                               "min_time": 720, "max_time": 1440}
+    config['GLOBAL_CLEAN']['site_obligations'] = deepcopy(site_obligations)
     if "GLOBAL_CLEAN" in raw:
         previous = _object(raw["GLOBAL_CLEAN"], "GLOBAL_CLEAN")
         if any(key.lower() not in config["GLOBAL_CLEAN"]
