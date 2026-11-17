@@ -6,6 +6,12 @@
     "enable_resume": false,
     "artifact_dir": "upload_artifacts",
     "max_jobs_per_cycle": 1,
+    "category_review": {
+      "enable": true,
+      "auto_fix": true,
+      "musicbrainz": false,
+      "catalog_file": ""
+    },
     "rules": [
       {
         "enable": false,

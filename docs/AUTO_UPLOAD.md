@@ -161,7 +161,8 @@ Deluge ใช้ Web JSON-RPC หรือ Daemon SSL-RPC ของ 1.3.15/2.0.x
 `enable_seed` อนุญาตเพิ่มงานและ recheck, `enable_resume` อนุญาตเริ่ม seed หลังตรวจครบ
 การปิดหรือแก้กฎจะหยุดการส่งงานเก่าที่ผูกกับกฎนั้น รอบบอทหลักเรียกคิวหลังการค้นหาปกติ/
 Cross-Seed และจำกัดจำนวนตาม `max_jobs_per_cycle` ห้ามรันบอทหลักและ CLI พร้อมกันบน
-browser profile เดียวกัน
+browser profile เดียวกัน คำสั่ง CLI ที่ทำงานเฉพาะครั้งใช้ profile แยกตาม PID
+ส่วน `run` ใช้ profile คิวตามเดิม จึงไม่ควรเปิดหลายตัวพร้อมกัน
 
 การตรวจซ้ำเลือกเฉพาะแถวผลค้นหา ไม่ใช้ลิงก์รายการล่าสุดในส่วนบัญชี
 ใช้ชื่อไฟล์ต้นทางก่อน และเก็บเลขตอนแม้มีป้ายความละเอียดนำหน้า เช่น `4K.S01E10`
@@ -190,6 +191,9 @@ python auto_upload_cli.py inspect-source --node 'ชื่อโหนด' --has
 python auto_upload_cli.py prepare --node 'ชื่อโหนด' --hash 'infohashต้นทาง' --url 'https://bearbit.org/details.php?id=123' --zone normal
 python auto_upload_cli.py prepare --node 'ชื่อโหนด' --hash 'infohashต้นทาง' --url 'https://bearbit.org/details.php?id=123' --zone normal --target-site TORRENTDD
 python auto_upload_cli.py show JOB_ID
+python auto_upload_cli.py classify JOB_ID
+python auto_upload_cli.py repair-category JOB_ID
+python auto_upload_cli.py resolve-duplicate JOB_ID
 python auto_upload_cli.py check-job JOB_ID
 python auto_upload_cli.py configure JOB_ID --file job-fields.json
 python auto_upload_cli.py publish JOB_ID
@@ -210,6 +214,16 @@ python auto_upload_cli.py run --interval 300
 `check-job` ตรวจ client, ฟอร์ม และค้นหาซ้ำจริงโดยไม่ส่งฟอร์มหรือเพิ่ม torrent
 ผลค้นหาและเวลาตรวจถูกบันทึกใน mapping งานจะยังคง `draft` ถ้าข้อมูลไม่ครบ
 การส่งจริงจะตรวจ source และรายการซ้ำใหม่เสมอ จึงไม่ใช้ผลตรวจเก่าเป็นหลักฐานถาวร
+
+`classify` วิเคราะห์หมวดจากข้อมูลที่บันทึกไว้และคืนข้อเสนอโดยไม่แก้ฟอร์ม/สถานะงาน
+ค้น MusicBrainz หรือ URL อ้างอิงได้เมื่อระบุ `--musicbrainz`/`--web`
+ส่วน `--save` เก็บเฉพาะคำแนะนำ ดูตัวเลือก หลักฐาน และวิธีใช้ไฟล์แค็ตตาล็อกใน
+[คู่มือแนะนำหมวดหมู่](METADATA_CLASSIFICATION.md)
+
+เพิ่ม `AUTO_UPLOAD.category_review` เพื่อให้ตรวจและแก้ช่องว่าง/ค่าผิดจากหลักฐานระดับสูง
+หลังเตรียมงานและก่อนเผยแพร่ โดยไม่ทับค่าที่ผู้ใช้ระบุ กรณีหลักฐานขัดกันจะหยุดเป็น draft
+ส่วน `repair-category JOB_ID` ตรวจฟอร์มสดและแก้เฉพาะงานโดยไม่เผยแพร่
+รายละเอียด config และประวัติการแก้ไขอยู่ในคู่มือข้างต้น
 
 ใช้ `configure` เพื่อเติมค่าเฉพาะงานผ่านไฟล์ JSON เช่น:
 
@@ -238,6 +252,38 @@ python auto_upload_cli.py cancel JOB_ID
 
 `reconcile` รับเฉพาะงาน `submitting`/`publication_uncertain` และตรวจ canonical torrent
 ก่อนยอมรับ `cancel` รับเฉพาะงาน `draft`/`prepared` ที่ยังไม่ส่งเท่านั้น คิวอัตโนมัติจะไม่เตรียมงานที่ยกเลิกซ้ำ
+
+### ผูกรายการซ้ำที่ seed อยู่แล้ว
+
+ถ้างานเป็น `draft`/`prepared` และพบ payload ซ้ำ แต่ torrent ของรายการปลายทาง
+มีอยู่บน client ต้นทางและกำลัง seed อยู่แล้ว ใช้:
+
+```sh
+python auto_upload_cli.py resolve-duplicate JOB_ID
+python auto_upload_cli.py resolve-duplicate JOB_ID --url 'https://www.dedbit.com/details.php?id=123'
+```
+
+ค่าเริ่มต้นใช้ URL จากผล `duplicate_check` ที่เป็น `duplicate` และ `complete: true`
+ส่วน `--url` ระบุรายการปลายทางให้ตรวจโดยตรงได้ ไม่ใช้ผลซ้ำเก่าเป็นหลักฐานยืนยันไฟล์
+คำสั่งจะอ่าน canonical ใหม่จากเว็บที่ล็อกอิน ตรวจ tracker แบบ private และตรวจ
+infohash, layout/pieces, client, save path และความครบของไฟล์ทั้งต้นทาง/ปลายทาง
+ปลายทางต้องกำลัง seed อยู่ (`uploading`, `stalledUP`, `forcedUP` ของ qBittorrent)
+ไม่รับกรณีเพียงชื่อคล้าย ไฟล์เปลี่ยนชื่อ/ตำแหน่ง หรือ hash ที่ผูกกับงานอื่น
+
+เมื่อตรวจผ่านจะกู้ source/canonical artifact ในโฟลเดอร์ปัจจุบัน ผูก `site_records`,
+`content_groups`, `site_listings`, `node_locations` และปรับงานเป็น `seeding`
+พร้อม `duplicate_resolution.method: existing_destination_torrent`
+ข้อมูลนี้บอกว่าใช้รายการที่มีอยู่แล้ว ไม่ใช่หลักฐานว่าโปรแกรมเพิ่งอัปโหลดรายการนั้น
+คง H&R/Quest/manual hold เดิม และตั้งภาระรายการใหม่เป็น `unknown` จนกว่าจะตรวจได้
+ไม่ส่งฟอร์ม ไม่เพิ่ม torrent ไม่ recheck ไม่ resume ไม่ลบไฟล์ การเรียกซ้ำตรวจข้อมูลสดอีกครั้ง
+แต่ไม่เพิ่ม mapping ซ้ำ
+
+หาก source artifact อยู่พาธเครื่องเดิม จะลอง export จาก qBittorrent แล้วตรวจ
+hash/payload/path/ไฟล์ครบก่อนใช้ client อื่นต้องมี artifact ที่อ่านได้
+ปลายทางที่ยังไม่อยู่บน client หรือหยุดอยู่ต้องจัดการผ่าน Cross-Seed ตามขั้นตอนปกติ
+งาน `submitting`/`publication_uncertain` ยังคงใช้ `reconcile` และงาน repack ต้องตรวจแยก
+คำสั่งนี้ต้องเปิด `AUTO_UPLOAD.enable` และเปิด node/site/zone ที่เกี่ยวข้อง
+ไม่จำเป็นต้องเปิด `enable_publish`, `enable_seed` หรือ `enable_resume` เพราะไม่มีการทำขั้นตอนเหล่านั้น
 หากต้องแก้กฎแล้วเตรียมใหม่ให้เรียก `prepare` โดยตรงเพื่อยืนยันต้นทางใหม่ งาน `adding`/`seed_uncertain`
 จะไม่เพิ่มซ้ำ ใช้ `reconcile-seed` เพื่อตรวจงานที่มีอยู่จริงและสั่ง recheck ใหม่โดยไม่เพิ่มงาน
 หากไม่มี hash ปลายทางใน client จะคงสถานะเดิมไว้ให้ตรวจสอบ

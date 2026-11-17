@@ -1,0 +1,15 @@
+{
+  "records": [
+    {
+      "kind": "music",
+      "provider": "musicbrainz",
+      "url": "https://musicbrainz.org/release/a15b163b-ce96-45f5-b45c-c486fed6152d",
+      "title": "Child of the Universe",
+      "artist": "Ambra",
+      "year": 2003,
+      "release_type": "Album",
+      "secondary_types": [],
+      "format": "Hybrid SACD"
+    }
+  ]
+}

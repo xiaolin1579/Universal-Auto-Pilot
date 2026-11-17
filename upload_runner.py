@@ -28,8 +28,9 @@ def client_for(app, node):
 
 
 class UploadSession:
-    def __init__(self, app):
+    def __init__(self, app, profile_name='auto_upload'):
         self.app = app
+        self.profile_name = profile_name
         self.browser = None
         self.adapters = {}
 
@@ -41,7 +42,7 @@ class UploadSession:
         if self.browser is None:
             log_event('browser_start', site=site)
             args = ['--proxy-server=' + os.environ['HTTPS_PROXY']] if os.environ.get('HTTPS_PROXY') else []
-            self.browser = await self.app.launch_any_browser('auto_upload', args, enable_images=True)
+            self.browser = await self.app.launch_any_browser(self.profile_name, args, enable_images=True)
         tab = await self.browser.get('about:blank', new_tab=True)
         log_event('site_login', site=site)
         if not await self.app.ensure_site_logged_in(tab, config):
@@ -88,8 +89,14 @@ async def _prepare_destination(app, session, client, source_hash, metadata, cont
         ledger = ledger_for(app)
         job = await asyncio.to_thread(ledger.prepare, content, inventory, files, metadata, rule,
                                        spec['announce'], readiness=spec['readiness'], form_schema=spec)
+        from category_review import category_settings, review_categories
+        settings = category_settings(app.CFG.get('AUTO_UPLOAD', {}), app.BASE_DIR)
+        if settings.get('enable') is True and job['state'] in ('draft', 'prepared'):
+            stage = 'category review'
+            job = await review_categories(ledger, job['id'], spec, content, settings, settings['cache_dir'])
         if (app.CFG.get('AUTO_UPLOAD', {}).get('enable_publish') is True
-                and job['state'] in ('draft', 'prepared')):
+                and job['state'] in ('draft', 'prepared')
+                and not job.get('category_review', {}).get('issues')):
             stage = 'publication confirmations'
             log_event('prepare_stage', source_hash=source_hash, node=client.name, site=rule['target_site'], stage=stage)
             await asyncio.to_thread(ledger.confirm_for_publish, job['id'])
@@ -140,7 +147,9 @@ async def run_cycle(app, active_nodes):
     started = monotonic()
     ledger = ledger_for(app)
     notices = UploadNotifications(app, ledger)
-    worker = UploadWorker(ledger, enable_publish=cfg.get('enable_publish') is True)
+    from category_review import category_settings
+    worker = UploadWorker(ledger, enable_publish=cfg.get('enable_publish') is True,
+                          category_review=category_settings(cfg, getattr(app, 'BASE_DIR', '.')))
     session = UploadSession(app)
     nodes = {node.name: node for node, _ in active_nodes}
     outcomes = []
@@ -196,6 +205,13 @@ async def run_cycle(app, active_nodes):
                 continue
             job_started = monotonic()
             try:
+                if (cfg.get('category_review', {}).get('enable') is True and job['state'] in ('draft','prepared')):
+                    from upload_classifier import origin_requires_review
+                    if origin_requires_review(job):
+                        job = await worker.review_categories(job['id'], None, None)
+                        skip(job, 'category_origin_requires_review')
+                        notices.record(job, 'Category review requires attention: origin_requires_review')
+                        continue
                 client = client_for(app, node)
                 acted = False
                 if job['state'] in ('draft', 'prepared') and cfg.get('enable_publish') is True:

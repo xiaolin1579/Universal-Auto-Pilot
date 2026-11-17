@@ -322,18 +322,40 @@ class UploadLedger:
             'source_verified_at', 'field_overrides', 'created_at', 'updated_at', 'target_hash', 'listing',
             'notifications', 'submission_started_at', 'last_publication_failure',
             'publication_history', 'publication_retry', 'publication_retry_check',
-            'submission_signature', 'metainfo_preflight') if k in job}
+            'submission_signature', 'metainfo_preflight', 'duplicate_resolution',
+            'category_review', 'category_corrections', 'category_auto_fields') if k in job}
         if job.get('repack'):
             public['repack'] = {k: deepcopy(job['repack'][k]) for k in (
                 'provider', 'source_hash', 'candidate_hash', 'candidate_signature', 'checked_at')}
         if job.get('repack_request'):
             public['repack_request'] = {'claimed_at': job['repack_request'].get('claimed_at')}
+        if job.get('classification'):
+            from upload_classifier import input_fingerprint
+            public['classification'] = deepcopy(job['classification'])
+            public['classification']['stale'] = input_fingerprint(job) != job['classification'].get('job_fingerprint')
+        if job.get('category_review'):
+            from upload_classifier import input_fingerprint
+            public['category_review']['stale'] = input_fingerprint(job) != job['category_review'].get('job_fingerprint')
         public['target_title'] = upload_title(job)
         public['torrent_filename'] = upload_filename(job)
         public['effective_fields'] = effective_rule(job).get('fields', {})
         public['effective_confirmations'] = effective_rule(job).get('confirmations', {})
         # Artifact files contain announce credentials; expose only their content identity.
         return public
+
+    def save_classification(self, key, report):
+        from upload_classifier import input_fingerprint
+        if (not isinstance(report, dict) or report.get('version') != 1 or report.get('job_id') != key
+                or report.get('applied') is not False or not isinstance(report.get('suggestions'), list)):
+            raise UploadBlocked('Invalid classification report')
+        def apply(data):
+            job = data['upload_jobs'][key]
+            if job['state'] not in ('draft', 'prepared'):
+                raise UploadBlocked('Only unsubmitted jobs may save classification suggestions')
+            if input_fingerprint(job) != report.get('job_fingerprint'):
+                raise UploadBlocked('Job changed during classification; analyze it again')
+            job['classification'] = {**deepcopy(report), 'saved': True, 'checked_at': stamp()}
+        self.store.update(apply)
 
     def configure_job(self, key, changes):
         if not isinstance(changes, dict) or set(changes) - {'fields', 'confirmations', 'title'}:
@@ -360,6 +382,8 @@ class UploadLedger:
                     overrides['title'] = values
                 else:
                     overrides.setdefault(section, {}).update(deepcopy(values))
+            for field in fields:
+                job.get('category_auto_fields', {}).pop(field, None)
             upload_title(job)
             readiness = form_readiness(job['form_schema'], effective_rule(job))
             if readiness['invalid_fields']:
@@ -511,9 +535,24 @@ class UploadLedger:
 
 class UploadWorker:
     """Adapters must supply live metadata/duplicate evidence, never optimistic fallbacks."""
-    def __init__(self, ledger, *, enable_publish=False):
+    def __init__(self, ledger, *, enable_publish=False, category_review=None):
         self.ledger = ledger
         self.enable_publish = enable_publish is True
+        self.category_review = deepcopy(category_review or {})
+
+    async def review_categories(self, key, adapter, client):
+        from upload_recovery import verified_source
+        from category_review import review_categories
+        import asyncio
+        job = self.ledger.get(key)
+        from upload_classifier import origin_requires_review
+        if origin_requires_review(job):
+            from category_review import block_origin
+            return await asyncio.to_thread(block_origin, self.ledger, job)
+        source = await asyncio.to_thread(verified_source, job, client)
+        spec = await adapter.load_form(job, require_ready=False)
+        return await review_categories(self.ledger, key, spec, source, self.category_review,
+            self.category_review.get('cache_dir', Path(self.ledger.artifacts).parent / '.metadata_cache'))
 
     async def variant(self, job, source, spec, client):
         variant = create_job_variant(job, source, spec['announce'])
@@ -534,6 +573,10 @@ class UploadWorker:
         job = self.ledger.get(key)
         if job['state'] not in ('draft', 'prepared'):
             raise UploadBlocked('Only an unsubmitted job can be checked')
+        if self.category_review.get('enable') is True:
+            job = await self.review_categories(key, adapter, client)
+            if job['category_review']['issues']:
+                return self.ledger.review(key)
         log_event('stage', job, stage='check_source')
         self.ledger.record_check(key, job, {'status': 'unknown', 'complete': False, 'reason': 'check_in_progress'})
         live = client.inventory(job['source_hash'])
@@ -591,6 +634,10 @@ class UploadWorker:
         job = self.ledger.get(key)
         if job.get('publication_retry', {}).get('manual_publish_required') is True and allow_manual_retry is not True:
             raise UploadBlocked('Publication retry requires an explicit CLI publish command')
+        if self.category_review.get('enable') is True and job['state'] in ('draft', 'prepared'):
+            job = await self.review_categories(key, adapter, client)
+            if job['category_review']['issues']:
+                raise UploadBlocked('Category review requires attention: ' + ', '.join(job['category_review']['issues']))
         if self.enable_publish and job['state'] in ('draft', 'prepared'):
             self.ledger.confirm_for_publish(key)
             job = self.ledger.get(key)

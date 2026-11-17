@@ -28,3 +28,9 @@ bcoding
 
 # Deluge daemon SSL-RPC (Web UI ไม่ต้องใช้ codec นี้)
 rencode>=1.0.8,<2
+
+# Metadata classification (network lookup is opt-in)
+rapidfuzz>=3,<4
+musicbrainzngs>=0.7.1,<0.8
+guessit>=3,<4
+ddgs>=9.16,<10

@@ -36,6 +36,14 @@ class QbitUploadClient:
             raise UploadBlocked('Invalid file inventory')
         return [{'path': r['name'], 'size_bytes': r['size'], 'progress': r.get('progress')} for r in rows]
 
+    def export_torrent(self, target):
+        target = infohash(target)
+        if not target: raise UploadBlocked('Invalid infohash')
+        content = self.request('GET', 'torrents/export', params={'hash': target}).content
+        if _extract_torrent_info_hash(content) != target:
+            raise UploadBlocked('Exported torrent hash differs from the requested hash')
+        return content
+
     def add_paused(self, content, job):
         target = _extract_torrent_info_hash(content)
         if target != job.get('target_hash'):

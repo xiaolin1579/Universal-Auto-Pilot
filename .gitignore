@@ -183,3 +183,6 @@ torrent_mapping.json.pre-central.bak
 
 # Account-scoped OnlyOne torrent maker lock
 .onlyone-maker-*.lock
+
+# Public metadata lookup cache
+/.metadata_cache/

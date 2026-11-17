@@ -3,6 +3,7 @@ from auto_upload import UploadBlocked
 import argparse
 import asyncio
 import json
+import os
 from auto_upload import UploadWorker
 from upload_runner import UploadSession, ledger_for, client_for, prepare_job, run_cycle, enabled_rule
 from upload_sites import listing_identity
@@ -13,6 +14,14 @@ def parser():
     p = argparse.ArgumentParser(description='BearBit -> Dedbit/Bitsuse/TorrentDD auto upload')
     sub = p.add_subparsers(dest='command', required=True)
     sub.add_parser('status')
+    classify = sub.add_parser('classify', help='Suggest category fields without changing state or publishing')
+    classify.add_argument('job_id', nargs='?')
+    classify.add_argument('--all-drafts', action='store_true')
+    classify.add_argument('--client', action='store_true', help='Read and verify source manifest from its client')
+    classify.add_argument('--musicbrainz', action='store_true', help='Opt in to MusicBrainz lookup')
+    classify.add_argument('--web', action='store_true', help='Opt in to web reference search (not classification evidence)')
+    classify.add_argument('--catalog-file', help='Explicit normalized metadata from an authorized catalog')
+    classify.add_argument('--save', action='store_true', help='Save suggestions only; never apply fields or publish')
     rebuild = sub.add_parser('repack', help='Rebuild oversized metainfo with OnlyOne; never publishes')
     rebuild.add_argument('job_id')
     rebuild.add_argument('--max-bytes', type=int, required=True, help='Size cap verified on the destination form')
@@ -30,9 +39,15 @@ def parser():
                                  help='Destination; required when more than one category rule matches')
     configure = sub.add_parser('configure')
     configure.add_argument('job_id'); configure.add_argument('--file', required=True)
-    for name in ('show', 'check-job', 'publish', 'seed', 'reconcile', 'reconcile-seed', 'cancel', 'retry-publication'):
+    for name in ('show', 'check-job', 'publish', 'seed', 'reconcile', 'reconcile-seed', 'cancel', 'retry-publication',
+                 'resolve-duplicate', 'repair-category'):
         cmd = sub.add_parser(name); cmd.add_argument('job_id')
         if name == 'reconcile': cmd.add_argument('--url', required=True)
+        if name == 'resolve-duplicate':
+            cmd.add_argument('--url', help='Existing destination listing; defaults to the recorded duplicate result')
+        if name == 'repair-category':
+            cmd.add_argument('--musicbrainz', action='store_true', help='Opt in to MusicBrainz evidence')
+            cmd.add_argument('--catalog-file', help='Normalized evidence from an authorized catalog')
         if name == 'retry-publication':
             cmd.add_argument('--confirm-not-published', action='store_true', required=True,
                              help='Confirm you checked destination My Uploads and this job was not published')
@@ -40,9 +55,18 @@ def parser():
 
 
 async def execute(args, app):
+    if args.command == 'classify':
+        from classification_runner import classify_uploads
+        return await classify_uploads(args, app)
     await app.initialize_mapping()
     ledger = ledger_for(app); cfg = app.CFG.get('AUTO_UPLOAD', {})
-    worker = UploadWorker(ledger, enable_publish=cfg.get('enable_publish') is True)
+    from category_review import category_settings
+    settings = category_settings(cfg, getattr(app, 'BASE_DIR', '.'))
+    if args.command == 'repair-category':
+        settings.update(enable=True, auto_fix=True)
+        if args.musicbrainz: settings['musicbrainz'] = True
+        if args.catalog_file: settings['catalog_file'] = args.catalog_file
+    worker = UploadWorker(ledger, enable_publish=cfg.get('enable_publish') is True, category_review=settings)
     if args.command == 'status':
         return [{'id': j['id'], 'state': j['state'], 'source_hash': j['source_hash'],
                  'target_site': j['target_site'], 'target_category': j['target_category'],
@@ -52,7 +76,7 @@ async def execute(args, app):
         zone = next((z for z in ('normal', 'special') if upload_route_supported(args.site, z, args.category)), None)
         if zone is None:
             raise UploadBlocked('Destination category is not available in a supported upload zone')
-        session = UploadSession(app)
+        session = UploadSession(app, profile_name='auto_upload_cli_' + str(os.getpid()))
         try:
             adapter = await session.adapter(args.site)
             spec = await adapter.load_form({'target_site': args.site, 'target_zone': zone,
@@ -86,7 +110,7 @@ async def execute(args, app):
         return ledger.review(args.job_id)
     if args.command == 'cancel':
         return {'id': args.job_id, 'state': ledger.transition(args.job_id, {'draft', 'prepared'}, 'cancelled')['state']}
-    if args.command in ('publish', 'seed', 'reconcile-seed', 'run') and cfg.get('enable') is not True:
+    if args.command in ('publish', 'seed', 'reconcile-seed', 'resolve-duplicate', 'run') and cfg.get('enable') is not True:
         raise UploadBlocked('AUTO_UPLOAD.enable must be true for runtime actions')
     if args.command == 'run':
         if args.interval < 30: raise UploadBlocked('Minimum interval is 30 seconds')
@@ -105,6 +129,11 @@ async def execute(args, app):
             if args.once: return None
             await asyncio.sleep(args.interval)
     job = None if args.command in ('prepare', 'inspect-source') else ledger.get(args.job_id)
+    if args.command == 'resolve-duplicate':
+        from duplicate_recovery import resolution_listing
+        resolution_listing(job, args.url)
+    if args.command == 'repair-category' and job['state'] not in ('draft', 'prepared'):
+        raise UploadBlocked('Category repair only accepts unsubmitted jobs')
     if args.command in ('publish', 'seed', 'reconcile-seed', 'retry-publication') and not enabled_rule(cfg, job):
         raise UploadBlocked('The job category rule is no longer enabled or has changed')
     if args.command == 'retry-publication':
@@ -119,7 +148,14 @@ async def execute(args, app):
     if args.command == 'reconcile-seed' and job['state'] in ('verified', 'rechecking'):
         raise UploadBlocked('Job is ' + job['state'] + '; use seed ' + job['id']
                             + '. reconcile-seed only recovers adding/seed_uncertain jobs')
-    session = UploadSession(app); node = None
+    if args.command in ('publish', 'check-job', 'repair-category') and settings.get('enable') is True:
+        from upload_classifier import origin_requires_review
+        if origin_requires_review(job):
+            result = await worker.review_categories(job['id'], None, None)
+            if args.command == 'publish':
+                raise UploadBlocked('Category review requires attention: origin_requires_review')
+            return ledger.review(job['id'])
+    session = UploadSession(app, profile_name='auto_upload_cli_' + str(os.getpid())); node = None
     notices = UploadNotifications(app, ledger)
     try:
         if args.command == 'reconcile':
@@ -156,6 +192,13 @@ async def execute(args, app):
                                            getattr(args, 'target_site', None))
             elif args.command == 'check-job':
                 return await worker.check_job(job['id'], await session.adapter(job['target_site']), client)
+            elif args.command == 'repair-category':
+                result = await worker.review_categories(job['id'], await session.adapter(job['target_site']), client)
+                return {'id':result['id'], 'state':result['state'], 'category_review':result['category_review'],
+                        'classification':result['classification']}
+            elif args.command == 'resolve-duplicate':
+                from duplicate_recovery import resolve_duplicate
+                result = await resolve_duplicate(ledger, job['id'], await session.adapter(job['target_site']), client, args.url)
             elif args.command == 'publish':
                 result = await worker.publish(job['id'], await session.adapter(job['target_site']), client,
                                               allow_manual_retry=True)

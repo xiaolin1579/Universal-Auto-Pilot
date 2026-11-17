@@ -57,6 +57,8 @@ def message_for(job, error=None):
         'cancelled': '🛑 Auto Upload: ยกเลิกงานแล้ว',
     }
     label = labels.get(job.get('state'))
+    if job.get('state') == 'seeding' and job.get('duplicate_resolution', {}).get('method') == 'existing_destination_torrent':
+        label = '♻️ Auto Upload: ผูกรายการเดิมที่กำลัง seed แล้ว'
     if not label:
         return None
     needs_input = job['state'] == 'draft' and error and error.startswith('Destination form is incomplete:')

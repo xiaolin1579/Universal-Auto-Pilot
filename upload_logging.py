@@ -18,6 +18,7 @@ EVENTS = {
     'site_ready': 'เว็บไซต์พร้อม', 'browser_close': 'ปิดเบราว์เซอร์',
     'inventory': 'ตรวจรายการต้นทาง', 'source_error': 'ต้นทางยังไม่พร้อม',
     'prepare_result': 'ผลเตรียมงาน', 'duplicate_result': 'ผลค้นหาซ้ำ',
+    'category_result': 'ผลตรวจหมวดหมู่',
     'state_change': 'สถานะงาน', 'recheck_wait': 'รอผลตรวจไฟล์',
     'repack_status': 'สถานะ OnlyOne maker', 'repack_start': 'สั่งสร้าง torrent ใหม่',
     'repack_ready': 'ตรวจ torrent ใหม่ผ่าน',

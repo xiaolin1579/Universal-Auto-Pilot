@@ -152,7 +152,32 @@ class MappingStore:
             target = job.get('target_hash')
             if target is not None and (not infohash(target) or target != infohash(target) or target == job['source_hash']):
                 raise ValueError('Invalid upload variant hash')
+            classification = job.get('classification')
+            if classification is not None and (not isinstance(classification, dict)
+                    or classification.get('version') != 1 or classification.get('job_id') != key
+                    or classification.get('applied') is not False
+                    or classification.get('source_hash') != job['source_hash']
+                    or not isinstance(classification.get('suggestions'), list)
+                    or not isinstance(classification.get('job_fingerprint'), str)
+                    or not re.fullmatch(r'[0-9a-f]{64}', classification['job_fingerprint'])):
+                raise ValueError('Invalid classification suggestions')
             signature = job.get('submission_signature')
+            resolution = job.get('duplicate_resolution')
+            if resolution is not None and (not isinstance(resolution, dict)
+                    or resolution.get('method') != 'existing_destination_torrent'
+                    or resolution.get('target_hash') != target
+                    or resolution.get('listing') != job.get('listing') or not target):
+                raise ValueError('Invalid duplicate resolution')
+            category = job.get('category_review')
+            if category is not None and (not isinstance(category, dict) or category.get('version') != 1
+                    or category.get('status') not in ('ready','review_required')
+                    or not isinstance(category.get('issues'), list)
+                    or any(not isinstance(v, str) for v in category['issues'])
+                    or not isinstance(category.get('applied_fields'), dict)
+                    or type(category.get('auto_fix')) is not bool
+                    or not isinstance(category.get('job_fingerprint'), str)
+                    or not re.fullmatch(r'[0-9a-f]{64}', category['job_fingerprint'])):
+                raise ValueError('Invalid category review')
             if signature is not None and (not isinstance(signature, str) or not re.fullmatch(r'[0-9a-f]{64}', signature)):
                 raise ValueError('Invalid upload submission signature')
             repack = job.get('repack')

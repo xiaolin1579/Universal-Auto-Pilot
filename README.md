@@ -228,10 +228,19 @@ Auto Upload ใช้ไฟล์ที่โหลดครบแล้วจ�
 ```bash
 python auto_upload_cli.py --help
 python auto_upload_cli.py status
+python auto_upload_cli.py classify JOB_ID
 python auto_upload_cli.py inspect-form --site DEDBIT --category 35
 python auto_upload_cli.py inspect-form --site BITSUSE --category 181
 python auto_upload_cli.py inspect-form --site TORRENTDD --category 19
 ```
+
+`classify` แนะนำหมวดจากข้อมูลต้นทางและ manifest โดยไม่เปลี่ยนฟอร์มหรือสถานะงาน
+เลือกเปิด MusicBrainz ด้วย `--musicbrainz` และเก็บเฉพาะคำแนะนำด้วย `--save`
+ดูแหล่งข้อมูล การตรวจหลักฐาน และข้อจำกัดสำหรับแต่ละชนิดสื่อใน
+[คู่มือแนะนำหมวดหมู่](docs/METADATA_CLASSIFICATION.md)
+เปิด `AUTO_UPLOAD.category_review` เพื่อแก้ช่องว่างหรือค่าผิดที่มีหลักฐานระดับสูง
+ในคิวอัตโนมัติ หรือใช้ `repair-category JOB_ID` กับงานที่เลือก
+ส่วน `resolve-duplicate JOB_ID` ผูกรายการซ้ำที่ seed อยู่แล้วเข้ากับคิว โดยไม่อัปโหลดหรือเพิ่ม torrent ซ้ำ
 
 หากไฟล์ `.torrent` เกินขนาดที่ฟอร์มปลายทางรับ คิวรองรับการสร้างใหม่ผ่าน
 OnlyOne SSO maker จากโฟลเดอร์ downloads เริ่มต้น ตรวจรายชื่อและขนาดไฟล์

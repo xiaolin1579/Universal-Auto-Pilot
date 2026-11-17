@@ -1,0 +1,141 @@
+# ตรวจสอบและแก้หมวดหมู่จาก metadata
+
+คำสั่ง `classify` วิเคราะห์งานที่อยู่ในคิวแล้ว และคืน JSON พร้อมข้อเสนอ เหตุผล
+ระดับความมั่นใจ และ URL หลักฐานถ้ามี ค่าเริ่มต้นอ่าน mapping และไฟล์ `.torrent`
+ที่เก็บไว้ในเครื่อง โดยไม่ล็อกอิน seedbox เปิด browser หรือค้นข้อมูลภายนอก
+ไม่มีการเปลี่ยนช่องฟอร์ม checkbox สถานะงาน หรือส่งอัปโหลดจากคำสั่งนี้
+การแก้อัตโนมัติในคิวเปิดแยกด้วย `AUTO_UPLOAD.category_review` ตามตัวอย่างด้านล่าง
+ส่วนคำสั่ง `classify` ยังคงอ่านและเสนอค่าเท่านั้น
+
+ติดตั้ง dependencies จาก `requirements.txt` ก่อนใช้งาน:
+
+```sh
+python -m pip install -r requirements.txt
+python auto_upload_cli.py classify JOB_ID
+python auto_upload_cli.py classify --all-drafts
+```
+
+ระบุ JOB_ID หรือ `--all-drafts` อย่างใดอย่างหนึ่ง โดย `--all-drafts` เลือกเฉพาะ
+งานสถานะ `draft` ส่วน JOB_ID ใช้อ่านงานสถานะอื่นได้ด้วย
+
+## การเลือกแหล่งข้อมูล
+
+| ตัวเลือก | ข้อมูลที่อ่านและผลที่ได้ |
+|---|---|
+| ค่าเริ่มต้น | ชื่อ รายละเอียด หมวดต้นทาง ฟอร์มที่บันทึกไว้ และ manifest จาก artifact ที่ hash/โครงสร้างตรงกับงาน |
+| `--client` | ล็อกอินโหนดต้นทาง อ่าน inventory/files และ export torrent เพื่อตรวจ hash โครงสร้าง path และไฟล์ครบ รองรับ client ที่มี read-only export ผ่าน `request` ปัจจุบันใช้กับ qBittorrent |
+| `--musicbrainz` | ใช้ `musicbrainzngs` ค้นเพลงด้วยศิลปิน ชื่ออัลบั้ม และปี ตรวจชื่อ/ศิลปิน/ปี/ชนิดสื่อก่อนรับเป็นหลักฐาน |
+| `--web` | ใช้ `ddgs` ค้น URL อ้างอิงสำหรับผู้ตรวจ ไม่ใช้ข้อความผลค้นหาเติมหมวดหรือยืนยันข้อเท็จจริง |
+| `--catalog-file PATH` | อ่าน metadata ที่ผู้ใช้จัดเตรียมจากแค็ตตาล็อกที่ได้รับอนุญาต พร้อม URL หลักฐาน HTTPS |
+| `--save` | เพิ่ม `classification` ในงาน `draft`/`prepared` เท่านั้น ไม่เปลี่ยนฟอร์ม readiness หรือสถานะ |
+
+```sh
+python auto_upload_cli.py classify JOB_ID --musicbrainz
+python auto_upload_cli.py classify JOB_ID --client --musicbrainz --save
+python auto_upload_cli.py classify JOB_ID --web
+python auto_upload_cli.py classify JOB_ID --catalog-file classification.catalog.example.json
+python auto_upload_cli.py show JOB_ID
+```
+
+การค้นภายนอกเป็นการเลือกเปิดต่อคำสั่ง ส่งเฉพาะศิลปิน ชื่อ และปี
+ไม่ส่ง cookie/passkey ของ tracker หรือ manifest ไปให้ผู้ให้บริการ
+คำค้นและผลถูกแคชใน `.metadata_cache/` เป็นเวลา 24 ชั่วโมง
+กรณีบริการขัดข้องแคช 5 นาทีและรายงาน `*_unavailable` โดยไม่สร้างข้อมูลทดแทน
+timeout แต่ละผู้ให้บริการไม่เกิน 25 วินาทีตามค่าเริ่มต้น
+
+## การอ่านผลและข้อจำกัด
+
+- `suggestions`: ค่าเฉพาะช่องที่มีใน `form_schema` และอยู่ในตัวเลือกของฟอร์ม
+  พร้อม `confidence`, `reasons`, `evidence`, ค่า `current` และ `needs_change`
+- `high`/`medium` เป็นระดับตามกฎของหลักฐาน ไม่ใช่เปอร์เซ็นต์ความถูกต้อง
+  `rapidfuzz` ใช้ช่วยแก้การสะกดใกล้เคียงเท่านั้น ไม่ใช้ตัดสินความหมายของหมวด
+- `unresolved_fields`, `conflict_fields`, `review_flags`: ช่องที่ยังไม่ทราบ
+  หลักฐานขัดกัน หรือข้อจำกัดที่ต้องตรวจเอง ค่า `review_required` ไม่เปลี่ยนสถานะคิว
+- `applied: false` เสมอ `--save` เก็บข้อเสนอให้อ่านผ่าน `show` ได้
+  ถ้าข้อมูลต้นทาง กฎ ฟอร์ม หรือ override เปลี่ยน รายงานเดิมจะแสดง `stale: true`
+  การบันทึกจะตรวจ fingerprint อีกครั้งเพื่อไม่บันทึกผลที่วิเคราะห์จากข้อมูลเก่า
+- `requires_live_form_check: true` หมายถึงตัวเลือกที่ใช้มาจากฟอร์มที่เคยบันทึกไว้
+  ก่อนกรอกจริงต้องตรวจฟอร์มสดด้วย `check-job` ตาม workflow เดิม
+
+เพลงใช้ manifest ช่วยแยก MP3/Lossless และใช้ชนิด release ของ MusicBrainz
+โดยพิจารณา Compilation/Soundtrack ก่อน Album ข้อมูลประเทศที่วางขายและภาษา
+ใน tracklist ไม่ได้ยืนยันหมวดเพลงไทย/สากล/เอเชีย และ `Vol 1974` ไม่ถือเป็นปี
+SACD ISO ให้ได้เพียงข้อเสนอระดับกลางตามคำประกาศต้นทาง ยังไม่ได้ถอดรหัสเสียง
+ส่วน M4A อาจมี AAC หรือ ALAC จึงต้องตรวจ codec เพิ่ม งานหลายรูปแบบไม่บังคับเลือกแบบเดียว
+
+หนังทั่วไปใช้ `guessit` ช่วยอ่านชื่อ ปี ตอน ความละเอียด และ codec จากชื่อไฟล์
+รุ่นนี้ยังไม่มี provider แค็ตตาล็อกหนังทั่วไปสำหรับยืนยันหมวดย่อยครบทุกช่อง
+ไม่ใช้ `mutagen` เพราะ manifest ไม่มีข้อมูล header เสียงจากไฟล์จริงบน seedbox
+
+สำหรับสื่อผู้ใหญ่ ใช้รหัสฉบับที่ตรงกันแบบ exact match กับ metadata ใน
+`--catalog-file` ที่ผู้ใช้จัดเตรียมเท่านั้น ไม่มี provider ค้นเว็บภายนอกสำหรับหมวดนี้
+ไม่ใช้ prefix ของรหัสเดาประเทศ และไม่ใช้ชื่อ `Uncensored` ยืนยันการเซ็นเซอร์ของฉบับนั้น
+ประเภทคู่แสดงต้องมีข้อมูลยืนยันต่างหาก จึงคงช่องที่ไม่ทราบไว้ให้ตรวจเอง
+คำว่า Leaked/คลิปหลุด/แอบถ่ายจะตั้ง `origin_requires_review` และไม่สร้างข้อเสนอช่องฟอร์ม
+ไม่อ่าน seedbox หรือค้นข้อมูลภายนอกสำหรับงานนั้น
+
+หลังตรวจหลักฐานแล้ว หากต้องการกำหนดค่าเอง ให้จัดทำไฟล์ override และสั่ง
+`configure JOB_ID --file job-fields.json` ตามคู่มือ Auto Upload เดิม
+
+## ตรวจและแก้หมวดในคิวอัตโนมัติ
+
+เพิ่มส่วนนี้ภายใน `AUTO_UPLOAD` ของ config ที่ใช้งาน แล้วเริ่มโปรแกรมด้วยโค้ดรุ่นใหม่:
+
+```json
+"category_review": {
+  "enable": true,
+  "auto_fix": true,
+  "musicbrainz": false,
+  "catalog_file": ""
+}
+```
+
+เมื่อเปิด ระบบตรวจหลังเตรียมงาน และตรวจฟอร์มสดอีกครั้งก่อนส่งทั้งงาน `draft`
+และ `prepared` การเติมค่าใช้เฉพาะข้อเสนอระดับ `high` ที่อยู่ในตัวเลือกจริงของฟอร์ม
+โดยแก้เฉพาะช่องว่างหรือค่ากฎกลางที่ไม่ถูกต้องผ่าน override เฉพาะงาน
+ไม่เปลี่ยนเว็บ หมวดหลัก กฎกลาง ชื่อประกาศ หรือ checkbox จากผลวิเคราะห์
+กฎเส้นทางเดิมยังต้องตรงกับ config ปัจจุบันจึงเผยแพร่ได้
+
+ค่าที่ผู้ใช้ระบุเองจะไม่ถูกเขียนทับ แม้เป็นค่าที่ไม่ถูกต้อง
+ถ้าค่าที่มีอยู่ขัดกับหลักฐาน หรือข้อมูลมีหลายคำตอบ จะคงงานเป็น `draft`
+พร้อม `category_review.issues` ส่วนหลักฐานระดับกลางและข้อมูลที่ไม่พอจะไม่ถูกนำมาเติมเอง
+ช่องที่ยังว่างหรือผิดจึงยังทำให้งานส่งไม่ได้ตามฟอร์มปกติ
+การเซ็นเซอร์ที่ไม่มีหลักฐานฉบับจริงเป็นเพียงข้อสังเกตเมื่อไม่มีช่องนั้นในฟอร์ม
+กรณีหลักฐานเรื่องการเซ็นเซอร์ขัดกันจะหยุดให้ตรวจสอบ
+
+`category_review`, `category_corrections` และ `category_auto_fields` แสดงผลล่าสุด
+ประวัติค่าเดิม/ค่าใหม่พร้อมหลักฐาน และช่องที่ระบบเคยเติมผ่าน `show JOB_ID`
+ถ้าผู้ใช้แก้ช่องนั้นด้วย `configure` จะถือเป็นค่าที่ผู้ใช้ดูแลต่อ
+ผลถูกบันทึกใน transaction ที่ตรวจว่าข้อมูลงานไม่ได้เปลี่ยนระหว่างวิเคราะห์
+
+ตั้ง `auto_fix: false` เพื่อตรวจและบันทึกข้อเสนอโดยไม่เติมค่าอัตโนมัติ
+หากไม่ตั้ง `category_review.enable: true` คิวจะใช้พฤติกรรมเดิม
+การเปิด MusicBrainz สำหรับรอบอัตโนมัติต้องตั้ง `musicbrainz: true` เพิ่มต่างหาก
+`catalog_file` รับพาธไฟล์หลักฐาน โดยพาธสัมพัทธ์อิงโฟลเดอร์โครงการ
+ไม่มีการค้นเว็บ DDGS ในรอบแก้หมวดอัตโนมัติ เพราะ URL ค้นหาไม่ใช่หลักฐานยืนยันหมวด
+
+ตรวจและแก้เฉพาะงานด้วยฟอร์มสด โดยไม่เผยแพร่หรือเพิ่ม torrent:
+
+```sh
+python auto_upload_cli.py repair-category JOB_ID
+python auto_upload_cli.py repair-category JOB_ID --musicbrainz
+python auto_upload_cli.py repair-category JOB_ID --catalog-file classification.catalog.example.json
+```
+
+คำสั่งนี้รับเฉพาะ `draft`/`prepared` ใช้นโยบายแก้อัตโนมัติเฉพาะหลักฐานระดับสูง
+และไม่ยืนยัน checkbox ให้เอง ถ้า artifact อ้างพาธเดิมที่อ่านไม่ได้ จะใช้ export
+จาก qBittorrent ตรวจ hash, payload, path และไฟล์ครบก่อนบันทึกสำเนาใน artifact dir ปัจจุบัน
+client อื่นต้องมี artifact ที่อ่านได้ จึงใช้ workflow นี้ได้
+
+## รูปแบบไฟล์แค็ตตาล็อก
+
+ดู [classification.catalog.example.json](../classification.catalog.example.json)
+แต่ละ record ต้องมี `kind` (`music`, `video`, `adult`) และ URL หลักฐาน HTTPS
+ไม่รับ URL ที่มีข้อมูลล็อกอิน passkey/token หรือ query ที่ไม่รู้จัก
+ไฟล์สูงสุด 2 MiB และ 100 records ไม่อ่านหน้าเว็บของ URL นั้นโดยอัตโนมัติ
+การระบุ URL ในไฟล์ไม่ใช่การตรวจว่าข้อมูลที่ผู้ใช้กรอกตรงกับหน้าเว็บแล้ว
+
+ช่องที่รองรับ: `kind`, `provider`, `url`, `title`, `artist`, `year`, `release_type`,
+`secondary_types`, `format`, `music_region`, `release_code`, `production_country`,
+`media_type`, `censorship` โดยไม่รับ field override หรือ checkbox จากไฟล์นี้
+เมื่อพบหลายฉบับที่เข้าข่าย จะรายงาน `catalog_identity_ambiguous` ให้ตรวจเพิ่ม
