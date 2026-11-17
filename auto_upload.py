@@ -5,6 +5,7 @@ import os
 import re
 from pathlib import Path
 import tempfile
+from upload_logging import log_event
 from torrent_store import infohash, stamp, UPLOAD_STATES as STATES, UPLOAD_HOLD_STATES as HOLD_STATES
 from torrent_metainfo import (_extract_torrent_info_hash, payload_signature,
                               create_variant, verify_completed, UPLOAD_TARGETS,
@@ -516,11 +517,13 @@ class UploadWorker:
 
     async def variant(self, job, source, spec, client):
         variant = create_job_variant(job, source, spec['announce'])
+        log_event('stage', job, stage='metainfo_size', metainfo_bytes=len(variant), max_file_size=spec.get('max_file_size'))
         try:
             validate_metainfo_size(len(variant), spec)
         except MetainfoTooLarge:
             import asyncio
             from onlyone_repack import rebuild_onlyone
+            log_event('stage', job, stage='repack_onlyone')
             job = await asyncio.to_thread(rebuild_onlyone, self.ledger, job['id'], client, spec)
             variant = create_job_variant(job, source, spec['announce'])
             validate_metainfo_size(len(variant), spec)
@@ -531,15 +534,21 @@ class UploadWorker:
         job = self.ledger.get(key)
         if job['state'] not in ('draft', 'prepared'):
             raise UploadBlocked('Only an unsubmitted job can be checked')
+        log_event('stage', job, stage='check_source')
         self.ledger.record_check(key, job, {'status': 'unknown', 'complete': False, 'reason': 'check_in_progress'})
         live = client.inventory(job['source_hash'])
         if client.name != job['source_node'] or live.get('save_path') != job['save_path']:
             raise UploadBlocked('Source client or save path changed')
         verify_completed(Path(job['source_artifact']).read_bytes(), live, client.files(job['source_hash']))
+        log_event('stage', job, stage='load_form')
         spec = await adapter.load_form(job, require_ready=False)
         variant = create_job_variant(job, Path(job['source_artifact']).read_bytes(), spec['announce'])
         validate_metainfo_size(len(variant), spec)
+        log_event('stage', job, stage='duplicate_check')
         evidence = await adapter.check_duplicates(job)
+        if isinstance(evidence, dict):
+            log_event('duplicate_result', job, status=evidence.get('status'), complete=evidence.get('complete'),
+                      pages=evidence.get('pages'), candidates_checked=evidence.get('candidates_checked'), reason=evidence.get('reason'))
         self.ledger.record_check(key, job, evidence, readiness=spec['readiness'])
         return self.ledger.review(key)
 
@@ -553,20 +562,27 @@ class UploadWorker:
         live = client.inventory(job['source_hash'])
         if client.name != job['source_node'] or live.get('save_path') != job['save_path']:
             raise UploadBlocked('Source client or save path changed; cannot authorize a retry')
+        log_event('stage', job, stage='check_source')
         source = Path(job['source_artifact']).read_bytes()
         verify_completed(source, live, client.files(job['source_hash']))
         if payload_signature(source) != job['content_group_id']:
             raise UploadBlocked('Source payload no longer matches the uncertain job')
+        log_event('stage', job, stage='load_form')
         spec = await adapter.load_form(job, require_ready=False)
         if not isinstance(spec.get('readiness'), dict) or type(spec['readiness'].get('ready')) is not bool:
             raise UploadBlocked('Destination form readiness could not be verified')
         job, variant = await self.variant(job, source, spec, client)
         if _extract_torrent_info_hash(variant) != job['prepared_hash']:
             raise UploadBlocked('Prepared variant no longer matches the uncertain job')
+        log_event('stage', job, stage='duplicate_check')
         evidence = await adapter.check_duplicates(job)
+        if isinstance(evidence, dict):
+            log_event('duplicate_result', job, status=evidence.get('status'), complete=evidence.get('complete'),
+                      pages=evidence.get('pages'), candidates_checked=evidence.get('candidates_checked'), reason=evidence.get('reason'))
         if not isinstance(evidence, dict):
             raise UploadBlocked('Duplicate search returned invalid evidence')
         result = self.ledger.record_publication_retry(key, job, evidence, spec)
+        log_event('state_change', result, stage='retry_check')
         if evidence.get('status') != 'clear' or evidence.get('complete') is not True:
             raise UploadBlocked(duplicate_block_reason(evidence, job['target_site']))
         return result
@@ -588,34 +604,48 @@ class UploadWorker:
                 raise UploadBlocked('Uncertain submission requires reconciliation before publication')
             raise UploadBlocked('Only prepared jobs can be published (current state: ' + job['state'] + ')')
         # Revalidate live source; Cleaner holds it while this job is active.
+        log_event('stage', job, stage='check_source')
         source = Path(job['source_artifact']).read_bytes()
         live = client.inventory(job['source_hash'])
         if client.name != job['source_node'] or live.get('save_path') != job['save_path']:
             raise UploadBlocked('Source client or save path changed; prepare a new job')
         verify_completed(source, live, client.files(job['source_hash']))
+        log_event('stage', job, stage='load_form')
         form = await adapter.load_form(job)
         job, variant = await self.variant(job, source, form, client)
         if _extract_torrent_info_hash(variant) != job['prepared_hash']:
             raise UploadBlocked('Prepared variant no longer matches the rule')
+        log_event('stage', job, stage='record_preflight')
         self.ledger.record_check(key, job, {'status': 'unknown', 'complete': False, 'reason': 'check_in_progress'})
+        log_event('stage', job, stage='duplicate_check')
         evidence = await adapter.check_duplicates(job)
+        if isinstance(evidence, dict):
+            log_event('duplicate_result', job, status=evidence.get('status'), complete=evidence.get('complete'),
+                      pages=evidence.get('pages'), candidates_checked=evidence.get('candidates_checked'), reason=evidence.get('reason'))
         if evidence.get('status') != 'clear' or evidence.get('complete') is not True:
             self.ledger.record_check(key, job, evidence)
             raise UploadBlocked(duplicate_block_reason(evidence, job['target_site']))
         # Duplicate search navigates away: refresh nonce and validate fields once more.
+        log_event('stage', job, stage='load_form')
         form = await adapter.load_form(job)
         job, variant = await self.variant(job, source, form, client)
         path = write_artifact(self.ledger.artifacts, key, 'submission', variant, upload_filename(job))
+        log_event('stage', job, stage='fill_form', metainfo_bytes=len(variant))
         await adapter.fill(job, path)
         self.ledger.claim_submission(key, job, evidence)
+        log_event('state_change', job, state='submitting', stage='submit_form')
         try:
             listing = await adapter.submit(job)
             self.ledger.record_publication(key, listing)
+            log_event('state_change', job, state='published', listing_id=listing.get('torrent_id'))
         except UploadRejected as exc:
+            log_event('job_error', job, stage='submit_form', reason=exc.code, error_type=type(exc).__name__)
             self.ledger.transition(key, {'submitting'}, 'prepared',
                 last_submission_failure={'code': exc.code, 'title_limit': exc.title_limit, 'verified_at': stamp()})
             raise
         except BaseException as exc:
+            log_event('job_error', job, state='publication_uncertain',
+                      stage=publication_failure(adapter, exc)['stage'], error_type=type(exc).__name__)
             self.ledger.transition(key, {'submitting'}, 'publication_uncertain',
                                    last_publication_failure=publication_failure(adapter, exc))
             raise
@@ -624,9 +654,14 @@ class UploadWorker:
     async def verify_publication(self, key, adapter):
         job = self.ledger.get(key)
         try:
+            log_event('stage', job, stage='download_canonical')
             canonical = await adapter.download_listing(job['listing']['details_url'])
-            return self.ledger.accept_canonical(key, canonical)
-        except Exception:
+            result = self.ledger.accept_canonical(key, canonical)
+            log_event('state_change', result, stage='canonical_verified', metainfo_bytes=len(canonical),
+                      target_hash=result.get('target_hash'))
+            return result
+        except Exception as exc:
+            log_event('job_error', job, stage='verify_canonical', error_type=type(exc).__name__)
             self.ledger.transition(key, {'published', 'verification_failed'}, 'verification_failed')
             raise
 
@@ -635,6 +670,7 @@ class UploadWorker:
         if job['source_node'] != client.name:
             raise UploadBlocked('Cross-seed must use the verified source client and save path')
         if job['state'] == 'verified':
+            log_event('stage', job, stage='check_source_before_seed')
             live = client.inventory(job['source_hash'])
             if live.get('save_path') != job['save_path']:
                 raise UploadBlocked('Source save path changed')
@@ -645,15 +681,19 @@ class UploadWorker:
                 raise UploadBlocked('Canonical artifact changed')
             # Persist before client mutation: never blindly retry an interrupted add.
             self.ledger.transition(key, {'verified'}, 'adding')
+            log_event('state_change', job, state='adding', stage='add_paused')
             try:
                 if client.inventory(job['target_hash'], missing_ok=True) is not None:
                     raise UploadBlocked('Target hash already exists; reconcile it explicitly')
                 if not client.add_paused(content, job):
                     raise RuntimeError('Paused add not confirmed')
+                log_event('stage', job, stage='request_recheck', target_hash=job['target_hash'])
                 observed = request_recheck(client, job['target_hash'])
                 self.ledger.transition(key, {'adding'}, 'rechecking', recheck_requested_at=stamp(), recheck_observed=observed)
+                log_event('state_change', job, state='rechecking', target_hash=job['target_hash'])
                 # A later pass must observe checking and then a completed paused state.
-            except BaseException:
+            except BaseException as exc:
+                log_event('job_error', job, state='seed_uncertain', stage='add_or_recheck', error_type=type(exc).__name__)
                 self.ledger.transition(key, {'adding'}, 'seed_uncertain')
                 raise
             return self.ledger.get(key)
@@ -663,13 +703,16 @@ class UploadWorker:
         if row.get('save_path') != job['save_path']:
             raise UploadBlocked('Target save path changed during recheck')
         state = str(row.get('state', '')).lower()
+        log_event('recheck_wait', job, status=state, progress=row.get('progress'), amount_left=row.get('amount_left'))
         if state.startswith('checking'):
             return self.ledger.transition(key, {'rechecking'}, 'rechecking', recheck_observed=True)
         if not job.get('recheck_observed') and not client.recheck_complete(job['target_hash']):
             return job
         verify_completed(Path(job['canonical_artifact']).read_bytes(), row, client.files(job['target_hash']))
         if not resume:
+            log_event('job_skip', job, reason='resume_disabled')
             return job
+        log_event('stage', job, stage='resume_seed', target_hash=job['target_hash'])
         if not client.resume(job['target_hash']):
             raise RuntimeError('Resume not confirmed')
         confirmed = client.inventory(job['target_hash'])
@@ -691,10 +734,13 @@ class UploadWorker:
                         'verification_method': 'live_upload_recheck_complete'})
             current.update(state='seeding', verified_at=stamp(), updated_at=stamp())
             return deepcopy(current)
-        return self.ledger.store.update(apply)
+        result = self.ledger.store.update(apply)
+        log_event('state_change', result, target_hash=job['target_hash'])
+        return result
 
     def reconcile_seed(self, key, client):
         job = self.ledger.get(key)
+        log_event('stage', job, stage='reconcile_seed')
         if job['state'] not in ('adding', 'seed_uncertain') or client.name != job['source_node']:
             raise UploadBlocked('Only an uncertain add on its source client can be reconciled')
         row = client.inventory(job['target_hash'])

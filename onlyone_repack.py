@@ -13,6 +13,7 @@ from auto_upload import (UploadBlocked, MetainfoTooLarge, create_job_variant, va
 from torrent_metainfo import (create_variant, verify_completed, payload_signature,
                               _extract_torrent_manifest, _extract_torrent_info_hash)
 from torrent_store import MappingStore, stamp
+from upload_logging import log_event
 
 
 class OnlyOneMaker:
@@ -95,6 +96,7 @@ def rebuild_onlyone(ledger, key, client, spec):
     try:
         location = maker.location(job, source)
         status = maker.request('/api/tenant/maker')
+        log_event('repack_status', job, status=status.get('state'), done=status.get('done'), total=status.get('total'))
         request = job.get('repack_request')
         if job.get('repack'):
             validate_metainfo_size(len(create_job_variant(job, source, spec['announce'])), spec)
@@ -132,7 +134,9 @@ def rebuild_onlyone(ledger, key, client, spec):
                     metainfo_preflight={'status': 'ready', 'max_file_size': spec['max_file_size'],
                                         'variant_bytes': len(variant), 'checked_at': stamp()})
                 return dict(current)
-            return ledger.store.update(finish)
+            result = ledger.store.update(finish)
+            log_event('repack_ready', result, metainfo_bytes=len(variant), max_file_size=spec['max_file_size'])
+            return result
         if status.get('state') == 'running':
             raise UploadBlocked('OnlyOne maker is running; poll again later without starting another task')
         if request:
@@ -151,6 +155,7 @@ def rebuild_onlyone(ledger, key, client, spec):
         ledger.store.update(claim_start)
         # Use a credential-free destination URL. The worker inserts the real announce later.
         from upload_sites import SITES
+        log_event('repack_start', job)
         maker.request('/api/tenant/maker', {'path': location['path'], 'trackers': [SITES[job['target_site']][0] + '/announce.php'],
             'private': True, 'name': name, 'comment': ''})
         raise UploadBlocked('OnlyOne maker started; poll again later to validate its result')

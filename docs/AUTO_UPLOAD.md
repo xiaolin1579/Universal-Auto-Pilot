@@ -362,3 +362,38 @@ python auto_upload_cli.py repack JOB_ID --max-bytes 1000000
 
 งาน `publication_uncertain` ยังคงต้องตรวจผลเผยแพร่ก่อนเปลี่ยนสถานะหรือส่งซ้ำ
 การพบไฟล์ใหญ่เกินข้อจำกัดไม่ใช่หลักฐานว่าการส่งครั้งก่อนปราศจากผลข้างเคียง
+
+
+### Log การทำงาน
+
+Log Auto Upload ใช้ prefix `[Auto Upload]` พร้อมเวลาไทย (UTC+07:00) และ JSON
+หนึ่งบรรทัดต่อเหตุการณ์ โปรแกรมหลักเขียนรวมใน `script_run.log` ตามสคริปต์เริ่มระบบ
+ส่วน CLI แสดงทาง stdout เหมือนเดิม ทุกบรรทัด flush ทันที
+
+| event | ความหมาย |
+|---|---|
+| `cycle_wait` | รอตรวจ node หรือรอรอบค้นหา/Cross-Seed ก่อนเข้าคิวอัปโหลด |
+| `cycle_start` / `queue` | เริ่มรอบ สวิตช์ จำนวนงานสูงสุด และจำนวนงานแต่ละสถานะ |
+| `job_start` / `stage` | งานและขั้นตอนปัจจุบัน เช่น `check_source`, `duplicate_check`, `fill_form`, `submit_form` |
+| `job_skip` | เหตุผลที่ข้าม เช่น `reconciliation_required`, `source_node_unavailable`, `manual_publish_required`, `seed_disabled` |
+| `duplicate_result` | ผลค้นหาซ้ำ ความครบถ้วน และจำนวนหน้าที่ตรวจ |
+| `repack_status` / `repack_ready` | ความคืบหน้า OnlyOne maker และขนาด metainfo ใหม่ที่ผ่านการตรวจ |
+| `state_change` / `recheck_wait` | สถานะหลังส่ง ตรวจ canonical เพิ่มแบบหยุด และผล recheck ก่อน seed |
+| `job_error` / `cycle_error` | งานหรือรอบทำงานขัดข้อง พร้อมชนิดข้อผิดพลาด |
+| `cycle_limit` / `cycle_summary` | ถึงจำนวนงานต่อรอบ และสรุปจำนวนที่ทำ/ข้าม/ยังไม่ได้พิจารณา พร้อมเวลาที่ใช้ |
+
+`job` และ hash แสดง 12 ตัวแรก ใช้เทียบกับคำสั่ง `status`/`show` ได้
+จำนวน `processed` นับงานที่พยายามทำ รวมงานที่เกิดข้อผิดพลาด ซึ่งยังใช้
+`max_jobs_per_cycle` ตามพฤติกรรมเดิม งาน seeding/cancelled สรุปรวมในคิวและ
+จำนวนข้าม เพื่อไม่พิมพ์ซ้ำทุกงาน `cycle_summary.status=completed` หมายถึง
+ประมวลผลรอบจบ ไม่ได้หมายความว่าทุกงานสำเร็จ ให้ดู `job_error` ประกอบ
+
+เลือกดูเฉพาะ Auto Upload แบบต่อเนื่องได้ด้วย:
+
+```bash
+tail -f script_run.log | grep --line-buffered '\[Auto Upload\]'
+```
+
+Logger รับเฉพาะฟิลด์ความคืบหน้าที่กำหนดไว้ ไม่พิมพ์ config, HTML, artifact path,
+exception body ทั่วไป หรือ announce URL และกรอง URL/ค่าความลับจากข้อความ
+ข้อผิดพลาดที่รองรับ การเพิ่ม log ไม่เปลี่ยนเงื่อนไขเผยแพร่หรือ retry งาน

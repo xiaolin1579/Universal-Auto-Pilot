@@ -1,6 +1,9 @@
 """Opt-in runtime integration. No website publication unless enable_publish is true."""
 from auto_upload import UploadBlocked
 import asyncio
+from collections import Counter
+from time import monotonic
+from upload_logging import log_event
 import os
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -36,18 +39,22 @@ class UploadSession:
                        if s.get('name', '').upper() == site and s.get('enable') is True), None)
         if config is None: raise UploadBlocked('Site is not enabled: ' + site)
         if self.browser is None:
+            log_event('browser_start', site=site)
             args = ['--proxy-server=' + os.environ['HTTPS_PROXY']] if os.environ.get('HTTPS_PROXY') else []
             self.browser = await self.app.launch_any_browser('auto_upload', args, enable_images=True)
         tab = await self.browser.get('about:blank', new_tab=True)
+        log_event('site_login', site=site)
         if not await self.app.ensure_site_logged_in(tab, config):
             raise RuntimeError('Site login failed: ' + site)
         adapter = BrowserSite(site, tab, enabled_paths={urlsplit(z.get('url', '')).path
                     for z in config.get('target_urls', []) if isinstance(z, dict) and z.get('enable', True)})
+        log_event('site_ready', site=site)
         self.adapters[site] = adapter
         return adapter
 
     async def close(self):
         if self.browser is not None:
+            log_event('browser_close')
             self.app.kill_specific_browser()
             await self.app.cleanup_profile()
             self.app.kill_xvfb()
@@ -63,24 +70,31 @@ async def prepare_job(app, session, node, source_hash, details_url, zone, target
 
 async def _prepare_destination(app, session, client, source_hash, metadata, content, rule):
     stage = 'source inventory'
+    log_event('prepare_stage', source_hash=source_hash, node=client.name, site=rule['target_site'], stage=stage)
     try:
         inventory, files = await asyncio.to_thread(lambda: (client.inventory(source_hash), client.files(source_hash)))
         stage = 'source manifest'
+        log_event('prepare_stage', source_hash=source_hash, node=client.name, site=rule['target_site'], stage=stage)
         verify_completed(content, inventory, files)
         stage = 'destination login'
+        log_event('prepare_stage', source_hash=source_hash, node=client.name, site=rule['target_site'], stage=stage)
         dest = await session.adapter(rule['target_site'])
         stage = 'destination form'
+        log_event('prepare_stage', source_hash=source_hash, node=client.name, site=rule['target_site'], stage=stage)
         spec = await dest.load_form({'target_site': rule['target_site'], 'target_zone': metadata['zone'], 'metadata': metadata,
                                     'target_category': str(rule['target_category']), 'rule': rule}, require_ready=False)
         stage = 'prepare artifacts'
+        log_event('prepare_stage', source_hash=source_hash, node=client.name, site=rule['target_site'], stage=stage)
         ledger = ledger_for(app)
         job = await asyncio.to_thread(ledger.prepare, content, inventory, files, metadata, rule,
                                        spec['announce'], readiness=spec['readiness'], form_schema=spec)
         if (app.CFG.get('AUTO_UPLOAD', {}).get('enable_publish') is True
                 and job['state'] in ('draft', 'prepared')):
             stage = 'publication confirmations'
+            log_event('prepare_stage', source_hash=source_hash, node=client.name, site=rule['target_site'], stage=stage)
             await asyncio.to_thread(ledger.confirm_for_publish, job['id'])
             job = ledger.get(job['id'])
+        log_event('prepare_result', job)
         return job
     except Exception as exc:
         safe_reasons = {
@@ -120,67 +134,118 @@ def enabled_rule(cfg, job):
 
 async def run_cycle(app, active_nodes):
     cfg = app.CFG.get('AUTO_UPLOAD', {})
-    if cfg.get('enable') is not True: return []
+    if cfg.get('enable') is not True:
+        log_event('cycle_disabled')
+        return []
+    started = monotonic()
     ledger = ledger_for(app)
     notices = UploadNotifications(app, ledger)
     worker = UploadWorker(ledger, enable_publish=cfg.get('enable_publish') is True)
     session = UploadSession(app)
     nodes = {node.name: node for node, _ in active_nodes}
     outcomes = []
+    skipped = Counter()
+    considered = 0
+    discovered = 0
+    queued = 0
+    status = 'completed'
     limit = max(1, min(int(cfg.get('max_jobs_per_cycle', 1)), 10))
+    log_event('cycle_start', nodes=len(nodes), max_jobs=limit,
+              publish=cfg.get('enable_publish') is True, seed=cfg.get('enable_seed') is True,
+              resume=cfg.get('enable_resume') is True)
+
+    def skip(job, reason, detail=True):
+        skipped[reason] += 1
+        if detail:
+            log_event('job_skip', job, reason=reason)
+
+    def at_limit():
+        if len(outcomes) >= limit:
+            log_event('cycle_limit', processed=len(outcomes), max_jobs=limit, remaining=max(0, queued-considered))
+            return True
+        return False
+
     try:
-        # Continue existing durable jobs first. Ambiguous POST/add states never auto-retry.
-        for job in ledger.store.read()['upload_jobs'].values():
-            if len(outcomes) >= limit: return outcomes
+        jobs = list(ledger.store.read()['upload_jobs'].values())
+        queued = len(jobs)
+        log_event('queue', queued=queued, counts=dict(Counter(job['state'] for job in jobs)))
+        # Continue durable jobs first. Ambiguous POST/add states never auto-retry.
+        for job in jobs:
+            if at_limit(): return outcomes
+            considered += 1
             if job['state'] in ('publication_uncertain', 'submitting', 'adding', 'seed_uncertain'):
+                skip(job, 'reconciliation_required')
                 notices.record(job)
                 continue
             if job['state'] in ('seeding', 'cancelled'):
+                skip(job, 'terminal_state', detail=False)
                 continue
             if job.get('publication_retry', {}).get('manual_publish_required') is True:
+                skip(job, 'manual_publish_required')
                 notices.record(job)
                 continue
             if job['state'] == 'draft' and cfg.get('enable_publish') is not True:
+                skip(job, 'publish_disabled')
                 continue
             node = nodes.get(job['source_node'])
-            if node is None or not enabled_rule(cfg, job): continue
+            if node is None:
+                skip(job, 'source_node_unavailable')
+                continue
+            if not enabled_rule(cfg, job):
+                skip(job, 'rule_disabled_or_changed')
+                continue
+            job_started = monotonic()
             try:
                 client = client_for(app, node)
                 acted = False
                 if job['state'] in ('draft', 'prepared') and cfg.get('enable_publish') is True:
+                    log_event('job_start', job, stage='publish')
                     adapter = await session.adapter(job['target_site'])
                     acted = True
                     job = await worker.publish(job['id'], adapter, client)
                 elif job['state'] in ('published', 'verification_failed'):
+                    log_event('job_start', job, stage='verify_canonical')
                     adapter = await session.adapter(job['target_site'])
                     acted = True
                     job = await worker.verify_publication(job['id'], adapter)
                 if job['state'] in ('verified', 'rechecking') and cfg.get('enable_seed') is True:
+                    log_event('job_start', job, stage='seed')
                     acted = True
                     job = await asyncio.to_thread(worker.seed, job['id'], client, cfg.get('enable_resume') is True)
                 if acted:
                     notices.record(job)
                     outcomes.append({'id': job['id'], 'state': job['state']})
+                    log_event('job_result', job, elapsed_seconds=round(monotonic()-job_started, 2))
+                else:
+                    skip(job, 'seed_disabled' if job['state'] in ('verified', 'rechecking') else 'publish_disabled')
             except Exception as exc:
-                # No response bodies/URLs/cookies/announce tokens in logs.
                 current = ledger.get(job['id'])
-                notices.record(current, safe_error(exc, current))
-                outcome = {'id': job['id'], 'state': current['state'], 'error': safe_error(exc, current)}
+                reason = safe_error(exc, current)
+                log_event('job_error', current, reason=reason, error_type=type(exc).__name__,
+                          elapsed_seconds=round(monotonic()-job_started, 2))
+                notices.record(current, reason)
+                outcome = {'id': job['id'], 'state': current['state'], 'error': reason}
                 if current['state'] == 'publication_uncertain' and current.get('last_publication_failure'):
                     outcome['publication_failure'] = current['last_publication_failure']
                 outcomes.append(outcome)
-        if len(outcomes) >= limit: return outcomes
-        # Queue only hashes linked to BearBit by verified, authenticated site_records.
+        if at_limit(): return outcomes
+        # Queue only completed hashes linked to BearBit by verified site_records.
         data = ledger.store.read()
         existing = {(j['source_hash'], j['target_site']) for j in data['upload_jobs'].values()}
         configured = [r for r in cfg.get('rules', []) if isinstance(r, dict) and r.get('enable') is True]
         zones = sorted({r.get('source_zone') for r in configured if r.get('source_zone') in ('normal', 'special')})
         for node in nodes.values():
-            if app.CLIENTS.adapter_for(node).upload_factory is None: continue
+            if app.CLIENTS.adapter_for(node).upload_factory is None:
+                log_event('inventory', node=node.name, reason='client_unsupported')
+                continue
+            log_event('inventory', node=node.name, stage='read')
             inventory = await asyncio.to_thread(node.get_all_torrents_info)
-            if not isinstance(inventory, list): continue
+            if not isinstance(inventory, list):
+                log_event('inventory', node=node.name, reason='inventory_unavailable')
+                continue
             completed = {str(t.get('hash', '')).lower() for t in inventory
                          if t.get('progress') == 1 and t.get('amount_left') == 0}
+            log_event('inventory', node=node.name, total=len(inventory), completed=len(completed))
             for record in data['site_records'].values():
                 source_hash = record.get('infohash')
                 if record['site'] != 'BEARBIT' or source_hash not in completed: continue
@@ -190,12 +255,14 @@ async def run_cycle(app, active_nodes):
                                and (source_hash, r.get('target_site')) not in existing}
                     if not pending: continue
                     try:
+                        log_event('stage', node=node.name, source_hash=source_hash, stage='read_source_' + zone)
                         client = client_for(app, node)
                         source_adapter = await session.adapter('BEARBIT')
                         metadata, content = await source_adapter.read_source(url, source_hash, zone)
                         rules = select_rules(cfg.get('rules', []), metadata)
                     except Exception as exc:
-                        print('[Auto Upload] Source not ready:', source_hash[:12], zone, str(exc) if isinstance(exc, UploadBlocked) else type(exc).__name__)
+                        log_event('source_error', node=node.name, source_hash=source_hash,
+                                  reason=safe_error(exc), error_type=type(exc).__name__)
                         continue
                     for rule in rules:
                         pair = (source_hash, rule['target_site'])
@@ -204,15 +271,30 @@ async def run_cycle(app, active_nodes):
                             job = await _prepare_destination(app, session, client, source_hash, metadata, content, rule)
                             notices.record(job)
                             outcomes.append({'id': job['id'], 'state': job['state']})
+                            discovered += 1
                             existing.add(pair)
                         except Exception as exc:
-                            print('[Auto Upload] Destination not ready:', source_hash[:12], rule['target_site'],
-                                  str(exc) if isinstance(exc, UploadBlocked) else type(exc).__name__)
-                        if len(outcomes) >= limit: return outcomes
-                if len(outcomes) >= limit: return outcomes
+                            log_event('source_error', node=node.name, source_hash=source_hash, site=rule['target_site'],
+                                      stage='prepare_destination', reason=safe_error(exc), error_type=type(exc).__name__)
+                        if at_limit(): return outcomes
+                if at_limit(): return outcomes
         return outcomes
+    except BaseException as exc:
+        status = 'failed'
+        log_event('cycle_error', error_type=type(exc).__name__)
+        raise
     finally:
         try:
-            await session.close()
+            try:
+                await session.close()
+            finally:
+                await notices.flush()
+        except BaseException as exc:
+            status = 'failed'
+            log_event('cycle_error', stage='cleanup', error_type=type(exc).__name__)
+            raise
         finally:
-            await notices.flush()
+            log_event('cycle_summary', status=status, queued=queued, processed=len(outcomes),
+                      discovered=discovered, skipped=sum(skipped.values()), skip_reasons=dict(skipped),
+                      remaining=max(0, queued-considered), elapsed_seconds=round(monotonic()-started, 2),
+                      counts=dict(Counter(item['state'] for item in outcomes)))

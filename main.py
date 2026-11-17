@@ -13299,6 +13299,11 @@ async def main():
             CFG = load_full_config()
             SET = CFG.get('SETTING', {})
             global_clean = CFG.get('GLOBAL_CLEAN', {})
+            from upload_logging import log_event as log_upload_event
+            if CFG.get('AUTO_UPLOAD', {}).get('enable') is True:
+                log_upload_event('cycle_wait', stage='node_scan', mode=cycle_mode)
+            else:
+                log_upload_event('cycle_disabled')
             active_nodes = []
             node_status_buffer = []
 
@@ -13583,6 +13588,9 @@ async def main():
                             "skip Cross-Seed target construction."
                         )
 
+                if CFG.get('AUTO_UPLOAD', {}).get('enable') is True:
+                    log_upload_event('cycle_wait', stage='search', mode=cycle_mode)
+
                 if cycle_mode == "normal":
 
                     print(
@@ -13684,7 +13692,7 @@ async def main():
                 if CFG.get("AUTO_UPLOAD", {}).get("enable") is True:
                     from upload_runner import run_cycle as run_upload_cycle
                     upload_results = await run_upload_cycle(sys.modules[__name__], active_nodes)
-                    print("[Auto Upload]", json.dumps(upload_results, ensure_ascii=False))
+                    # run_cycle emits sanitized progress and a final summary.
 
                 cycle_mode_completed = True
                 consecutive_errors = 0
