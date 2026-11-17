@@ -4388,6 +4388,7 @@ class QbitNode:
 class RtorrentNode:
     def __init__(self, cfg):
         self.name, self.url = cfg["name"], cfg["url"].rstrip("/")
+        self.rutorrent_url = cfg.get('rutorrent_url')
         self.user, self.pw = cfg["rt_user"], cfg["rt_pass"]
         self.quota_gb = cfg.get("quota_gb", 0)
         self.allow_space_reclaim = cfg.get("allow_space_reclaim", True) is True

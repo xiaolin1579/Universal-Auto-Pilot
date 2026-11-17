@@ -33,9 +33,9 @@ _RUNTIME_FIELDS = {'qb_user', 'qb_pass', 'rt_user', 'rt_pass', 'deluge_user', 'd
 _CLEAN_FIELDS = {'enable', 'policy', 'allow_space_reclaim', 'min_ratio',
                  'min_time_minutes', 'max_time_minutes'}
 _LEGACY_CLEAN_FIELDS = {'enable', 'min_ratio', 'min_time', 'max_time', 'max_idle_hours'}
-_SHARED_NODE_FIELDS = {'id', 'name', 'type', 'url', 'enable', 'storage_id', 'auth',
+_SHARED_NODE_FIELDS = {'id', 'name', 'type', 'url', 'rutorrent_url', 'enable', 'storage_id', 'auth',
                        'cleaner', 'space_accounting', 'allow_sweeper_auto_resume', 'daemon_id', 'rpc'}
-_LEGACY_NODE_FIELDS = {'name', 'type', 'url', 'enable', 'qb_user', 'qb_pass', 'rt_user',
+_LEGACY_NODE_FIELDS = {'name', 'type', 'url', 'rutorrent_url', 'enable', 'qb_user', 'qb_pass', 'rt_user',
                        'rt_pass', 'nginx', 'quota_gb', 'disk_type', 'clean_settings',
                        'allow_space_reclaim', 'provider_sso', 'provider_user', 'provider_pass',
                        'provider_auth_origin', 'storage_api', 'storage_mount',
@@ -652,6 +652,8 @@ class Editor:
             self.edit_node_cleaner(ident); return
         node = _node(self.doc, ident)
         changes = _form(node, [('url', str, False), ('enable', bool, False), ('allow_sweeper_auto_resume', bool, False)])
+        if node.get('type') == 'rtorrent':
+            changes.update(_form(node, [('rutorrent_url', str, False)]))
         if node.get('type') == 'deluge':
             if urlsplit(changes.get('url', node['url'])).scheme == 'deluge+ssl':
                 changes['daemon_id'] = REMOVE

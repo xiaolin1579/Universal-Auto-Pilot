@@ -20,7 +20,7 @@ EVENTS = {
     'prepare_result': 'ผลเตรียมงาน', 'duplicate_result': 'ผลค้นหาซ้ำ',
     'category_result': 'ผลตรวจหมวดหมู่',
     'state_change': 'สถานะงาน', 'recheck_wait': 'รอผลตรวจไฟล์',
-    'repack_status': 'สถานะ OnlyOne maker', 'repack_start': 'สั่งสร้าง torrent ใหม่',
+    'repack_status': 'สถานะตัวสร้าง torrent', 'repack_start': 'สั่งสร้าง torrent ใหม่',
     'repack_ready': 'ตรวจ torrent ใหม่ผ่าน',
 }
 FIELDS = frozenset({
@@ -29,7 +29,7 @@ FIELDS = frozenset({
     'max_jobs', 'processed', 'skipped', 'remaining', 'discovered', 'counts',
     'skip_reasons', 'elapsed_seconds', 'complete', 'pages', 'candidates_checked',
     'metainfo_bytes', 'max_file_size', 'files', 'completed', 'total', 'done',
-    'progress', 'amount_left', 'listing_id',
+    'progress', 'amount_left', 'listing_id', 'provider', 'piece_size',
 })
 THAI_TIME = timezone(timedelta(hours=7))
 

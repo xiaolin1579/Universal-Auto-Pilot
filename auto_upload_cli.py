@@ -22,7 +22,9 @@ def parser():
     classify.add_argument('--web', action='store_true', help='Opt in to web reference search (not classification evidence)')
     classify.add_argument('--catalog-file', help='Explicit normalized metadata from an authorized catalog')
     classify.add_argument('--save', action='store_true', help='Save suggestions only; never apply fields or publish')
-    rebuild = sub.add_parser('repack', help='Rebuild oversized metainfo with OnlyOne; never publishes')
+    capabilities = sub.add_parser('repack-capabilities', help='Detect available torrent creator without creating a task')
+    capabilities.add_argument('--node', required=True)
+    rebuild = sub.add_parser('repack', help='Rebuild oversized metainfo with an automatically detected creator; never publishes')
     rebuild.add_argument('job_id')
     rebuild.add_argument('--max-bytes', type=int, required=True, help='Size cap verified on the destination form')
     inspect_form = sub.add_parser('inspect-form')
@@ -90,6 +92,17 @@ async def execute(args, app):
         from pathlib import Path
         changes = json.loads(Path(args.file).read_text(encoding='utf-8'))
         return ledger.configure_job(args.job_id, changes)
+    if args.command == 'repack-capabilities':
+        config = next((n for n in app.CFG['NODES'] if n.get('name') == args.node and n.get('enable') is True), None)
+        if config is None: raise UploadBlocked('Source node is not enabled')
+        node = app.CLIENTS.create(config)
+        try:
+            if not await asyncio.to_thread(node.login): raise UploadBlocked('Source client login failed')
+            from torrent_creators import detect_creator
+            creator = await asyncio.to_thread(detect_creator, client_for(app, node))
+            return {'node': args.node, 'provider': creator.provider if creator else 'onlyone', 'supported': True}
+        finally:
+            app.CLIENTS.close(node)
     if args.command == 'repack':
         if cfg.get('enable') is not True or type(args.max_bytes) is not int or args.max_bytes <= 0:
             raise UploadBlocked('Repack requires AUTO_UPLOAD.enable and a positive destination size cap')
@@ -99,9 +112,9 @@ async def execute(args, app):
         node = app.CLIENTS.create(config)
         try:
             if not await asyncio.to_thread(node.login): raise UploadBlocked('Source client login failed')
-            from onlyone_repack import rebuild_onlyone
+            from torrent_repack import rebuild_metainfo
             from upload_sites import SITES
-            result = await asyncio.to_thread(rebuild_onlyone, ledger, job['id'], client_for(app, node),
+            result = await asyncio.to_thread(rebuild_metainfo, ledger, job['id'], client_for(app, node),
                 {'max_file_size': args.max_bytes, 'announce': SITES[job['target_site']][0] + '/announce.php'})
             return {'id': result['id'], 'state': result['state'], 'metainfo_preflight': result['metainfo_preflight']}
         finally:

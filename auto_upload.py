@@ -38,7 +38,7 @@ def validate_metainfo_size(size, spec):
 
 
 def repacked_source(job, source, *, candidate=None):
-    """Accept changed piece hashes only via a bound OnlyOne artifact and exact file layout.
+    """Accept changed piece hashes only via a bound creator artifact and exact file layout.
 
     This is not byte equality evidence: target data must still pass the full client
     recheck before resume. The original source identity remains unchanged.
@@ -47,7 +47,7 @@ def repacked_source(job, source, *, candidate=None):
     if not evidence:
         return source
     from torrent_metainfo import _extract_torrent_manifest, _decode_bencode_value
-    if (not isinstance(evidence, dict) or evidence.get('provider') != 'onlyone'
+    if (not isinstance(evidence, dict) or evidence.get('provider') not in ('onlyone', 'qbittorrent', 'rutorrent', 'deluge')
             or evidence.get('source_hash') != job['source_hash']
             or evidence.get('source_signature') != job['content_group_id']
             or _extract_torrent_info_hash(source) != job['source_hash']
@@ -67,7 +67,7 @@ def repacked_source(job, source, *, candidate=None):
     a, _ = _decode_bencode_value(source)
     b, _ = _decode_bencode_value(candidate)
     if b[b'info'][b'piece length'] <= a[b'info'][b'piece length']:
-        raise UploadBlocked('OnlyOne maker did not increase the piece size')
+        raise UploadBlocked('Torrent creator did not increase the piece size')
     return candidate
 
 
@@ -212,7 +212,7 @@ def effective_rule(job):
 def write_artifact(directory, job_id, kind, content, filename=None):
     directory = Path(directory).resolve(); directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     if filename is not None:
-        if (not re.fullmatch(r'[0-9a-f]{64}', job_id) or kind not in {'source', 'prepared', 'submission', 'canonical', 'repacked'}
+        if (not re.fullmatch(r'[0-9a-f]{64}', job_id) or kind not in {'source', 'prepared', 'submission', 'canonical', 'repacked', 'creator-result'}
                 or filename in {'.', '..'} or not filename.endswith('.torrent')
                 or re.search(r'[/\\\x00-\x1f]', filename)):
             raise UploadBlocked('Invalid upload artifact path')
@@ -328,7 +328,8 @@ class UploadLedger:
             public['repack'] = {k: deepcopy(job['repack'][k]) for k in (
                 'provider', 'source_hash', 'candidate_hash', 'candidate_signature', 'checked_at')}
         if job.get('repack_request'):
-            public['repack_request'] = {'claimed_at': job['repack_request'].get('claimed_at')}
+            public['repack_request'] = {k: job['repack_request'].get(k)
+                                       for k in ('provider', 'piece_size', 'claimed_at')}
         if job.get('classification'):
             from upload_classifier import input_fingerprint
             public['classification'] = deepcopy(job['classification'])
@@ -561,9 +562,9 @@ class UploadWorker:
             validate_metainfo_size(len(variant), spec)
         except MetainfoTooLarge:
             import asyncio
-            from onlyone_repack import rebuild_onlyone
-            log_event('stage', job, stage='repack_onlyone')
-            job = await asyncio.to_thread(rebuild_onlyone, self.ledger, job['id'], client, spec)
+            from torrent_repack import rebuild_metainfo
+            log_event('stage', job, stage='repack_metainfo')
+            job = await asyncio.to_thread(rebuild_metainfo, self.ledger, job['id'], client, spec)
             variant = create_job_variant(job, source, spec['announce'])
             validate_metainfo_size(len(variant), spec)
         return job, variant

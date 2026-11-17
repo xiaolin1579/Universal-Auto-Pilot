@@ -395,17 +395,37 @@ variant `.torrent` ก่อนเตรียมงาน ตรวจงาน
 หากตาราง piece hashes และรายชื่อไฟล์ทำให้ metainfo เกินข้อจำกัด ต้องสร้าง
 metainfo ใหม่ด้วย piece size ใหญ่ขึ้นจากไฟล์จริง การลบ metadata ส่วนบน
 หรือแก้ค่า `piece length` อย่างเดียวใช้แทนการ rehash ไม่ได้
-คิวรองรับการสร้าง metainfo ใหม่ผ่าน **OnlyOne SSO maker** เฉพาะเมื่อ variant
-เดิมเกิน `MAX_FILE_SIZE` จริง โดยใช้โฟลเดอร์ downloads เริ่มต้นของบัญชี
-ส่วน Swizzin และ client อื่นยังหยุดเมื่อไฟล์เกินข้อจำกัดตามเดิม
+คิวตรวจความสามารถของ client อัตโนมัติ เฉพาะเมื่อ variant เดิมเกิน
+`MAX_FILE_SIZE` จริง และเลือกตัวสร้างที่รองรับบนโหนดต้นทาง:
+
+| Client / ผู้ให้บริการ | ช่องทางสร้างใหม่ |
+| --- | --- |
+| qBittorrent | Torrent Creator WebAPI; ตรวจ endpoint จริง ไม่ตัดสินจากรุ่นอย่างเดียว |
+| rTorrent / Swizzin | ปลั๊กอิน Create และ Task ของ ruTorrent บน origin เดียวกับ RPC |
+| Deluge 2.2+ | `core.create_torrent` และ `core.get_path_size` ผ่าน Web/daemon RPC |
+| OnlyOne | SSO maker เมื่อ native API ไม่มี โดยใช้ downloads เริ่มต้น |
+
+ruTorrent ตรวจ `/rutorrent` อัตโนมัติ หรือระบุ `rutorrent_url` ใน node
+สำหรับพาธอื่นได้ ต้องเป็น origin เดียวกับ RPC เพื่อใช้บัญชีเดิม
+Deluge 1.3–2.1 ไม่รองรับการรับผลสร้างกลับทาง RPC จึงหยุดให้ตรวจเอง
+ระบบไม่ส่งคำสั่ง shell ผ่าน RPC และไม่ติดตั้งเครื่องมือบนเซิร์ฟเวอร์
 
 ระบบอ่านผลสร้างที่เสร็จอยู่แล้วและตรงกับโฟลเดอร์ต้นทางก่อน หากต้องเริ่มงานใหม่
 จะบันทึกคำขอก่อน POST แล้วให้รอบถัดไปอ่านสถานะ ไม่ส่ง POST ซ้ำเมื่อผลยังไม่ชัดเจน
-เมนู OnlyOne เลือก piece size ให้เอง หากผลใหม่ยังใหญ่เกินเกณฑ์ระบบจะหยุด
-ไม่ปรับค่าข้อจำกัดของเว็บปลายทาง
+ตัวสร้าง native เลือก piece size ที่ใหญ่ขึ้นเป็นกำลังสอง สูงสุด 64 MiB
+จากขนาด hash table ที่คาดว่าจะพอดี ส่วน OnlyOne เลือกขนาดให้เอง
+ทุกช่องทางต้องตรวจขนาด variant จริงอีกครั้ง หากยังเกินจะหยุด
+ไม่ปรับค่าข้อจำกัดของเว็บปลายทาง และไม่ fallback เปลี่ยน provider เมื่อส่งคำขอแล้ว
+
+qBittorrent/ruTorrent จับคู่ task ด้วย marker เฉพาะคำขอและพาธ/piece size
+จึงติดตามผลได้แม้ response ของ POST หาย โดยไม่สั่งสร้างซ้ำ
+Deluge 2.2 ส่งผลกลับพร้อมเขียนไฟล์ชื่อเฉพาะไว้ข้างต้นทาง โดยปิด `add_to_session`
+หาก RPC timeout หรือโปรเซสหยุดก่อนเก็บผลในเครื่อง ต้องตรวจไฟล์บนเซิร์ฟเวอร์เอง
+ระบบคงคำขอไว้และไม่สั่งสร้างทับซ้ำ หรือลบไฟล์/task ของ client อัตโนมัติ
 
 ผลใหม่ต้องเป็น v1 มี root และรายชื่อไฟล์/ขนาดตรงกับต้นทางทุกไฟล์ และมี piece
-size ใหญ่ขึ้น ขั้นนี้ยังไม่รองรับ padding, symlink หรือโฟลเดอร์ downloads ที่ย้ายเอง
+size ใหญ่ขึ้น ขั้นนี้ยังไม่รองรับ padding หรือ symlink
+ข้อจำกัด downloads เริ่มต้นใช้เฉพาะ OnlyOne maker
 ระบบเก็บ artifact และ signature ใหม่แยกจาก source เดิม โดย signature ของการส่ง
 แต่ละครั้งยังถูกผูกกับ canonical torrent ของครั้งนั้น ตรวจ recheck บน client
 ก่อนเริ่ม seed เสมอ การตรวจรายชื่อและขนาดไฟล์ไม่ใช่หลักฐานว่า byte ตรงกัน
@@ -414,12 +434,18 @@ size ใหญ่ขึ้น ขั้นนี้ยังไม่รอง�
 
 ```bash
 python auto_upload_cli.py repack JOB_ID --max-bytes 1000000
+python auto_upload_cli.py repack-capabilities --node ReadyIDC
 ```
 
 ใช้ค่าจากฟอร์มปลายทางจริง หาก maker กำลังทำงาน ให้เรียกคำสั่งเดิมภายหลังเพื่อ
 อ่านสถานะและตรวจผล คิว publish ตรวจข้อจำกัดสดจากฟอร์มและใช้เส้นทางเดียวกัน
 การ repack ไม่ปลด `publication_uncertain` และไม่อนุญาตส่งซ้ำโดยอัตโนมัติ
 งานที่ยังมีคำขอ maker ไม่ได้ข้อสรุปจะยกเลิกเพื่อปล่อยการป้องกันต้นทางไม่ได้
+
+`repack-capabilities` ตรวจ API แบบอ่านอย่างเดียว ไม่สร้าง task หรือเผยแพร่งาน
+อ้างอิง API: [qBittorrent Creator](https://github.com/qbittorrent/qBittorrent/blob/master/src/webui/api/torrentcreatorcontroller.cpp),
+[ruTorrent Create](https://github.com/Novik/ruTorrent/blob/master/plugins/create/action.php),
+[Deluge 2.2 core](https://github.com/deluge-torrent/deluge/blob/deluge-2.2.0/deluge/core/core.py)
 
 งาน `publication_uncertain` ยังคงต้องตรวจผลเผยแพร่ก่อนเปลี่ยนสถานะหรือส่งซ้ำ
 การพบไฟล์ใหญ่เกินข้อจำกัดไม่ใช่หลักฐานว่าการส่งครั้งก่อนปราศจากผลข้างเคียง
@@ -438,7 +464,7 @@ Log Auto Upload ใช้ prefix `[Auto Upload]` พร้อมเวลาไ�
 | `job_start` / `stage` | งานและขั้นตอนปัจจุบัน เช่น `check_source`, `duplicate_check`, `fill_form`, `submit_form` |
 | `job_skip` | เหตุผลที่ข้าม เช่น `reconciliation_required`, `source_node_unavailable`, `manual_publish_required`, `seed_disabled` |
 | `duplicate_result` | ผลค้นหาซ้ำ ความครบถ้วน และจำนวนหน้าที่ตรวจ |
-| `repack_status` / `repack_ready` | ความคืบหน้า OnlyOne maker และขนาด metainfo ใหม่ที่ผ่านการตรวจ |
+| `repack_start` / `repack_status` / `repack_ready` | ตัวสร้างที่เลือก, piece size และขนาด metainfo ใหม่ที่ผ่านการตรวจ |
 | `state_change` / `recheck_wait` | สถานะหลังส่ง ตรวจ canonical เพิ่มแบบหยุด และผล recheck ก่อน seed |
 | `job_error` / `cycle_error` | งานหรือรอบทำงานขัดข้อง พร้อมชนิดข้อผิดพลาด |
 | `cycle_limit` / `cycle_summary` | ถึงจำนวนงานต่อรอบ และสรุปจำนวนที่ทำ/ข้าม/ยังไม่ได้พิจารณา พร้อมเวลาที่ใช้ |

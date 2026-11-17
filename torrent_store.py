@@ -182,7 +182,7 @@ class MappingStore:
                 raise ValueError('Invalid upload submission signature')
             repack = job.get('repack')
             if repack is not None and (not isinstance(repack, dict)
-                    or repack.get('provider') != 'onlyone'
+                    or repack.get('provider') not in ('onlyone', 'qbittorrent', 'rutorrent', 'deluge')
                     or repack.get('source_hash') != job['source_hash']
                     or repack.get('source_signature') != job['content_group_id']
                     or not infohash(repack.get('candidate_hash'))
@@ -191,7 +191,18 @@ class MappingStore:
                     or not isinstance(repack.get('artifact'), str) or not repack['artifact'].startswith('/')):
                 raise ValueError('Invalid rebuilt metainfo evidence')
             request = job.get('repack_request')
-            if request is not None and (not isinstance(request, dict) or request.get('root') != 'files'
+            if request is not None and isinstance(request, dict) and request.get('provider') in ('qbittorrent', 'rutorrent', 'deluge'):
+                path = request.get('source_path')
+                piece = request.get('piece_size')
+                if (not isinstance(path, str) or not path.startswith('/') or '\\' in path or '\x00' in path
+                        or any(p in ('.', '..') for p in path.split('/'))
+                        or type(piece) is not int or not 32768 <= piece <= 64 * 1024**2 or piece & (piece - 1)
+                        or not isinstance(request.get('marker'), str)
+                        or not re.fullmatch(r'uap-[0-9a-f]{32}', request['marker'])
+                        or not isinstance(request.get('claimed_at'), str)):
+                    raise ValueError('Invalid torrent creator request')
+            elif request is not None and (not isinstance(request, dict) or request.get('provider') not in (None, 'onlyone')
+                    or request.get('root') != 'files'
                     or not isinstance(request.get('path'), str) or not request['path']
                     or '/' in request['path'] or request['path'] in ('.', '..')
                     or not isinstance(request.get('name'), str)

@@ -100,6 +100,14 @@ def normalize_config(raw):
     nodes = config.get("NODES", [])
     if not isinstance(nodes, list) or any(not isinstance(n, dict) for n in nodes):
         raise ConfigError("NODES must be a list of objects")
+    for node in nodes:
+        if 'rutorrent_url' in node:
+            _url(node['rutorrent_url'], 'NODES.rutorrent_url')
+            _url(node.get('url'), 'NODES.url')
+            rpc, ui = urlsplit(node['url']), urlsplit(node['rutorrent_url'])
+            if (node.get('type') != 'rtorrent' or (rpc.scheme, rpc.hostname, rpc.port)
+                    != (ui.scheme, ui.hostname, ui.port)):
+                raise ConfigError('NODES.rutorrent_url requires an rTorrent node on the RPC origin')
     if not uses_shared_nodes(config):
         for node in nodes:
             if deluge_rpc_settings(node) and (not isinstance(node.get('deluge_user'), str)
