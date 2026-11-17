@@ -49,6 +49,7 @@ import urllib.parse
 from torrent_store import MappingStore, UPLOAD_HOLD_STATES
 from client_registry import ClientAdapter, ClientRegistry
 from cross_seed_search import search_keywords, search_zones
+from cross_seed_validation import source_file_pairs, preflight_evidence
 from upload_client import QbitUploadClient, RtorrentUploadClient
 from deluge_client import DelugeNode, DelugeUploadClient
 from storage_telemetry import parse_size_gib, read_swizzin_storage_stats
@@ -3466,6 +3467,11 @@ class QbitNode:
             }
 
             if cross_seed:
+                # qBittorrent 5 uses stopped; retain paused for older WebAPI.
+                data['stopped'] = 'true' if paused else 'false'
+                data['contentLayout'] = 'Original'
+                data['skip_checking'] = 'true' if skip_checking else 'false'
+                data['seedMode'] = 'true' if skip_checking else 'false'
                 current_tags = [
                     part.strip()
                     for part in str(data.get("tags") or "").split(",")
@@ -9306,7 +9312,15 @@ def build_search_url(
             params.append((f"c{category_id}", "1"))
             seen_categories.add(category_id)
 
-    return f"{path_name}?{urlencode(params)}"
+    # BearBit's live search form is windows-874. UTF-8 query bytes are
+    # interpreted as Thai legacy text and produce mojibake/no results.
+    encoding = 'cp874' if 'bearbit' in site_key else 'utf-8'
+    try:
+        query = urlencode(params, encoding=encoding, errors='strict')
+    except UnicodeEncodeError:
+        print(f"⚠️ [{site_name}] Search keyword cannot be represented in {encoding}; query skipped")
+        return None
+    return f"{path_name}?{query}"
 
 
 def build_cross_seed_targets(
@@ -10348,12 +10362,7 @@ async def _preflight_cross_seed_candidate_single_source(
             return "/".join(parts)
 
         phase = "compare source files against candidate manifest"
-        source_pairs = []
-        for item in source_files:
-            source_pairs.append((
-                normalize_file_path(item.get("path")),
-                int(item.get("size_bytes")),
-            ))
+        source_pairs = source_file_pairs(source_files, source_name, candidate.get("multi_file") is True)
 
         candidate_pairs = []
         for item in candidate.get("files", []):
@@ -11380,15 +11389,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                         "known_sites": list(
                                             cross_seed_target.get("known_sites") or []
                                         ),
-                                        "preflight_status": _cs_preflight.get("status"),
-                                        "preflight_action": _cs_preflight.get("action"),
-                                        "candidate_info_hash": _cs_preflight.get("candidate_info_hash"),
-                                        "candidate_trackers": _cs_preflight.get("candidate_trackers", []),
-                                        "candidate_manifest": _cs_preflight.get("candidate_manifest"),
-                                        "torrent_content": _cs_preflight.get("torrent_content"),
-                                        "candidate_filelist": _cs_preflight.get("filelist", {}),
-                                        "source_file_mapping": _cs_preflight.get("source_file_mapping", []),
-                                        "candidate_extra_files": _cs_preflight.get("candidate_extra_files", []),
+                                        **preflight_evidence(_cs_preflight),
                                     })
                                 else:
                                     print(
@@ -12299,7 +12300,7 @@ def run_opt_in_cross_seed_tracker_additions(matches, active_nodes):
 
 
 
-def run_opt_in_new_hash_cross_seed(matches, active_nodes):
+def run_opt_in_new_hash_cross_seed(matches, active_nodes, *, dry_run=False):
     """
     Strict new-info-hash flow:
     - disabled by default
@@ -12503,6 +12504,10 @@ def run_opt_in_new_hash_cross_seed(matches, active_nodes):
             content = item.get("torrent_content")
             if not isinstance(content, (bytes, bytearray)) or len(content) < 1000:
                 raise ValueError("Missing usable candidate torrent bytes")
+            actual_manifest = _extract_torrent_manifest(content)
+            if (actual_manifest != manifest
+                    or actual_manifest['info_hash'].upper() != candidate_hash):
+                raise ValueError("Candidate metainfo differs from the preflight evidence")
 
             candidate_pairs = []
             for file_row in files:
@@ -12545,7 +12550,7 @@ def run_opt_in_new_hash_cross_seed(matches, active_nodes):
                 and int(source_info.get("total_size", -1)) == source_size
             )
             live_save_path = normalize_abs(source_info.get("save_path"))
-            live_root_path = normalize_abs(source_info.get("root_path"))
+            live_root_path = normalize_abs(source_info.get("content_path") or source_info.get("root_path"))
             live_name = str(source_info.get("name") or "")
         except (TypeError, ValueError, OverflowError):
             source_live_complete = False
@@ -12578,14 +12583,13 @@ def run_opt_in_new_hash_cross_seed(matches, active_nodes):
             if not isinstance(source_files, list) or not source_files:
                 raise ValueError("Source file manifest unavailable")
 
-            source_pairs = []
-            for file_row in source_files:
-                if not isinstance(file_row, dict):
-                    raise ValueError("Invalid source file entry")
-                source_pairs.append((
-                    normalize_rel(file_row.get("path")),
-                    int(file_row.get("size_bytes")),
-                ))
+            # qBittorrent's files API includes the content root for multi-file
+            # torrents. Bare paths cannot prove that the source is a directory.
+            if not all(isinstance(row, dict) and normalize_rel(row.get('path')).startswith(source_name + '/')
+                       for row in source_files):
+                raise ValueError("Source client multi-file root layout could not be verified")
+
+            source_pairs = source_file_pairs(source_files, source_name, True)
 
             if len(source_pairs) != len(candidate_pairs):
                 raise ValueError("Source/candidate file count differs")
@@ -12625,6 +12629,13 @@ def run_opt_in_new_hash_cross_seed(matches, active_nodes):
                 break
 
         if inventory_incomplete or present_elsewhere:
+            continue
+
+        if dry_run:
+            print(
+                f"🟡 [Cross-Seed New Hash] hash={hash_prefix}: "
+                "WOULD_ADD_PAUSED_AND_RECHECK; live gates passed; dry-run only."
+            )
             continue
 
         # The only mutation in this handler: add paused, with normal checking enabled.
@@ -12670,7 +12681,7 @@ def run_opt_in_new_hash_cross_seed(matches, active_nodes):
             candidate_info = candidate_rows[0]
             try:
                 candidate_save = normalize_abs(candidate_info.get("save_path"))
-                candidate_root = normalize_abs(candidate_info.get("root_path"))
+                candidate_root = normalize_abs(candidate_info.get("content_path") or candidate_info.get("root_path"))
                 candidate_size_live = int(candidate_info.get("total_size", -1))
             except (TypeError, ValueError, OverflowError):
                 candidate_save = ""
@@ -12742,7 +12753,7 @@ def run_opt_in_new_hash_cross_seed(matches, active_nodes):
                 timeout=20,
             )
 
-            if response is None or response.status_code != 200:
+            if response is None or response.status_code not in (200, 204):
                 try:
                     node.stop_torrent(candidate_hash)
                 except Exception:
@@ -12820,6 +12831,8 @@ async def audit_cross_seed_execution_plan(matches, active_nodes):
         """Require exact source/candidate file paths and byte sizes."""
         try:
             manifest = item.get("candidate_manifest") or {}
+            if manifest.get('multi_file') is True and manifest.get('root_name') != item.get('source_torrent_name'):
+                return False
             files = manifest.get("files") or []
             mapping = item.get("source_file_mapping") or []
             extras = item.get("candidate_extra_files") or []

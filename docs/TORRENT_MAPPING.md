@@ -111,6 +111,32 @@ candidate ID เดิมจะผ่าน preflight เพียงครั�
 ทุก match ยังต้องผ่านการตรวจขนาดและ manifest ตามเงื่อนไขเดิม การเพิ่ม torrent
 หรือ tracker ยังคงขึ้นกับค่าที่เปิดใช้งานและการตรวจขั้นถัดไป
 
+BearBit ใช้แบบฟอร์มค้นหา `windows-874` จึงส่งคำค้นด้วย CP874 เพื่อให้ภาษาไทย
+กลับมาเป็นข้อความเดิม ตัวกรองโซน/หมวด/searchin/incldead ยังคงเดิม เว็บไซต์อื่นใช้ UTF-8
+หากคำค้นมีอักขระที่ CP874 แทนไม่ได้ จะข้ามคำนั้นพร้อม log แทนการตัดอักขระออกแล้วค้นกว้างขึ้น
+
+ผล preflight ส่งต่อ `content_verification`, ขนาดรวมต้นทาง/ปลายทาง และ manifest
+ไปยัง audit/execution ครบ โดยสถานะเนื้อหายังคงเป็น `NOT_VERIFIED_RECHECK_REQUIRED`
+การจับคู่ชื่อ/ขนาดครบยังไม่ใช่หลักฐานว่า recheck ไฟล์ผ่านแล้ว
+
+พาธไฟล์จาก qBittorrent แบบหลายไฟล์มีชื่อโฟลเดอร์รากนำหน้า เช่น
+`Series/sub/E01.mkv` ส่วน manifest ใน `.torrent` แยก root `Series` กับพาธ
+`sub/E01.mkv` ระบบตัด root นำหน้าออกเพียงหนึ่งครั้งเมื่อทุกไฟล์มี prefix ตรงกัน
+แล้วเทียบโฟลเดอร์ย่อย ชื่อไฟล์ และขนาดอย่างเคร่งครัด
+ไม่เปลี่ยนชื่อไฟล์ ไม่ใช้เพียง basename เพื่ออนุญาตเพิ่ม และไม่ยอมรับ path traversal
+ขั้นก่อนเพิ่มยังอ่าน source สด ตรวจ root/save path/ความครบ และตรวจ hash ซ้ำบนทุก node ที่เปิดไว้
+หาก root prefix ของ client ยืนยันไม่ได้ จะไม่ถือว่าต้นทางเป็นโฟลเดอร์หลายไฟล์
+
+Cross-Seed ที่ hash ใหม่เพิ่มแบบหยุดโดยส่งทั้ง `paused` และ `stopped` สำหรับ API ต่างรุ่น
+บังคับ `contentLayout=Original` และไม่ใช้ skip-check/seed mode จากนั้นขอ recheck
+รองรับการตอบกลับ recheck แบบ HTTP 200/204 โดยไม่ resume หรือลบไฟล์อัตโนมัติ
+API ที่คืน `content_path` ใช้ยืนยันตำแหน่ง root ได้ โดยยังรองรับ `root_path` รุ่นเดิม
+ก่อนเพิ่มจะตรวจว่า bytes ของ torrent และ hash ยังตรงกับ manifest ที่ผ่าน preflight
+
+ฟังก์ชัน `run_opt_in_new_hash_cross_seed(..., dry_run=True)` ใช้ทดสอบ gate สด
+ถึงจุดก่อนเพิ่ม โดยไม่เรียก add/recheck/resume/delete ส่วน log `Cross-Seed Audit: DRY-RUN ONLY`
+บอกเฉพาะขั้น audit หลังจากนั้น execution ยังขึ้นกับ `CROSS_SEED_EXECUTION` ตามปกติ
+
 TorrentDD ใช้ `torrentdd_cross_seed.py` อ่านตารางผลค้นหาและ File List ใน modal
 ของหน้ารายละเอียด โดยผูก URL/โซน/ID ก่อนส่งเข้า preflight และ audit เดิม
 ไม่เพิ่ม schema ใหม่ อ่านวิธีค้นหาและข้อจำกัด execution ใน

@@ -291,6 +291,7 @@ Cleaner ตรวจ H&R/Quest, manual hold และงานอัปโหล
 | [client_registry.py](client_registry.py) | จุดลงทะเบียน adapter สำหรับโปรแกรมบิท |
 | [torrent_store.py](torrent_store.py) | อ่านและอัปเดต mapping กลางแบบ transaction |
 | [cross_seed_search.py](cross_seed_search.py) | คำค้นสำรองและการเลือกโซน Cross-Seed |
+| [cross_seed_validation.py](cross_seed_validation.py) | เทียบพาธ root ของ client และส่งต่อหลักฐาน preflight |
 | [torrentdd_cross_seed.py](torrentdd_cross_seed.py) | ค้นหา อ่าน File List และดาวน์โหลด metainfo ของ TorrentDD |
 | [auto_upload_cli.py](auto_upload_cli.py) | คำสั่งตรวจ เตรียม เผยแพร่ และกู้สถานะอัปโหลด |
 | [auto_upload.py](auto_upload.py) / [upload_runner.py](upload_runner.py) | คิวอัปโหลดและการเชื่อมกับรอบบอท |
