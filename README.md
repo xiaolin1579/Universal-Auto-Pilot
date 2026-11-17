@@ -233,6 +233,11 @@ python auto_upload_cli.py inspect-form --site BITSUSE --category 181
 python auto_upload_cli.py inspect-form --site TORRENTDD --category 19
 ```
 
+หากไฟล์ `.torrent` เกินขนาดที่ฟอร์มปลายทางรับ คิวรองรับการสร้างใหม่ผ่าน
+OnlyOne SSO maker จากโฟลเดอร์ downloads เริ่มต้น ตรวจรายชื่อและขนาดไฟล์
+ทุกไฟล์ แล้ว recheck ก่อนเริ่ม seed เส้นทางนี้ยังไม่รองรับ padding และยังไม่เปิด
+สำหรับ Swizzin หรือผู้ให้บริการอื่น ดูรายละเอียดและคำสั่ง `repack` ใน [AUTO_UPLOAD.md](docs/AUTO_UPLOAD.md)
+
 คิวนี้รองรับ **qBittorrent/rTorrent/Deluge และ torrent v1** รวม padding ที่ประกาศไว้ใน metainfo
 rTorrent เพิ่มแบบหยุดผ่าน `load.raw` ตรวจ hash ด้วย `d.check_hash` และเริ่ม seed หลังตรวจครบเท่านั้น
 ส่วน torrent v2/hybrid และ symlink ยังไม่รองรับในขั้นเพิ่มงานจากคิวนี้

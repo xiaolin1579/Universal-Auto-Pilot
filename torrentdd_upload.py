@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 from bs4 import BeautifulSoup
-from auto_upload import UploadBlocked, effective_rule, upload_title
+from auto_upload import UploadBlocked, effective_rule, upload_title, known_payload_signatures
 from torrent_metainfo import (payload_signature, duplicate_payload_status,
                               _extract_torrent_info_hash, valid_target_announce)
 import torrentdd_cross_seed as tdd
@@ -160,7 +160,7 @@ async def check_duplicates(adapter, job, max_pages=10, max_candidates=80):
                 canonical = await adapter.download_listing(details)
                 checked.add(details)
                 signature = payload_signature(canonical)
-                status = ('duplicate' if signature == job['content_group_id'] else
+                status = ('duplicate' if signature in known_payload_signatures(job, source) else
                           duplicate_payload_status(source, canonical))
                 if status in ('duplicate', 'possible_duplicate'):
                     return {'status': status, 'complete': status == 'duplicate',

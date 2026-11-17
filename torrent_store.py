@@ -152,6 +152,26 @@ class MappingStore:
             target = job.get('target_hash')
             if target is not None and (not infohash(target) or target != infohash(target) or target == job['source_hash']):
                 raise ValueError('Invalid upload variant hash')
+            signature = job.get('submission_signature')
+            if signature is not None and (not isinstance(signature, str) or not re.fullmatch(r'[0-9a-f]{64}', signature)):
+                raise ValueError('Invalid upload submission signature')
+            repack = job.get('repack')
+            if repack is not None and (not isinstance(repack, dict)
+                    or repack.get('provider') != 'onlyone'
+                    or repack.get('source_hash') != job['source_hash']
+                    or repack.get('source_signature') != job['content_group_id']
+                    or not infohash(repack.get('candidate_hash'))
+                    or not isinstance(repack.get('candidate_signature'), str)
+                    or not re.fullmatch(r'[0-9a-f]{64}', repack['candidate_signature'])
+                    or not isinstance(repack.get('artifact'), str) or not repack['artifact'].startswith('/')):
+                raise ValueError('Invalid rebuilt metainfo evidence')
+            request = job.get('repack_request')
+            if request is not None and (not isinstance(request, dict) or request.get('root') != 'files'
+                    or not isinstance(request.get('path'), str) or not request['path']
+                    or '/' in request['path'] or request['path'] in ('.', '..')
+                    or not isinstance(request.get('name'), str)
+                    or not re.fullmatch(r'uap-[0-9a-f]{24}\.torrent', request['name'])):
+                raise ValueError('Invalid OnlyOne maker request')
             if 'publication_retry' in job and (
                     not isinstance(job['publication_retry'], dict)
                     or type(job['publication_retry'].get('manual_publish_required')) is not bool):

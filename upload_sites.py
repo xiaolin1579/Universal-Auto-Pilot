@@ -2,7 +2,7 @@
 
 HTML is content, never executable configuration. Hidden tokens stay in the live form.
 """
-from auto_upload import UploadBlocked, UploadRejected, effective_rule, upload_title, validate_metainfo_size
+from auto_upload import UploadBlocked, UploadRejected, effective_rule, upload_title, validate_metainfo_size, known_payload_signatures, publication_signature
 import asyncio
 import json
 import re
@@ -528,6 +528,7 @@ class BrowserSite:
         source = Path(job['source_artifact']).read_bytes() if job.get('source_artifact') else None
         if source is not None and _extract_torrent_info_hash(source) != job['source_hash']:
             raise UploadBlocked('Source artifact hash changed during duplicate search')
+        known_signatures = known_payload_signatures(job, source)
         checked = {}; page_count = 0; skipped = set()
         for keyword in keywords:
             pending = [self.origin + path + '?' + urlencode({'search': keyword, 'incldead': 1})]
@@ -569,7 +570,7 @@ class BrowserSite:
                     if len(checked) >= max_candidates: return {'status': 'unknown', 'complete': False, 'reason': 'candidate_budget_exceeded'}
                     canonical = await self.download_listing(url)
                     signature = payload_signature(canonical); checked[url] = signature
-                    status = ('duplicate' if signature == job['content_group_id'] else
+                    status = ('duplicate' if signature in known_signatures else
                               duplicate_payload_status(source, canonical) if source is not None else 'different')
                     if status in ('duplicate', 'possible_duplicate'):
                         return {'status': status, 'complete': status == 'duplicate',
@@ -618,7 +619,7 @@ class BrowserSite:
             return None
         canonical = await self.download_listing(listing['details_url'])
         if (_extract_torrent_info_hash(canonical) != job['prepared_hash']
-                or payload_signature(canonical) != job['content_group_id']):
+                or payload_signature(canonical) != publication_signature(job)):
             return None
         html, current = await self.open(listing['details_url'])
         soup = BeautifulSoup(html, 'html.parser')

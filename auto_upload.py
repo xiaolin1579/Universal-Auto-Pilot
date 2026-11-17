@@ -20,6 +20,10 @@ class UploadRejected(UploadBlocked):
         super().__init__('Upload explicitly rejected by the website: ' + code)
 
 
+class MetainfoTooLarge(UploadBlocked):
+    pass
+
+
 def validate_metainfo_size(size, spec):
     """Honor the live form's PHP MAX_FILE_SIZE before claiming or sending a POST."""
     limit = (spec or {}).get('max_file_size')
@@ -28,8 +32,62 @@ def validate_metainfo_size(size, spec):
     if type(limit) is not int or limit <= 0:
         raise UploadBlocked('Destination metainfo size limit is invalid')
     if size > limit:
-        raise UploadBlocked(f'Torrent metainfo exceeds destination limit: {size} > {limit} bytes; '
+        raise MetainfoTooLarge(f'Torrent metainfo exceeds destination limit: {size} > {limit} bytes; '
                             'a larger piece size requires rehashing the source files')
+
+
+def repacked_source(job, source, *, candidate=None):
+    """Accept changed piece hashes only via a bound OnlyOne artifact and exact file layout.
+
+    This is not byte equality evidence: target data must still pass the full client
+    recheck before resume. The original source identity remains unchanged.
+    """
+    evidence = job.get('repack')
+    if not evidence:
+        return source
+    from torrent_metainfo import _extract_torrent_manifest, _decode_bencode_value
+    if (not isinstance(evidence, dict) or evidence.get('provider') != 'onlyone'
+            or evidence.get('source_hash') != job['source_hash']
+            or evidence.get('source_signature') != job['content_group_id']
+            or _extract_torrent_info_hash(source) != job['source_hash']
+            or payload_signature(source) != job['content_group_id']):
+        raise UploadBlocked('Rebuilt metainfo is not bound to the original source')
+    candidate = Path(evidence['artifact']).read_bytes() if candidate is None else candidate
+    if (_extract_torrent_info_hash(candidate) != evidence.get('candidate_hash')
+            or payload_signature(candidate) != evidence.get('candidate_signature')):
+        raise UploadBlocked('Rebuilt metainfo artifact changed')
+    left, right = _extract_torrent_manifest(source), _extract_torrent_manifest(candidate)
+    def layout(m):
+        if any(f.get('is_padding') for f in m['files']):
+            raise UploadBlocked('Metainfo rebuilding does not yet support padding files')
+        return (m['root_name'], m['multi_file'], sorted((f['path'], f['size_bytes']) for f in m['files']))
+    if layout(left) != layout(right):
+        raise UploadBlocked('Rebuilt metainfo file paths or sizes differ from the source')
+    a, _ = _decode_bencode_value(source)
+    b, _ = _decode_bencode_value(candidate)
+    if b[b'info'][b'piece length'] <= a[b'info'][b'piece length']:
+        raise UploadBlocked('OnlyOne maker did not increase the piece size')
+    return candidate
+
+
+def known_payload_signatures(job, source):
+    signatures = {job['content_group_id']}
+    if job.get('repack'):
+        if source is None:
+            raise UploadBlocked('Rebuilt duplicate checks require the original source artifact')
+        signatures.add(payload_signature(repacked_source(job, source)))
+    return signatures
+
+
+def create_job_variant(job, source, announce):
+    return create_variant(repacked_source(job, source), job['target_site'], job['target_zone'],
+                          job['target_category'], announce)
+
+
+def publication_signature(job):
+    # Preserve the expected signature of an older uncertain POST even when a
+    # new candidate is prepared. Only claim_submission switches this binding.
+    return job.get('submission_signature', job['content_group_id'])
 
 
 def upload_title(job):
@@ -153,7 +211,7 @@ def effective_rule(job):
 def write_artifact(directory, job_id, kind, content, filename=None):
     directory = Path(directory).resolve(); directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     if filename is not None:
-        if (not re.fullmatch(r'[0-9a-f]{64}', job_id) or kind not in {'source', 'prepared', 'submission', 'canonical'}
+        if (not re.fullmatch(r'[0-9a-f]{64}', job_id) or kind not in {'source', 'prepared', 'submission', 'canonical', 'repacked'}
                 or filename in {'.', '..'} or not filename.endswith('.torrent')
                 or re.search(r'[/\\\x00-\x1f]', filename)):
             raise UploadBlocked('Invalid upload artifact path')
@@ -192,7 +250,6 @@ class UploadLedger:
         key_text = ':'.join((manifest['info_hash'], rule['target_site'], metadata['zone'], str(rule['target_category'])))
         key = hashlib.sha256(key_text.encode()).hexdigest()
         variant = create_variant(source, rule['target_site'], metadata['zone'], rule['target_category'], announce)
-        validate_metainfo_size(len(variant), form_schema)
         variant_hash = _extract_torrent_info_hash(variant)
         if readiness is not None and type(readiness.get('ready')) is not bool:
             raise UploadBlocked('Invalid draft readiness')
@@ -202,13 +259,23 @@ class UploadLedger:
                'target_zone': metadata['zone'], 'target_category': str(rule['target_category']),
                'content_group_id': signature, 'prepared_hash': variant_hash,
                'metadata': deepcopy(metadata), 'rule': deepcopy(rule), 'created_at': stamp(), 'updated_at': stamp()}
+        try:
+            validate_metainfo_size(len(variant), form_schema)
+        except MetainfoTooLarge:
+            job['metainfo_preflight'] = {'status': 'blocked', 'code': 'metainfo_too_large',
+                'variant_bytes': len(variant), 'max_file_size': form_schema['max_file_size']}
         if readiness is not None:
             job['readiness'] = deepcopy(readiness)
         if form_schema is not None:
-            job['form_schema'] = {k: deepcopy(form_schema[k]) for k in ('fields', 'acknowledgements')}
+            job['form_schema'] = {k: deepcopy(form_schema[k]) for k in ('fields', 'acknowledgements', 'max_file_size') if k in form_schema}
         def apply(data):
             old = data['upload_jobs'].get(key)
             if old:
+                if ((old.get('repack_request') and not old.get('repack'))
+                        or (old.get('repack') and old['state'] != 'cancelled')):
+                    # Re-parsing source metadata must not erase a durable provider request
+                    # or replace its verified candidate with the original oversized torrent.
+                    return deepcopy(old)
                 if old['state'] not in ('draft', 'prepared', 'cancelled'):
                     return deepcopy(old)
                 if (old['state'] != 'cancelled' and old['rule'] == job['rule']
@@ -253,7 +320,13 @@ class UploadLedger:
             'metadata', 'rule', 'readiness', 'form_schema', 'duplicate_check',
             'source_verified_at', 'field_overrides', 'created_at', 'updated_at', 'target_hash', 'listing',
             'notifications', 'submission_started_at', 'last_publication_failure',
-            'publication_history', 'publication_retry', 'publication_retry_check') if k in job}
+            'publication_history', 'publication_retry', 'publication_retry_check',
+            'submission_signature', 'metainfo_preflight') if k in job}
+        if job.get('repack'):
+            public['repack'] = {k: deepcopy(job['repack'][k]) for k in (
+                'provider', 'source_hash', 'candidate_hash', 'candidate_signature', 'checked_at')}
+        if job.get('repack_request'):
+            public['repack_request'] = {'claimed_at': job['repack_request'].get('claimed_at')}
         public['target_title'] = upload_title(job)
         public['torrent_filename'] = upload_filename(job)
         public['effective_fields'] = effective_rule(job).get('fields', {})
@@ -315,6 +388,8 @@ class UploadLedger:
             job = data['upload_jobs'][key]
             if job['state'] not in expected:
                 raise UploadBlocked('Upload state changed; refusing repeated action')
+            if state == 'cancelled' and job.get('repack_request') and not job.get('repack'):
+                raise UploadBlocked('Resolve the OnlyOne maker request before releasing source protection')
             job.update(fields, state=state, updated_at=stamp())
             return deepcopy(job)
         return self.store.update(apply)
@@ -322,7 +397,7 @@ class UploadLedger:
     @staticmethod
     def same_configuration(current, expected):
         keys = ('source_hash', 'source_node', 'save_path', 'prepared_hash', 'metadata', 'rule',
-                'field_overrides', 'publication_retry')
+                'field_overrides', 'publication_retry', 'repack', 'repack_request')
         return all(current.get(k) == expected.get(k) for k in keys)
 
     def claim_submission(self, key, expected, evidence):
@@ -331,6 +406,7 @@ class UploadLedger:
             if current['state'] != 'prepared' or not self.same_configuration(current, expected):
                 raise UploadBlocked('Job configuration changed during preflight; check the job again')
             current.update(state='submitting', duplicate_check={**evidence, 'checked_at': stamp()},
+                           submission_signature=(expected.get('repack') or {}).get('candidate_signature', expected['content_group_id']),
                            submission_started_at=stamp(), updated_at=stamp())
             if current.get('publication_retry', {}).get('manual_publish_required') is True:
                 current['publication_retry'].update(manual_publish_required=False, consumed_at=stamp())
@@ -351,17 +427,17 @@ class UploadLedger:
             current['publication_retry_check'] = {**deepcopy(evidence), 'checked_at': checked_at}
             if evidence.get('status') == 'clear' and evidence.get('complete') is True:
                 attempt = {field: deepcopy(current[field]) for field in (
-                    'state', 'submission_started_at', 'last_publication_failure', 'last_submission_failure',
+                    'state', 'submission_started_at', 'submission_signature', 'last_publication_failure', 'last_submission_failure',
                     'duplicate_check') if field in current}
                 attempt.update(resolution='operator_confirmed_not_published', resolved_at=checked_at)
                 current.setdefault('publication_history', []).append(attempt)
                 current.update(state='prepared' if spec['readiness']['ready'] else 'draft',
                     readiness=deepcopy(spec['readiness']), source_verified_at=checked_at,
-                    form_schema={k: deepcopy(spec[k]) for k in ('fields', 'acknowledgements')},
+                    form_schema={k: deepcopy(spec[k]) for k in ('fields', 'acknowledgements', 'max_file_size') if k in spec},
                     duplicate_check=deepcopy(current['publication_retry_check']),
                     publication_retry={'method': 'operator_checked_my_uploads', 'confirmed_at': checked_at,
                                        'manual_publish_required': True})
-                for field in ('submission_started_at', 'last_publication_failure', 'last_submission_failure'):
+                for field in ('submission_started_at', 'submission_signature', 'last_publication_failure', 'last_submission_failure'):
                     current.pop(field, None)
             current['updated_at'] = checked_at
             return deepcopy(current)
@@ -386,7 +462,7 @@ class UploadLedger:
 
     def accept_canonical(self, key, content):
         job = self.get(key); target = _extract_torrent_info_hash(content)
-        if payload_signature(content) != job['content_group_id'] or target == job['source_hash']:
+        if payload_signature(content) != publication_signature(job) or target == job['source_hash']:
             raise UploadBlocked('Published torrent payload differs, or hash is unchanged')
         # Only destination announce hosts; source credentials must not reach the client.
         from torrent_metainfo import _extract_torrent_manifest
@@ -438,6 +514,18 @@ class UploadWorker:
         self.ledger = ledger
         self.enable_publish = enable_publish is True
 
+    async def variant(self, job, source, spec, client):
+        variant = create_job_variant(job, source, spec['announce'])
+        try:
+            validate_metainfo_size(len(variant), spec)
+        except MetainfoTooLarge:
+            import asyncio
+            from onlyone_repack import rebuild_onlyone
+            job = await asyncio.to_thread(rebuild_onlyone, self.ledger, job['id'], client, spec)
+            variant = create_job_variant(job, source, spec['announce'])
+            validate_metainfo_size(len(variant), spec)
+        return job, variant
+
     async def check_job(self, key, adapter, client):
         """Inspect a draft/prepared job without any publication or client mutation."""
         job = self.ledger.get(key)
@@ -449,8 +537,7 @@ class UploadWorker:
             raise UploadBlocked('Source client or save path changed')
         verify_completed(Path(job['source_artifact']).read_bytes(), live, client.files(job['source_hash']))
         spec = await adapter.load_form(job, require_ready=False)
-        variant = create_variant(Path(job['source_artifact']).read_bytes(), job['target_site'],
-                                 job['target_zone'], job['target_category'], spec['announce'])
+        variant = create_job_variant(job, Path(job['source_artifact']).read_bytes(), spec['announce'])
         validate_metainfo_size(len(variant), spec)
         evidence = await adapter.check_duplicates(job)
         self.ledger.record_check(key, job, evidence, readiness=spec['readiness'])
@@ -473,8 +560,7 @@ class UploadWorker:
         spec = await adapter.load_form(job, require_ready=False)
         if not isinstance(spec.get('readiness'), dict) or type(spec['readiness'].get('ready')) is not bool:
             raise UploadBlocked('Destination form readiness could not be verified')
-        variant = create_variant(source, job['target_site'], job['target_zone'], job['target_category'], spec['announce'])
-        validate_metainfo_size(len(variant), spec)
+        job, variant = await self.variant(job, source, spec, client)
         if _extract_torrent_info_hash(variant) != job['prepared_hash']:
             raise UploadBlocked('Prepared variant no longer matches the uncertain job')
         evidence = await adapter.check_duplicates(job)
@@ -508,8 +594,7 @@ class UploadWorker:
             raise UploadBlocked('Source client or save path changed; prepare a new job')
         verify_completed(source, live, client.files(job['source_hash']))
         form = await adapter.load_form(job)
-        variant = create_variant(source, job['target_site'], job['target_zone'], job['target_category'], form['announce'])
-        validate_metainfo_size(len(variant), form)
+        job, variant = await self.variant(job, source, form, client)
         if _extract_torrent_info_hash(variant) != job['prepared_hash']:
             raise UploadBlocked('Prepared variant no longer matches the rule')
         self.ledger.record_check(key, job, {'status': 'unknown', 'complete': False, 'reason': 'check_in_progress'})
@@ -519,8 +604,7 @@ class UploadWorker:
             raise UploadBlocked(duplicate_block_reason(evidence, job['target_site']))
         # Duplicate search navigates away: refresh nonce and validate fields once more.
         form = await adapter.load_form(job)
-        variant = create_variant(source, job['target_site'], job['target_zone'], job['target_category'], form['announce'])
-        validate_metainfo_size(len(variant), form)
+        job, variant = await self.variant(job, source, form, client)
         path = write_artifact(self.ledger.artifacts, key, 'submission', variant, upload_filename(job))
         await adapter.fill(job, path)
         self.ledger.claim_submission(key, job, evidence)
@@ -557,7 +641,7 @@ class UploadWorker:
             verify_completed(Path(job['source_artifact']).read_bytes(), live, client.files(job['source_hash']))
             content = Path(job['canonical_artifact']).read_bytes()
             if (_extract_torrent_info_hash(content) != job['target_hash']
-                    or payload_signature(content) != job['content_group_id']):
+                    or payload_signature(content) != publication_signature(job)):
                 raise UploadBlocked('Canonical artifact changed')
             # Persist before client mutation: never blindly retry an interrupted add.
             self.ledger.transition(key, {'verified'}, 'adding')

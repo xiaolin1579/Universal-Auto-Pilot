@@ -13,6 +13,9 @@ def parser():
     p = argparse.ArgumentParser(description='BearBit -> Dedbit/Bitsuse/TorrentDD auto upload')
     sub = p.add_subparsers(dest='command', required=True)
     sub.add_parser('status')
+    rebuild = sub.add_parser('repack', help='Rebuild oversized metainfo with OnlyOne; never publishes')
+    rebuild.add_argument('job_id')
+    rebuild.add_argument('--max-bytes', type=int, required=True, help='Size cap verified on the destination form')
     inspect_form = sub.add_parser('inspect-form')
     inspect_form.add_argument('--site', choices=('DEDBIT', 'BITSUSE', 'TORRENTDD'), required=True)
     inspect_form.add_argument('--category', required=True)
@@ -63,6 +66,22 @@ async def execute(args, app):
         from pathlib import Path
         changes = json.loads(Path(args.file).read_text(encoding='utf-8'))
         return ledger.configure_job(args.job_id, changes)
+    if args.command == 'repack':
+        if cfg.get('enable') is not True or type(args.max_bytes) is not int or args.max_bytes <= 0:
+            raise UploadBlocked('Repack requires AUTO_UPLOAD.enable and a positive destination size cap')
+        job = ledger.get(args.job_id)
+        config = next((n for n in app.CFG['NODES'] if n.get('name') == job['source_node'] and n.get('enable') is True), None)
+        if config is None: raise UploadBlocked('Source node is not enabled')
+        node = app.CLIENTS.create(config)
+        try:
+            if not await asyncio.to_thread(node.login): raise UploadBlocked('Source client login failed')
+            from onlyone_repack import rebuild_onlyone
+            from upload_sites import SITES
+            result = await asyncio.to_thread(rebuild_onlyone, ledger, job['id'], client_for(app, node),
+                {'max_file_size': args.max_bytes, 'announce': SITES[job['target_site']][0] + '/announce.php'})
+            return {'id': result['id'], 'state': result['state'], 'metainfo_preflight': result['metainfo_preflight']}
+        finally:
+            app.CLIENTS.close(node)
     if args.command == 'show':
         return ledger.review(args.job_id)
     if args.command == 'cancel':
@@ -107,8 +126,9 @@ async def execute(args, app):
             listing = listing_identity(job['target_site'], args.url)
             # Verify the authenticated canonical payload before accepting an ambiguous result.
             from torrent_metainfo import payload_signature, _extract_torrent_info_hash
+            from auto_upload import publication_signature
             content = await adapter.download_listing(listing['details_url'])
-            if payload_signature(content) != job['content_group_id'] or _extract_torrent_info_hash(content) == job['source_hash']:
+            if payload_signature(content) != publication_signature(job) or _extract_torrent_info_hash(content) == job['source_hash']:
                 raise UploadBlocked('Listing does not match the uploaded payload/variant')
             ledger.record_publication(job['id'], listing)
             result = ledger.accept_canonical(job['id'], content)
