@@ -8,13 +8,14 @@ from torrent_store import stamp
 from torrent_metainfo import _extract_torrent_info_hash, payload_signature, _extract_torrent_manifest
 from upload_classifier import classify_job, extract_identity, input_fingerprint, origin_requires_review, clean_text
 from upload_sites import form_readiness
+from upload_languages import language_value
 
 BLOCKING_FLAGS = {'origin_requires_review', 'destination_schema_unavailable', 'multiple_release_codes',
                   'catalog_identity_ambiguous', 'conflicting_evidence', 'censorship_claim_conflict'}
 
 
 def correction_plan(job, report, auto_fix):
-    """Only fill invalid/empty enum fields supported by independent high evidence."""
+    """Fill supported enums and declared track languages from high evidence."""
     fields = dict(job.get('rule', {}).get('fields', {}))
     overrides = (job.get('field_overrides') or {}).get('fields', {})
     fields.update(overrides)
@@ -25,11 +26,13 @@ def correction_plan(job, report, auto_fix):
     for suggestion in report['suggestions']:
         field = suggestion['field']; value = suggestion['value']
         spec = schema.get(field, {}); options = spec.get('options')
-        # Never automatically change free text, route/category IDs, or checkboxes.
-        if not isinstance(options, list) or value not in options or suggestion['confidence'] != 'high':
+        language = (field in ('c3dub', 'c3sub') and options is None and language_value(value)
+                    and suggestion['reasons'] == ['mediainfo_track_languages'])
+        # Only the two language controls accept generated text; other text stays manual.
+        if (not language and (not isinstance(options, list) or value not in options)) or suggestion['confidence'] != 'high':
             continue
         before = fields.get(field)
-        valid = isinstance(before, str) and bool(before.strip()) and before in options
+        valid = isinstance(before, str) and bool(before.strip()) and (options is None or before in options)
         if valid:
             if before != value: issues.add('existing_value_conflicts_with_evidence:' + field)
             continue

@@ -125,6 +125,7 @@ def eligible_records(identity, records):
     matches = []
     for record in records:
         if not isinstance(record, dict) or not public_source(record.get('url')): continue
+        if record.get('scope', 'release') != 'release': continue
         if record.get('kind') != identity['kind']: continue
         if identity['kind'] == 'music':
             if not identity['artist'] or not record.get('artist'): continue
@@ -174,6 +175,11 @@ def classify_job(job, *, files=None, records=None, references=None, diagnostics=
                 'reasons': [reason], 'evidence': proof})
 
     if 'origin_requires_review' not in flags:
+        if identity['kind'] == 'video':
+            from upload_languages import track_languages
+            for field, value in track_languages(metadata.get('description')).items():
+                propose(field, value, 'high', 'mediainfo_track_languages',
+                        [evidence('source_track_metadata', value)])
         for field, value in current.items():
             options = schema.get(field, {}).get('options')
             if value and isinstance(options, list) and value not in options:
@@ -213,6 +219,11 @@ def classify_job(job, *, files=None, records=None, references=None, diagnostics=
             if re.search(r'(?i)\b(?:FLAC|SACD|Lossless)\b', text):
                 propose('c41sub', 'Lossless', 'medium', 'source_declares_lossless', [evidence('source', 'lossless/SACD')])
         if identity['kind'] == 'music':
+            if re.search(r'(?i)\bdiscography\b', str(metadata.get('title', ''))):
+                releases = {part for file in files or [] for part in PurePosixPath(str(file.get('path', ''))).parts[:-1]
+                            if re.match(r'^(?:19|20)\d{2}\s*[-–]\s*\S', part)}
+                propose('c41type', 'รวม', 'high' if len(releases) >= 2 else 'medium', 'explicit_discography',
+                        [evidence('source_title', 'Discography'), evidence('manifest', str(len(releases)) + ' release directories')])
             if re.search(r'(?i)\b(?:Albums? Singles|compilation|various artists)\b|รวมเพลง|รวมอัลบั้ม', text):
                 propose('c41type', 'รวม', 'high', 'explicit_compilation', [evidence('source', 'compilation declaration')])
             if re.search(r'(?i)\b(?:OST|soundtrack)\b', text):
@@ -236,13 +247,26 @@ def classify_job(job, *, files=None, records=None, references=None, diagnostics=
             category = str(metadata.get('category', ''))
             for label in ('ญี่ปุ่น', 'ไทย', 'เกาหลี', 'จีน', 'ฝรั่ง'):
                 if label in category:
-                    propose('c100cat', label, 'high', 'explicit_source_category', [evidence('source_category', category)])
+                    for field in ('c100cat', 'c184cat'):
+                        propose(field, label, 'high', 'explicit_source_category', [evidence('source_category', category)])
             uncensored = bool(re.search(r'(?i)\buncensored\b|ไม่เซ็น|ไม่เซนเซอร์', text))
             censored = bool(re.search(r'(?i)(?<!un)\bcensored\b|(?<!ไม่)เซนเซอร์|(?<!ไม่)เซ็น', text))
             if uncensored or censored:
                 observations.append({'kind': 'censorship_claim', 'value': 'conflicting' if uncensored and censored else
                                      'uncensored' if uncensored else 'censored', 'verified': False})
 
+    if identity['kind'] == 'music' and identity.get('artist') and 'origin_requires_review' not in flags:
+        artists = [r for r in records or [] if isinstance(r, dict) and r.get('kind') == 'music'
+                   and r.get('scope') == 'artist' and public_source(r.get('url'))
+                   and normalized(r.get('artist')) == normalized(identity['artist'])]
+        regions = {r.get('music_region') for r in artists if r.get('music_region')}
+        if len(regions) > 1:
+            flags.append('catalog_identity_ambiguous')
+        elif len(regions) == 1:
+            region = next(iter(regions))
+            if region in ('ไทยสากล','ไทยลูกทุ่ง','สากล','เอเชีย','เพลงบรรเลง(ไทย)','เพลงบรรเลง(ตปท)'):
+                propose('c4genre', region, 'high', 'catalog_explicit_artist_music_region',
+                        [evidence('artist_catalog', r.get('provider', 'catalog'), r['url']) for r in artists])
     matched = eligible_records(identity, records or []) if 'origin_requires_review' not in flags else []
     if len(matched) > 1:
         flags.append('catalog_identity_ambiguous')
@@ -272,6 +296,9 @@ def classify_job(job, *, files=None, records=None, references=None, diagnostics=
             for source, field, aliases in (('production_country','c100cat',countries),('media_type','c100type',media)):
                 value = record.get(source)
                 if isinstance(value,str): propose(field,aliases.get(normalized(value),value),'high','catalog_exact_code',proof)
+            country = record.get('production_country')
+            if isinstance(country, str):
+                propose('c184cat', countries.get(normalized(country), country), 'high', 'catalog_exact_code', proof)
             if record.get('censorship') in ('censored','uncensored'):
                 observations.append({'kind':'censorship','value':record['censorship'],'verified':True,'evidence':proof})
 

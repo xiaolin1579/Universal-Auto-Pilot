@@ -12098,7 +12098,9 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                         min_gb = SET.get('MIN_SIZE_GB', 0) if 'SET' in globals() else 0
                         max_gb = SET.get('MAX_SIZE_GB', 999) if 'SET' in globals() else 999
 
-                        if 'generate_main_status' in globals() and 'CFG' in globals():
+                        if cross_seed_mode:
+                            condition_text = "🧩 Cross-Seed: ใช้ไฟล์ที่โหลดครบแล้ว | ข้ามตัวกรองขนาดและฟรีโหลดของการดาวน์โหลดใหม่"
+                        elif 'generate_main_status' in globals() and 'CFG' in globals():
                             condition_text = generate_main_status(CFG, site_name=site)
                         else:
                             condition_text = f"⚙️ เงื่อนไข: ขนาด {min_gb:.1f}-{max_gb:.1f}GB"
@@ -12117,7 +12119,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                 )
                             else:
                                 summary_msg.append(
-                                    "❌ ไม่พบ Cross-Seed ที่ตรงกันในโซนนี้"
+                                    "⚪ ไม่พบรายการที่ผ่านการเทียบรายการไฟล์ในการค้นครั้งนี้"
                                 )
 
                         elif not added_in_zone and not full_nodes_in_zone:
@@ -12134,7 +12136,12 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                                 summary_msg.append("⚠️ Queue Full:")
                                 summary_msg.extend(full_nodes_in_zone)
 
-                        summary_msg.append(f"\n📊 สรุป {display_zone}: เพิ่ม {len(added_in_zone)} | เต็ม {len(full_nodes_in_zone)} | ข้าม {count_skip}")
+                        if cross_seed_mode:
+                            summary_msg.append(f"\n📊 สรุปค้นหา {display_zone}: ผ่านตรวจรายการไฟล์ {zone_match_count} รายการ")
+                            if zone_match_count:
+                                summary_msg.append("ขั้นเพิ่มทอร์เรนท์และ recheck จะประเมินหลังจบรอบค้นหา")
+                        else:
+                            summary_msg.append(f"\n📊 สรุป {display_zone}: เพิ่ม {len(added_in_zone)} | เต็ม {len(full_nodes_in_zone)} | ข้าม {count_skip}")
 
                         full_report = "\n".join(summary_msg)
                         print("\n" + full_report + "\n")
@@ -12674,10 +12681,11 @@ def run_opt_in_new_hash_cross_seed(matches, active_nodes, *, dry_run=False):
             print(f"⛔ [Cross-Seed New Hash] hash={hash_prefix}: missing manifest.")
             continue
 
-        if manifest.get("multi_file") is not True:
+        multi_file = manifest.get("multi_file")
+        if type(multi_file) is not bool:
             print(
                 f"⛔ [Cross-Seed New Hash] hash={hash_prefix}: "
-                "single-file layout is unsupported by the strict path gate."
+                "candidate file layout is unknown."
             )
             continue
 
@@ -12727,6 +12735,8 @@ def run_opt_in_new_hash_cross_seed(matches, active_nodes, *, dry_run=False):
                 raise ValueError("Negative candidate file size")
             if sum(size for _, size in candidate_pairs) != source_size:
                 raise ValueError("Candidate file total does not match source size")
+            if not multi_file and candidate_pairs != [(root_name, source_size)]:
+                raise ValueError("Single-file candidate must contain exactly its root filename")
 
         except (TypeError, ValueError, OverflowError) as exc:
             print(
@@ -12787,11 +12797,11 @@ def run_opt_in_new_hash_cross_seed(matches, active_nodes, *, dry_run=False):
 
             # qBittorrent's files API includes the content root for multi-file
             # torrents. Bare paths cannot prove that the source is a directory.
-            if not all(isinstance(row, dict) and normalize_rel(row.get('path')).startswith(source_name + '/')
-                       for row in source_files):
+            if multi_file and not all(isinstance(row, dict) and normalize_rel(row.get('path')).startswith(source_name + '/')
+                                      for row in source_files):
                 raise ValueError("Source client multi-file root layout could not be verified")
 
-            source_pairs = source_file_pairs(source_files, source_name, True)
+            source_pairs = source_file_pairs(source_files, source_name, multi_file)
 
             if len(source_pairs) != len(candidate_pairs):
                 raise ValueError("Source/candidate file count differs")

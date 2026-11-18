@@ -137,13 +137,20 @@ def load_catalog_records(path):
     data = json.loads(path.read_text(encoding='utf-8'))
     records = data.get('records') if isinstance(data,dict) else None
     if not isinstance(records,list) or len(records)>100: raise ValueError('Catalog metadata must contain up to 100 records')
-    keys = {'kind','provider','url','title','artist','year','release_type','secondary_types','format',
+    keys = {'kind','scope','provider','url','title','artist','year','release_type','secondary_types','format',
             'music_region','release_code','production_country','media_type','censorship'}
     result = []
     for record in records:
         if not isinstance(record,dict) or set(record)-keys: raise ValueError('Unsupported catalog record fields')
         if record.get('kind') not in ('music','video','adult') or not public_source(record.get('url')):
             raise ValueError('Catalog record needs a kind and public HTTPS evidence URL')
+        scope = record.get('scope', 'release')
+        if scope not in ('release', 'artist'):
+            raise ValueError('Unsupported catalog evidence scope')
+        if scope == 'artist' and (record.get('kind') != 'music' or not record.get('artist')
+                or record.get('music_region') not in ('ไทยสากล','ไทยลูกทุ่ง','สากล','เอเชีย','เพลงบรรเลง(ไทย)','เพลงบรรเลง(ตปท)')
+                or set(record) - {'kind','scope','provider','url','artist','music_region'}):
+            raise ValueError('Artist evidence must declare only the artist and music region')
         if any(not isinstance(v,str) or len(v)>500 for k,v in record.items() if k not in ('year','secondary_types')):
             raise ValueError('Catalog metadata text values must be short strings')
         if 'year' in record and (type(record['year']) is not int or not 1900<=record['year']<=2100):
