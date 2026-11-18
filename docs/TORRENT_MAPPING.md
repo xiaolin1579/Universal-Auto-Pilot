@@ -89,7 +89,9 @@ H&R/Quest ของ BearBit ส่วนเว็บไซต์อื่นต�
 โดยไม่แก้สถานะ H&R/Quest ใน ledger และยังคง manual hold กับภาระที่รู้ว่าต้อง seed
 ดูรูปแบบ config ใน [NODE_CONFIG.md](NODE_CONFIG.md)
 
-ก่อนเริ่ม Cleaner ทุกรอบ ระบบเรียก `cleaner_obligations.refresh_before_cleaner()`
+ก่อนเริ่ม Cleaner ทุกรอบ ระบบเรียก `cleaner_obligations.refresh_cleaner_evidence()`
+โดยใช้ browser session เดียวสำหรับอ่านภาระและตรวจเพียร์ของงาน Auto Upload
+และปิด session เมื่ออ่านเสร็จ
 รวมรอบ Cross-Seed เพื่ออ่าน H&R/Seed Quest ของ BearBit โดยไม่ทำ maintenance,
 ดาวน์โหลดเนื้อหา หรือเริ่มงานใหม่ ตัวอ่านติดตาม pagination สูงสุด 20 หน้า
 และตรวจ identity/login/โครงสร้างทุกหน้า หากหน้าหนึ่งล้มเหลวจะคงการป้องกันไว้
@@ -118,6 +120,12 @@ Reclaim ตรวจพื้นที่หลังลบสำเร็จแ
 งานไฟล์ร่วมยังเก็บข้อมูลไว้ตาม guard เดิม และระบบตรวจ references ใหม่หลังหยุดงาน
 Cleaner ทำงานผ่าน worker thread เพื่อให้ event loop รับคำสั่งหยุดได้ระหว่างรอบ
 เมื่อขอ shutdown จะหยุดก่อนเริ่มลบงานถัดไปและไม่ใช้ inventory ที่อ่านไม่ครบ
+ตัวอ่านไฟล์ qBittorrent ส่ง GET พร้อมกันสูงสุด 4 คำขอ โดยแยก HTTP session ของแต่ละ worker
+และอ่านรายชื่อ hash/เส้นทางซ้ำเมื่อจบ หากอ่านไม่ครบหรือรายการเปลี่ยนจะไม่อนุญาตลบข้อมูล
+หากพบ content root ร่วมกับงานอื่นตั้งแต่ต้น จะเก็บไฟล์ไว้ทันทีและข้ามการอ่านไฟล์ทั้งโหนด
+ผลที่ไม่พบ root ร่วมยังต้องตรวจรายการไฟล์สดของทุก client รวมโหนดที่ปิดใช้งานตามเดิม
+ไม่มีการเก็บผลอนุญาตลบไว้ข้ามงานหรือข้ามรอบ และยังตรวจ references ใหม่หลังหยุดงาน
+log `[Storage Inventory]` แสดงจำนวนงาน จำนวน worker และเวลาอ่านที่สำเร็จ
 qBittorrent ใช้ `/torrents/stop` โดย fallback เป็น `/torrents/pause`
 เฉพาะเมื่อ endpoint แรกตอบ 404 รองรับผลสำเร็จ 200/204 และก่อนลบ
 ต้องอ่านสถานะ `stoppedUP`/`pausedUP` จริง พร้อมตรวจภาระ seed ซ้ำอีกครั้ง

@@ -153,7 +153,7 @@ async def inspect_upload(adapter, job):
     return proof
 
 
-async def refresh_upload_retention(app):
+async def refresh_upload_retention(app, *, session=None):
     global_cfg = app.CFG.get('GLOBAL_CLEAN', {})
     stopping = lambda: getattr(app, 'stop_event', None) is not None and app.stop_event.is_set()
     if stopping(): return []
@@ -167,7 +167,8 @@ async def refresh_upload_retention(app):
                      and fresh(j['retention_check']))]
     if not jobs: return []
     from upload_runner import UploadSession
-    session = UploadSession(app, 'upload_retention_' + str(os.getpid()))
+    owns_session = session is None
+    if owns_session: session = UploadSession(app, 'upload_retention_' + str(os.getpid()))
     result = []
     try:
         groups = {}
@@ -190,7 +191,8 @@ async def refresh_upload_retention(app):
                       + ' other_seeders=' + str(proof['other_seeders'])
                       + ' completed=' + str(proof['completed']), flush=True)
     finally:
-        try: await session.close()
-        except Exception as exc:
-            print('[Cleaner Upload] browser_cleanup=failed error_type=' + type(exc).__name__)
+        if owns_session:
+            try: await session.close()
+            except Exception as exc:
+                print('[Cleaner Upload] browser_cleanup=failed error_type=' + type(exc).__name__)
     return result

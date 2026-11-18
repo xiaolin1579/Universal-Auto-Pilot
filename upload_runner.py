@@ -2,6 +2,7 @@
 from auto_upload import UploadBlocked
 import asyncio
 from collections import Counter
+from copy import deepcopy
 from time import monotonic
 from upload_logging import log_event
 import os
@@ -158,6 +159,11 @@ async def run_cycle(app, active_nodes):
     discovered = 0
     queued = 0
     status = 'completed'
+    source_cache = {}
+    source_errors = set()
+    def stopping():
+        event = getattr(app, 'stop_event', None)
+        return event is not None and event.is_set()
     limit = max(1, min(int(cfg.get('max_jobs_per_cycle', 1)), 10))
     log_event('cycle_start', nodes=len(nodes), max_jobs=limit,
               publish=cfg.get('enable_publish') is True, seed=cfg.get('enable_seed') is True,
@@ -175,11 +181,17 @@ async def run_cycle(app, active_nodes):
         return False
 
     try:
+        if stopping():
+            status = 'stopped'
+            return outcomes
         jobs = list(ledger.store.read()['upload_jobs'].values())
         queued = len(jobs)
         log_event('queue', queued=queued, counts=dict(Counter(job['state'] for job in jobs)))
         # Continue durable jobs first. Ambiguous POST/add states never auto-retry.
         for job in jobs:
+            if stopping():
+                status = 'stopped'
+                return outcomes
             if at_limit(): return outcomes
             considered += 1
             if job['state'] in ('publication_uncertain', 'submitting', 'adding', 'seed_uncertain'):
@@ -217,14 +229,20 @@ async def run_cycle(app, active_nodes):
                 if job['state'] in ('draft', 'prepared') and cfg.get('enable_publish') is True:
                     log_event('job_start', job, stage='publish')
                     adapter = await session.adapter(job['target_site'])
+                    if stopping():
+                        status = 'stopped'
+                        return outcomes
                     acted = True
                     job = await worker.publish(job['id'], adapter, client)
                 elif job['state'] in ('published', 'verification_failed'):
                     log_event('job_start', job, stage='verify_canonical')
                     adapter = await session.adapter(job['target_site'])
+                    if stopping():
+                        status = 'stopped'
+                        return outcomes
                     acted = True
                     job = await worker.verify_publication(job['id'], adapter)
-                if job['state'] in ('verified', 'rechecking') and cfg.get('enable_seed') is True:
+                if job['state'] in ('verified', 'rechecking') and cfg.get('enable_seed') is True and not stopping():
                     log_event('job_start', job, stage='seed')
                     acted = True
                     job = await asyncio.to_thread(worker.seed, job['id'], client, cfg.get('enable_resume') is True)
@@ -245,12 +263,18 @@ async def run_cycle(app, active_nodes):
                     outcome['publication_failure'] = current['last_publication_failure']
                 outcomes.append(outcome)
         if at_limit(): return outcomes
+        if stopping():
+            status = 'stopped'
+            return outcomes
         # Queue only completed hashes linked to BearBit by verified site_records.
         data = ledger.store.read()
         existing = {(j['source_hash'], j['target_site']) for j in data['upload_jobs'].values()}
         configured = [r for r in cfg.get('rules', []) if isinstance(r, dict) and r.get('enable') is True]
         zones = sorted({r.get('source_zone') for r in configured if r.get('source_zone') in ('normal', 'special')})
         for node in nodes.values():
+            if stopping():
+                status = 'stopped'
+                return outcomes
             if app.CLIENTS.adapter_for(node).upload_factory is None:
                 log_event('inventory', node=node.name, reason='client_unsupported')
                 continue
@@ -263,24 +287,45 @@ async def run_cycle(app, active_nodes):
                          if t.get('progress') == 1 and t.get('amount_left') == 0}
             log_event('inventory', node=node.name, total=len(inventory), completed=len(completed))
             for record in data['site_records'].values():
+                if stopping():
+                    status = 'stopped'
+                    return outcomes
                 source_hash = record.get('infohash')
                 if record['site'] != 'BEARBIT' or source_hash not in completed: continue
                 url = 'https://bearbit.org/details.php?id=' + record['torrent_id']
                 for zone in zones:
+                    if stopping():
+                        status = 'stopped'
+                        return outcomes
                     pending = {r.get('target_site') for r in configured if r.get('source_zone') == zone
                                and (source_hash, r.get('target_site')) not in existing}
                     if not pending: continue
+                    cache_key = (source_hash, record['torrent_id'], zone)
+                    if cache_key in source_errors:
+                        skipped['source_already_checked'] += 1
+                        continue
                     try:
                         log_event('stage', node=node.name, source_hash=source_hash, stage='read_source_' + zone)
                         client = client_for(app, node)
                         source_adapter = await session.adapter('BEARBIT')
-                        metadata, content = await source_adapter.read_source(url, source_hash, zone)
+                        if cache_key not in source_cache:
+                            metadata, content = await source_adapter.read_source(url, source_hash, zone)
+                            source_cache[cache_key] = (deepcopy(metadata), content)
+                        metadata, content = source_cache[cache_key]
+                        metadata = deepcopy(metadata)
                         rules = select_rules(cfg.get('rules', []), metadata)
                     except Exception as exc:
+                        if isinstance(exc, UploadBlocked) and str(exc) in (
+                                'Source category is not present in this BearBit zone',
+                                'An explicit category rule is required for this BearBit category'):
+                            source_errors.add(cache_key)
                         log_event('source_error', node=node.name, source_hash=source_hash,
                                   reason=safe_error(exc), error_type=type(exc).__name__)
                         continue
                     for rule in rules:
+                        if stopping():
+                            status = 'stopped'
+                            return outcomes
                         pair = (source_hash, rule['target_site'])
                         if pair in existing: continue
                         try:

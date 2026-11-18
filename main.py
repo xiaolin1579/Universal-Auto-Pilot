@@ -5401,28 +5401,11 @@ def _read_builtin_storage_inventory(node):
     """Read all jobs and file references; any incomplete response blocks data deletion."""
     result = []
     if isinstance(node, QbitNode):
-        response = node._execute_request("GET", node.url + "/api/v2/torrents/info",
-                                         timeout=15, verify=True, allow_redirects=False)
-        if response is None or response.status_code != 200:
-            raise ValueError("Inventory unavailable")
-        rows = response.json()
-        if not isinstance(rows, list):
-            raise ValueError("Invalid inventory")
-        for row in rows:
-            torrent_hash = str(row["hash"]).lower()
-            if stop_event.is_set():
-                raise ValueError('Storage inventory interrupted by shutdown')
-            root = _storage_path(row.get("content_path"))
-            response = node._execute_request("GET", node.url + "/api/v2/torrents/files",
-                                             params={"hash": torrent_hash}, timeout=15,
-                                             verify=True, allow_redirects=False)
-            if response is None or response.status_code != 200:
-                raise ValueError("File inventory unavailable")
-            files = response.json()
-            if not isinstance(files, list) or not files:
-                raise ValueError("Incomplete file inventory")
-            paths = {_storage_file(row.get("save_path"), f["name"]) for f in files}
-            result.append({"hash": torrent_hash, "root": root, "files": paths})
+        from storage_reads import qbit_snapshot
+        started = time.monotonic()
+        result = qbit_snapshot(node, _storage_path, _storage_file, stop_event.is_set)
+        print(f"📊 [Storage Inventory] [{node.name}] jobs={len(result)} workers=4 "
+              f"elapsed={time.monotonic()-started:.2f}s")
     elif isinstance(node, RtorrentNode):
         def read(method, params):
             response = node.s.post(node.url, data=xmlrpc.client.dumps(params, methodname=method),
@@ -5457,9 +5440,15 @@ def _read_builtin_storage_inventory(node):
     return result
 
 
+def _qbit_storage_conflict(node, target):
+    from storage_reads import roots_overlap
+    return roots_overlap(node, target, _storage_path, stop_event.is_set)
+
+
 CLIENTS = ClientRegistry()
 CLIENTS.register(ClientAdapter("qbit", QbitNode, QbitNode, _read_builtin_storage_inventory,
-                               close=lambda node: node.s.close(), upload_factory=QbitUploadClient))
+                               close=lambda node: node.s.close(), upload_factory=QbitUploadClient,
+                               storage_conflict_reader=_qbit_storage_conflict))
 CLIENTS.register(ClientAdapter("rtorrent", RtorrentNode, RtorrentNode, _read_builtin_storage_inventory,
                                purge_reader=lambda node, torrent_hash: node.get_purge_snapshot(torrent_hash),
                                supports_keep_files=False, close=lambda node: node.s.close(),
@@ -5868,6 +5857,10 @@ class NodeCleaner:
             return False
         peers = []
         try:
+            conflict_reader = getattr(CLIENTS.adapter_for(self.node), 'storage_conflict_reader', None)
+            if conflict_reader is not None and conflict_reader(self.node, t_hash):
+                print(f"🔒 [{self.node.name}] Shared content root; full file scan skipped")
+                return False
             inventory = _read_storage_inventory(self.node)
             targets = [r for r in inventory if r["hash"] == str(t_hash).lower()]
             if len(targets) != 1:
@@ -13399,10 +13392,8 @@ async def main():
 
             # Refresh authenticated obligation evidence before any cleanup,
             # including Cross-Seed cycles that skip maintenance actions.
-            from cleaner_obligations import refresh_before_cleaner
-            await refresh_before_cleaner(sys.modules[__name__])
-            from auto_upload_retention import refresh_upload_retention
-            await refresh_upload_retention(sys.modules[__name__])
+            from cleaner_obligations import refresh_cleaner_evidence
+            await refresh_cleaner_evidence(sys.modules[__name__])
             if stop_event.is_set():
                 break
 
@@ -13425,7 +13416,13 @@ async def main():
 
                     await asyncio.to_thread(NodeCleaner(node, n_cfg.get('clean_settings', {}), global_clean).process,
                                             force_emergency=is_system_emergency)
+                    if stop_event.is_set():
+                        CLIENTS.close(node)
+                        break
                     await asyncio.sleep(2)  
+                    if stop_event.is_set():
+                        CLIENTS.close(node)
+                        break
 
                     if hasattr(node, '_sweeper_force_start'):
                         if n_cfg.get('allow_sweeper_auto_resume', False) is True:
@@ -13456,6 +13453,8 @@ async def main():
                 node_status_buffer.append(line)
                 update_trackers(node)
 
+            if stop_event.is_set():
+                break
             if active_nodes:
                 print("⏳ Waiting 5s for trackers to sync with All Trackers")
                 await asyncio.sleep(5)
@@ -13789,7 +13788,7 @@ async def main():
                             "ให้ตรวจสอบ build_cross_seed_targets() และ mapping"
                         )
 
-                if CFG.get("AUTO_UPLOAD", {}).get("enable") is True:
+                if CFG.get("AUTO_UPLOAD", {}).get("enable") is True and not stop_event.is_set():
                     from upload_runner import run_cycle as run_upload_cycle
                     upload_results = await run_upload_cycle(sys.modules[__name__], active_nodes)
                     # run_cycle emits sanitized progress and a final summary.

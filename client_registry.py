@@ -25,6 +25,7 @@ class ClientAdapter:
     supports_keep_files: bool = True
     close: Callable | None = None
     upload_factory: Callable | None = None
+    storage_conflict_reader: Callable | None = None
 
 
 class ClientRegistry:

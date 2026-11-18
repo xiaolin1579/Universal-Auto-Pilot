@@ -71,13 +71,18 @@ def parse_snapshot(site, kind, html, current):
 async def sync_site(app, adapter, max_pages=20, max_resolve=30):
     site = adapter.site
     result = {}
+    def stopping():
+        stop = getattr(app, 'stop_event', None)
+        return stop is not None and stop.is_set()
     for kind, path in PATHS.items():
+        if stopping(): return result
         await app._store_call('record_failure', site, kind)
         try:
             if site != 'BEARBIT':
                 raise UploadBlocked('No verified obligation page adapter for this site')
             pending = [adapter.origin + path]; visited = set(); required = set()
             while pending:
+                if stopping(): raise UploadBlocked('Obligation read interrupted by shutdown')
                 if len(visited) >= max_pages:
                     raise UploadBlocked('Obligation pagination exceeds the read limit')
                 url = pending.pop(0)
@@ -91,6 +96,7 @@ async def sync_site(app, adapter, max_pages=20, max_resolve=30):
             unresolved = [tid for tid in sorted(required)
                           if not data['site_records'][site + ':' + tid].get('infohash')]
             for tid in unresolved[:max_resolve]:
+                if stopping(): raise UploadBlocked('Obligation read interrupted by shutdown')
                 content = await adapter.download_listing(adapter.origin + '/details.php?id=' + tid)
                 await app._store_call('bind_obligation_listing', site, tid, _extract_torrent_info_hash(content))
             complete = await app._store_call('finalize_required_snapshot', site, kind)
@@ -103,7 +109,7 @@ async def sync_site(app, adapter, max_pages=20, max_resolve=30):
     return result
 
 
-async def refresh_before_cleaner(app):
+async def refresh_before_cleaner(app, *, session=None):
     global_cfg = app.CFG.get('GLOBAL_CLEAN', {})
     if not any(n.get('enable') is True and app.NodeCleaner(None, n, global_cfg).enabled()
                for n in app.CFG.get('NODES', [])):
@@ -127,7 +133,8 @@ async def refresh_before_cleaner(app):
         result['BEARBIT'] = {'status': 'fresh'}
         return result
     from upload_runner import UploadSession
-    session = UploadSession(app, 'cleaner_' + str(os.getpid()))
+    owns_session = session is None
+    if owns_session: session = UploadSession(app, 'cleaner_' + str(os.getpid()))
     try:
         adapter = await session.adapter('BEARBIT')
         result['BEARBIT'] = await sync_site(app, adapter)
@@ -136,8 +143,28 @@ async def refresh_before_cleaner(app):
         result['BEARBIT'] = {'status': 'failed', 'error_type': type(exc).__name__}
         print('[Cleaner Sync] site=BEARBIT status=failed error_type=' + type(exc).__name__)
     finally:
+        if owns_session:
+            try:
+                await session.close()
+            except Exception as exc:
+                print('[Cleaner Sync] browser_cleanup=failed error_type=' + type(exc).__name__)
+    return result
+
+
+async def refresh_cleaner_evidence(app):
+    """Share one browser for obligation and upload-peer checks in this cycle."""
+    stop = getattr(app, 'stop_event', None)
+    if stop is not None and stop.is_set():
+        return {'obligations': {}, 'uploads': []}
+    from upload_runner import UploadSession
+    from auto_upload_retention import refresh_upload_retention
+    session = UploadSession(app, 'cleaner_' + str(os.getpid()))
+    try:
+        obligations = await refresh_before_cleaner(app, session=session)
+        uploads = [] if stop is not None and stop.is_set() else await refresh_upload_retention(app, session=session)
+        return {'obligations': obligations, 'uploads': uploads}
+    finally:
         try:
             await session.close()
         except Exception as exc:
-            print('[Cleaner Sync] browser_cleanup=failed error_type=' + type(exc).__name__)
-    return result
+            raise UploadBlocked('Cleaner browser cleanup failed: ' + type(exc).__name__) from None
