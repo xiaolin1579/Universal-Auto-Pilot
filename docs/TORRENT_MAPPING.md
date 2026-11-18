@@ -67,6 +67,24 @@ transaction นั้นแทน
 รองรับระบบไฟล์ภายในเครื่อง ยังไม่รองรับระบบไฟล์เครือข่ายหรือการเขียนจากหลายเครื่อง
 API ของชั้นจัดเก็บเป็นจุดสำหรับเปลี่ยนไปใช้ SQLite ในอนาคต
 
+## ยืนยัน Source Zone จาก Cross-Seed
+
+Cross-Seed ที่ผ่านการตรวจ manifest ตรงกัน, inventory ที่โหลดครบ และ tracker ของ candidate
+สามารถยืนยัน `Source Zone` ผ่าน `site_listings` ได้ โดยผูกกับ infohash ของ listing นั้นเท่านั้น
+ถ้า candidate เป็นคนละ hash จะนำหลักฐานไปใช้กับเรกคอร์ดของ candidate เมื่อมีอยู่
+และไม่ย้ายโซนของ candidate ไปให้ hash ต้นทาง แม้ใช้ไฟล์ชุดเดียวกัน
+
+เมื่อมีหลักฐานเว็บ/โซน/ID ที่ตรงกันเพียงชุดเดียว ระบบเติม `source_site`, `source_zone_id`,
+flags ที่ยืนยันแล้ว และ `source_zone_evidence.verification_method=cross_seed_verified_listing`
+พร้อม hash, listing ID/URL, เวลา และหลักฐานการตรวจ
+ระบบตรวจทะเบียนเว็บ/โซนที่เปิดไว้ URL แบบสาธารณะ และ hash ใหม่ทุกครั้งที่ใช้หลักฐานนี้
+ข้อมูลต้นทางและโซนที่ยืนยันไว้เดิมจะถูกเก็บไว้เมื่อมีหลักฐานใหม่ขัดแย้งกัน
+หลักฐานหลายเว็บ หลายโซน หรือหลาย listing ID ที่ยังเลือกไม่ได้จะคงสถานะเดิม
+
+รายการเก่าที่มี `site_listings` ครบแล้วจะได้รับการ reconcile ในรอบซิงค์ mapping
+พร้อม log `Source Zone verified/reconciled: SITE/ZONE via Cross-Seed`
+การยืนยันโซนไม่เปลี่ยนภาระ H&R/Quest หรือ manual hold และไม่ใช่ผล recheck ของไฟล์
+
 ## ภาระการ seed และ Cleaner
 
 - `required` ระงับการลบเสมอ แม้ผลตรวจจะเก่าแล้ว

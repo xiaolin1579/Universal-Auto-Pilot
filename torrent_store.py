@@ -363,7 +363,7 @@ class MappingStore:
                 for listing in row.get('site_listings', []):
                     if isinstance(listing, dict) and listing.get('verified') is True:
                         collect(str(listing.get('site_key', '')).upper(), listing.get('torrent_id'),
-                                listing.get('details_url'), row['client_info'].get('hash'))
+                                listing.get('details_url'), listing.get('infohash', row['client_info'].get('hash')))
             for job in data['upload_jobs'].values():
                 metadata = job.get('metadata', {})
                 if metadata.get('site') == 'BEARBIT' and infohash(metadata.get('infohash')) == job['source_hash']:

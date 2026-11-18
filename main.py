@@ -1140,6 +1140,7 @@ async def add_or_update_torrent(client_data, web_data=None, node_data=None):
         effective_source,
         web_data.get("torrent_id"),
         web_data.get("details_url"),
+        source_hash=target_record.get("client_info", {}).get("hash"),
     ) if effective_source else None
 
     if incoming_zone_evidence:
@@ -1156,6 +1157,7 @@ async def add_or_update_torrent(client_data, web_data=None, node_data=None):
                 effective_source,
                 target_record.get("torrent_id"),
                 target_record.get("details_url"),
+                source_hash=target_record.get("client_info", {}).get("hash"),
             )
             if effective_source
             else None
@@ -1212,7 +1214,7 @@ async def handle_new_torrent_grabbed(web_item, client_response, host_name):
     """
     Called after a successful torrent addition.
 
-    Only this confirmed-add path can establish source provenance.
+    Confirmed additions establish source provenance alongside verified Cross-Seed listings.
     """
     web_item = (
         dict(web_item)
@@ -1390,18 +1392,35 @@ def _validate_mapping_target_zone_meta(meta):
     }
 
 
-def _validate_mapping_source_zone_evidence(evidence, source_site, torrent_id, details_url):
+def _validate_mapping_source_zone_evidence(evidence, source_site, torrent_id, details_url, *, source_hash=None):
     """Validate source-zone proof against the enabled registry and exact details URL."""
     from urllib.parse import parse_qs, urlsplit
 
     if not isinstance(evidence, dict) or evidence.get("verified") is not True:
         return None
-    if evidence.get("verification_method") != "successful_add_from_verified_zone":
+    method = evidence.get("verification_method")
+    methods = {
+        "successful_add_from_verified_zone": [
+            "configured_enabled_zone_registry", "matching_search_result_details_url", "successful_add_response"],
+        "cross_seed_verified_listing": [
+            "exact_source_candidate_file_manifest", "live_qbittorrent_complete_inventory",
+            "candidate_tracker_api_all_present"],
+    }
+    if not isinstance(method, str) or method not in methods:
         return None
+    if method == "cross_seed_verified_listing":
+        digest = str(source_hash or "").strip().upper()
+        if (not re.fullmatch(r"[0-9A-F]{40}", digest)
+                or str(evidence.get("infohash") or "").strip().upper() != digest):
+            return None
 
     meta = _validate_mapping_target_zone_meta(evidence)
     canonical_source = _canonical_mapping_site(source_site)
     if not meta or not canonical_source or meta["site_key"] != canonical_source:
+        return None
+    if method == "cross_seed_verified_listing" and not any(
+            s.get("name") == canonical_source and s.get("enable") is True
+            for s in globals().get("CFG", {}).get("SITE", []) if isinstance(s, dict)):
         return None
 
     expected_id = str(torrent_id or "").strip()
@@ -1416,14 +1435,25 @@ def _validate_mapping_source_zone_evidence(evidence, source_site, torrent_id, de
     ):
         return None
 
-    parsed = urlsplit(expected_url)
+    try:
+        parsed = urlsplit(expected_url)
+        port = parsed.port
+    except ValueError:
+        return None
     host = (parsed.hostname or "").casefold().rstrip(".")
     if parsed.scheme.casefold() not in {"http", "https"} or host != meta["host"].casefold().rstrip("."):
         return None
     if not re.search(r"(?:^|/)(?:bs_)?details(?:new)?\.php$", parsed.path, re.I):
         return None
 
-    query = parse_qs(parsed.query)
+    query = parse_qs(parsed.query, keep_blank_values=(method == "cross_seed_verified_listing"))
+    if method == "cross_seed_verified_listing":
+        # Reconciled evidence contains a public listing identity, never a signed URL.
+        if (parsed.scheme != 'https' or parsed.username or parsed.password or parsed.fragment
+                or port not in (None, 443)
+                or set(query) - {'id', 'tid', 'torrentid'}
+                or sum(len(values) for values in query.values()) != 1):
+            return None
     ids = {
         str(value).strip()
         for field in ("id", "tid", "torrentid")
@@ -1433,30 +1463,75 @@ def _validate_mapping_source_zone_evidence(evidence, source_site, torrent_id, de
         return None
 
     verified_by = evidence.get("verified_by")
-    if not isinstance(verified_by, list) or not {
-        "configured_enabled_zone_registry",
-        "matching_search_result_details_url",
-        "successful_add_response",
-    }.issubset(set(verified_by)):
+    if not isinstance(verified_by, list) or not all(isinstance(v, str) for v in verified_by) or not set(methods[method]).issubset(set(verified_by)):
         return None
     verified_at = str(evidence.get("verified_at") or "").strip()
     if not verified_at:
         return None
+    if method == "cross_seed_verified_listing":
+        from datetime import datetime
+        try:
+            if datetime.fromisoformat(verified_at.replace('Z', '+00:00')).utcoffset() is None:
+                return None
+        except ValueError:
+            return None
 
     return {
         **meta,
         "torrent_id": expected_id,
         "details_url": expected_url,
         "verified": True,
-        "verification_status": "successful_add_from_verified_zone",
-        "verification_method": "successful_add_from_verified_zone",
-        "verified_by": [
-            "configured_enabled_zone_registry",
-            "matching_search_result_details_url",
-            "successful_add_response",
-        ],
+        "verification_status": method,
+        "verification_method": method,
+        "verified_by": list(methods[method]),
         "verified_at": verified_at,
+        **({"infohash": str(source_hash).strip().upper()} if method == "cross_seed_verified_listing" else {}),
     }
+
+
+def _reconcile_cross_seed_source_zones(data):
+    """Bind zone proof to its own hash, never to a different source variant."""
+    by_hash = {}
+    for record in data.get("torrents", []):
+        if not isinstance(record, dict) or not isinstance(record.get("site_listings"), list):
+            continue
+        for listing in record["site_listings"]:
+            if (not isinstance(listing, dict) or listing.get("verified") is not True
+                    or listing.get("verification_status") != "live_inventory_exact_manifest_tracker_verified"):
+                continue
+            digest = str(listing.get("infohash") or "").strip().upper()
+            site = _canonical_mapping_site(listing.get("site_key"))
+            evidence = _validate_mapping_source_zone_evidence(
+                {**listing, "verification_method": "cross_seed_verified_listing"},
+                site, listing.get("torrent_id"), listing.get("details_url"), source_hash=digest)
+            if evidence:
+                key = (site, evidence["zone_id"], evidence["torrent_id"], evidence["details_url"])
+                by_hash.setdefault(digest, {})[key] = evidence
+    changed = 0
+    for record in data.get("torrents", []):
+        if not isinstance(record, dict) or not isinstance(record.get("client_info"), dict):
+            continue
+        digest = str(record["client_info"].get("hash") or "").strip().upper()
+        if digest not in by_hash:
+            continue
+        source = (_canonical_mapping_site(record.get("source_site"))
+                  if record.get("source_site_verified") is True else "")
+        old = _validate_mapping_source_zone_evidence(
+            record.get("source_zone_evidence"), source, record.get("torrent_id"),
+            record.get("details_url"), source_hash=digest) if source else None
+        if (old and record.get("source_zone_verified") is True
+                and record.get("source_zone_id") == old["zone_id"]):
+            continue
+        candidates = {key: proof for key, proof in by_hash[digest].items() if not source or key[0] == source}
+        if len(candidates) != 1:
+            continue
+        (site, zone, tid, url), evidence = next(iter(candidates.items()))
+        record.update(source_site=site, source_site_verified=True, source_zone_id=zone,
+                      source_zone_verified=True, source_zone_evidence=evidence,
+                      torrent_id=tid, details_url=url)
+        changed += 1
+        print(f"🧭 [Mapper] Source Zone verified/reconciled: {site}/{zone} via Cross-Seed hash={digest[:12]}")
+    return changed
 
 
 @_mapping_transactional
@@ -1598,7 +1673,8 @@ async def record_cross_seed_site_listings(updates):
             f"{len(missing_sources)}; those entries skipped"
         )
 
-    if not changed:
+    zones_reconciled = _reconcile_cross_seed_source_zones(data)
+    if not changed and not zones_reconciled:
         print("ℹ️ [Cross-Seed Site Listings] No new verified listing to persist")
         return not missing_sources
 
@@ -1639,7 +1715,8 @@ async def record_cross_seed_site_listings(updates):
 
     print(
         f"✅ [Cross-Seed Site Listings] Verified listings persisted: "
-        f"{changed}; source records={len(normalized) - len(missing_sources)}"
+        f"{changed}; source records={len(normalized) - len(missing_sources)}; "
+        f"zones_reconciled={zones_reconciled}"
     )
     return True
 
@@ -9754,6 +9831,7 @@ def build_cross_seed_targets(
                     _raw_source_zone_evidence.get("details_url")
                     if isinstance(_raw_source_zone_evidence, dict) else None
                 ),
+                source_hash=record.get("client_info", {}).get("hash"),
             )
             if (
                 source_zone_evidence
@@ -13352,6 +13430,7 @@ async def audit_cross_seed_execution_plan(matches, active_nodes):
 async def _persist_cross_seed_linking():
 
     mapping_data = await load_mapping()
+    _reconcile_cross_seed_source_zones(mapping_data)
     updated_mapping = process_cross_seed_linking(mapping_data)
     return await save_mapping(updated_mapping)
 
