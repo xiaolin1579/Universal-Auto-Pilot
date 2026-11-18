@@ -6795,6 +6795,7 @@ def save_hourly_snapshot(site_name, current_data):
                     all_history = {}
 
         from shared_user_stats import coalesce_stats, storage_key
+        from user_stats_reading import copy_reading_metadata
         all_history = coalesce_stats(all_history, history=True)
         site_name = storage_key(site_name, all_history, username=current_data.get('username'), history=True)
         if site_name not in all_history:
@@ -6830,11 +6831,13 @@ def save_hourly_snapshot(site_name, current_data):
             if raw_up < prev_up * 0.95:  # ยอมให้ลดลงได้ไม่เกิน 5% (หรือปรับเงื่อนไขตามความเหมาะสม)
                 print(f"⚠️ [{site_name}] Anomaly Guard: ตรวจพบยอด Upload ลดลงผิดปกติจาก {prev_up} เหลือ {raw_up} -> ใช้ค่าเดิมแทน")
                 raw_up = prev_up
+                copy_reading_metadata(current_data, prev_data, 'up')
             
             # ถ้า Download ลดลงผิดปกติ ให้ล็อกค่าเดิมไว้เช่นกัน
             if raw_dl < prev_dl * 0.95:
                 print(f"⚠️ [{site_name}] Anomaly Guard: ตรวจพบยอด Download ลดลงผิดปกติจาก {prev_dl} เหลือ {raw_dl} -> ใช้ค่าเดิมแทน")
                 raw_dl = prev_dl
+                copy_reading_metadata(current_data, prev_data, 'dl')
 
         # บันทึกข้อมูล Snapshot ประจำชั่วโมง
         all_history[site_name][timestamp_key] = {
@@ -6845,6 +6848,8 @@ def save_hourly_snapshot(site_name, current_data):
             'bonus': raw_bonus,
             'raw_time': now.strftime("%Y-%m-%d %H:%M:%S")
         }
+        for field in ('up', 'dl'):
+            copy_reading_metadata(all_history[site_name][timestamp_key], current_data, field)
 
         # 4. ⏱️ ปรับปรุงระบบ Retention (จำกัดความยาวประวัติ 31 วัน / 744 ชั่วโมง)
         site_keys = sorted(all_history[site_name].keys())
@@ -6892,6 +6897,7 @@ def get_stats_diff(site_name, current_data):
             print(f"⚠️ [{site_name}] Cache Read Error: {e}")
 
     from shared_user_stats import coalesce_stats, storage_key, account_identity
+    from user_stats_reading import copy_reading_metadata
     all_cache = coalesce_stats(all_cache)
     site_name = storage_key(site_name, all_cache, username=current_data.get('username'))
     # 2. ดึงข้อมูลเก่าเฉพาะของ Site นี้
@@ -6920,28 +6926,32 @@ def get_stats_diff(site_name, current_data):
                 print(f"⚠️ [{site_name}] Cache Guard: ตรวจพบยอด Upload เป็น 0 -> ใช้ค่าเก่า ({old_up}) คำนวณและดึง Cache เดิมไว้")
                 curr_up = old_up
                 current_data['up'] = old_data.get('up')  # ใช้ค่าเดิมกัน Cache พัง
+                copy_reading_metadata(current_data, old_data, 'up')
             elif curr_up < old_up * 0.95:
                 print(f"⚠️ [{site_name}] Cache Guard: ยอด Upload ลดลงผิดปกติ -> ใช้ค่าเดิมแทน")
                 curr_up = old_up
                 current_data['up'] = old_data.get('up')
+                copy_reading_metadata(current_data, old_data, 'up')
 
             if curr_dl == 0.0 and old_dl > 0:
                 curr_dl = old_dl
                 current_data['dl'] = old_data.get('dl')
+                copy_reading_metadata(current_data, old_data, 'dl')
             elif curr_dl < old_dl * 0.95:
                 curr_dl = old_dl
                 current_data['dl'] = old_data.get('dl')
+                copy_reading_metadata(current_data, old_data, 'dl')
 
             changes = []
             
             # ส่วนต่าง Upload
             diff_up = curr_up - old_up
-            if diff_up > 0.001: # Precision 1MB
+            if diff_up > 0.001 and current_data.get('up_precision') == old_data.get('up_precision'):
                 changes.append(f"Up: (+{format_size(diff_up)})")
 
             # ส่วนต่าง Download
             diff_dl = curr_dl - old_dl
-            if diff_dl > 0.001:
+            if diff_dl > 0.001 and current_data.get('dl_precision') == old_data.get('dl_precision'):
                 changes.append(f"Dl: (+{format_size(diff_dl)})")
 
             # ส่วนต่าง Bonus
@@ -6949,6 +6959,9 @@ def get_stats_diff(site_name, current_data):
             if abs(diff_b) > 0.1:
                 symbol = "+" if diff_b > 0 else ""
                 changes.append(f"💰 {symbol}{diff_b:,.1f}")
+
+            if any(current_data.get(f + '_precision') != old_data.get(f + '_precision') for f in ('up', 'dl')):
+                changes.append('เริ่มฐานเปรียบเทียบยอดรับส่งใหม่ (ความละเอียดข้อมูลเปลี่ยน)')
 
             if changes:
                 diff_msg = "<b>Changes:</b> " + " | ".join(changes)
@@ -7134,6 +7147,13 @@ async def get_site_stats(page: uc.Tab, site_cfg: dict, ctx: BotContext) -> str:
         curr_dl    = extract(r"(?:Downloaded|Download):?\s*([\d\.,]+\s*[KMGTPE]B)", text, None)
         curr_bonus = extract(r"(?:Bonus):?\s*([\d\.,]+)", text, "0")
 
+        profile_readings = {}
+        if site == 'BEARBIT':
+            from user_stats_reading import profile_transfer
+            profile_readings = {field: profile_transfer(soup, field) for field in ('up', 'dl')}
+            if profile_readings['up']: curr_up = profile_readings['up']['value']
+            if profile_readings['dl']: curr_dl = profile_readings['dl']['value']
+
         if not all([curr_ratio, curr_up, curr_dl]):
             return f"⚠️ [{site}] สถิติไม่ครบถ้วน (หน้าเว็บเรนเดอร์ข้อมูลไม่สมบูรณ์)"
 
@@ -7144,6 +7164,10 @@ async def get_site_stats(page: uc.Tab, site_cfg: dict, ctx: BotContext) -> str:
             'dl': curr_dl,
             'bonus': curr_bonus
         }
+        for field, reading in profile_readings.items():
+            if reading:
+                curr_data.update({field + '_precision': reading['precision'],
+                                  field + '_display': reading['value'], field + '_source': reading['source']})
 
         # -------------------------------------------------------------------------
         # 🎯 4. บันทึก Snapshot และประวัติความเปลี่ยนแปลง (Diff History)
@@ -7157,6 +7181,8 @@ async def get_site_stats(page: uc.Tab, site_cfg: dict, ctx: BotContext) -> str:
                 'dl': parse_size(curr_data['dl']), 
                 'bonus': float(curr_data['bonus'].replace(',', ''))
             }
+            from user_stats_reading import copy_reading_metadata
+            for field in ('up', 'dl'): copy_reading_metadata(snapshot_data, curr_data, field)
             await asyncio.to_thread(save_hourly_snapshot, site, snapshot_data)
         except Exception as save_err:
             print(f"⚠️ [{site}] ระบบบันทึกประวัติขัดข้อง: {save_err}")

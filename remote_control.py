@@ -14,6 +14,7 @@ import pytz
 import html  # เพิ่มเข้ามาเพื่อใช้เคลียร์แท็กพัง
 from datetime import datetime, timedelta
 from shared_user_stats import load_history as load_account_stats_history, storage_key
+from user_stats_reading import counter_delta, counter_baseline
 
 # --- SETUP PATH & CONFIG ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -152,6 +153,12 @@ def get_filtered_logs(n=15):
         return "\n".join(filtered[-n:])
     except: return "⚠️ อ่าน Log ขัดข้อง"
 
+def _sample_time(snapshot, fallback=''):
+    value = str(snapshot.get('raw_time') or fallback)
+    try: return datetime.fromisoformat(value).strftime('%H:%M')
+    except ValueError: return '--:--'
+
+
 def get_historical_report(site_name="TORRENTDD"):
     try:
         if not os.path.exists(STATS_HISTORY_FILE):
@@ -174,6 +181,7 @@ def get_historical_report(site_name="TORRENTDD"):
         first_snapshot = history[today_keys[0]]
         latest_snapshot = history[today_keys[-1]]
         h1_snapshot = history.get(today_keys[-2]) if len(today_keys) > 1 else None
+        today_samples = [history[k] for k in today_keys]
 
         # ฟังก์ชันช่วยจัดการเครื่องหมายและขนาดข้อมูล
         def format_signed_size(val):
@@ -194,12 +202,12 @@ def get_historical_report(site_name="TORRENTDD"):
                 prev_data = history[prev_key]
                 curr_data = history[curr_key]
                 
-                up_diff = curr_data['up'] - prev_data['up']
-                dl_diff = curr_data['dl'] - prev_data['dl']
+                up_diff = counter_delta(prev_data, curr_data, 'up') or 0
+                dl_diff = counter_delta(prev_data, curr_data, 'dl') or 0
                 bonus_diff = curr_data.get('bonus', 0) - prev_data.get('bonus', 0)
                 
                 if up_diff != 0 or dl_diff != 0 or bonus_diff != 0:
-                    time_label = curr_key.split(" ")[1][:5]
+                    time_label = _sample_time(prev_data, prev_key) + '–' + _sample_time(curr_data, curr_key)
                     hourly_rankings.append((time_label, up_diff, dl_diff, bonus_diff))
             
             hourly_rankings.sort(key=lambda x: x[1], reverse=True)
@@ -208,8 +216,8 @@ def get_historical_report(site_name="TORRENTDD"):
             f"📊 <b>{site_name} Report: {today_str}</b>",
             "━━━━━━━━━━━━━━━━━━",
             f"👤 <b>User:</b> <code>{latest_snapshot['username']}</code>",
-            f"📤 <b>Uploaded:</b> <code>{format_size(latest_snapshot['up'])}</code>",
-            f"📥 <b>Downloaded:</b> <code>{format_size(latest_snapshot['dl'])}</code>",
+            f"📤 <b>Uploaded:</b> <code>{html.escape(latest_snapshot.get('up_display') or format_size(latest_snapshot['up']))}</code>",
+            f"📥 <b>Downloaded:</b> <code>{html.escape(latest_snapshot.get('dl_display') or format_size(latest_snapshot['dl']))}</code>",
             f"📊 <b>Ratio:</b> <code>{latest_snapshot['ratio']:.3f}</code>"
         ]
 
@@ -219,17 +227,19 @@ def get_historical_report(site_name="TORRENTDD"):
         # --- ส่วน Last 1 Hour ---
         h1_lines = []
         if h1_snapshot:
-            h1_up_diff = latest_snapshot['up'] - h1_snapshot['up']
-            h1_dl_diff = latest_snapshot['dl'] - h1_snapshot['dl']
+            h1_up_diff = counter_delta(h1_snapshot, latest_snapshot, 'up')
+            h1_dl_diff = counter_delta(h1_snapshot, latest_snapshot, 'dl')
             h1_bonus_diff = latest_snapshot.get('bonus', 0) - h1_snapshot.get('bonus', 0)
 
-            if h1_up_diff != 0:
+            if h1_up_diff is not None and h1_up_diff != 0:
                 h1_lines.append(f"  ├ 📤 {format_signed_size(h1_up_diff)}")
-            if h1_dl_diff != 0:
+            if h1_dl_diff is not None and h1_dl_diff != 0:
                 h1_lines.append(f"  ├ 📥 {format_signed_size(h1_dl_diff)}")
             if h1_bonus_diff != 0:
                 prefix = "📈 +" if h1_bonus_diff > 0 else "📉 "
                 h1_lines.append(f"  ├ 💰 {prefix}{h1_bonus_diff:,.1f} pts")
+            if h1_up_diff is None or h1_dl_diff is None:
+                h1_lines.append('  ├ ℹ️ เริ่มฐานยอดรับส่งใหม่เมื่อความละเอียดข้อมูลเปลี่ยน')
 
             if h1_lines:
                 h1_lines[-1] = h1_lines[-1].replace("  ├", "  └")
@@ -240,14 +250,16 @@ def get_historical_report(site_name="TORRENTDD"):
 
         msg.extend([
             "━━━━━━━━━━━━━━━━━━",
-            "⚡ <b>Last 1 Hour</b>"
+            "⚡ <b>Since Last Snapshot</b>" + (f" ({_sample_time(h1_snapshot, today_keys[-2])}–{_sample_time(latest_snapshot, today_keys[-1])})" if h1_snapshot else '')
         ])
         msg.extend(h1_lines)
 
         # --- ส่วน Today's Gain ---
         today_lines = []
-        today_up_diff = latest_snapshot['up'] - first_snapshot['up']
-        today_dl_diff = latest_snapshot['dl'] - first_snapshot['dl']
+        up_base = counter_baseline(today_samples, 'up')
+        dl_base = counter_baseline(today_samples, 'dl')
+        today_up_diff = counter_delta(up_base, latest_snapshot, 'up')
+        today_dl_diff = counter_delta(dl_base, latest_snapshot, 'dl')
         today_bonus_diff = latest_snapshot.get('bonus', 0) - first_snapshot.get('bonus', 0)
 
         if today_up_diff != 0:
@@ -257,6 +269,9 @@ def get_historical_report(site_name="TORRENTDD"):
         if today_bonus_diff != 0:
             prefix = "📈 +" if today_bonus_diff > 0 else "📉 "
             today_lines.append(f"  ├ 💰 {prefix}{today_bonus_diff:,.1f} pts")
+        for field, baseline, label in (('up', up_base, 'Upload'), ('dl', dl_base, 'Download')):
+            if baseline is not first_snapshot:
+                today_lines.append(f'  ├ ℹ️ {label} เริ่มเทียบจาก {_sample_time(baseline)} (ความละเอียดใหม่)')
 
         if today_lines:
             today_lines[-1] = today_lines[-1].replace("  ├", "  └")
@@ -271,7 +286,7 @@ def get_historical_report(site_name="TORRENTDD"):
 
         msg.extend([
             "━━━━━━━━━━━━━━━━━━",
-            f"🏆 <b>Top Hourly Rankings (Today)</b>"
+            f"🏆 <b>Top Intervals (Today)</b>"
         ])
 
         if hourly_rankings:
@@ -290,16 +305,16 @@ def get_historical_report(site_name="TORRENTDD"):
                     msg.append(f"  └ ⏰ <b>{time_str} น.</b>")
                     msg.extend(sub_lines)
         else:
-            msg.append("  └ <i>ยังไม่มีข้อมูลช่วงชั่วโมงที่เปลี่ยนแปลง</i>")
+            msg.append("  └ <i>ยังไม่มีข้อมูลช่วงเก็บสถิติที่เปลี่ยนแปลง</i>")
 
         # --- คำนวณชั่วโมงสะสมจากคีย์ข้อมูลในวันนี้ ---
         active_hours = len(today_keys)
-        start_time_str = today_keys[0].split(" ")[1][:5]
-        end_time_str = today_keys[-1].split(" ")[1][:5]
+        start_time_str = _sample_time(first_snapshot, today_keys[0])
+        end_time_str = _sample_time(latest_snapshot, today_keys[-1])
 
         msg.extend([
             "━━━━━━━━━━━━━━━━━━",
-            f"📅 ข้อมูลสะสม: {active_hours} ชม.",
+            f"📅 ข้อมูลวันนี้: {active_hours} จุด",
             f"⏱️ ตั้งแต่: {today_str} {start_time_str}",
             f"⏱️ ถึง: {today_str} {end_time_str}",
             "━━━━━━━━━━━━━━━━━━"
@@ -331,8 +346,11 @@ def get_monthly_report(site_name="TORRENTDD"):
         first_data = history[monthly_keys[0]]
         last_data = history[monthly_keys[-1]]
 
-        up_gain = last_data['up'] - first_data['up']
-        dl_gain = last_data['dl'] - first_data['dl']
+        monthly_samples = [history[k] for k in monthly_keys]
+        up_base = counter_baseline(monthly_samples, 'up')
+        dl_base = counter_baseline(monthly_samples, 'dl')
+        up_gain = counter_delta(up_base, last_data, 'up')
+        dl_gain = counter_delta(dl_base, last_data, 'dl')
         bonus_gain = last_data.get('bonus', 0) - first_data.get('bonus', 0)
 
         active_days = len(set([k.split()[0] for k in monthly_keys]))
@@ -348,8 +366,8 @@ def get_monthly_report(site_name="TORRENTDD"):
         daily_rankings = []
         for day_str, snapshots in daily_stats.items():
             if len(snapshots) > 1:
-                day_up_diff = snapshots[-1]['up'] - snapshots[0]['up']
-                day_dl_diff = snapshots[-1]['dl'] - snapshots[0]['dl']
+                day_up_diff = counter_delta(counter_baseline(snapshots, 'up'), snapshots[-1], 'up')
+                day_dl_diff = counter_delta(counter_baseline(snapshots, 'dl'), snapshots[-1], 'dl')
                 day_bonus_diff = snapshots[-1].get('bonus', 0) - snapshots[0].get('bonus', 0)
                 daily_rankings.append((day_str, day_up_diff, day_dl_diff, day_bonus_diff))
             elif len(snapshots) == 1 and active_days == 1:
@@ -374,6 +392,9 @@ def get_monthly_report(site_name="TORRENTDD"):
             f"📤 <b>Total Uploaded:</b> {format_signed_size(up_gain)}",
             f"📥 <b>Total Downloaded:</b> {format_signed_size(dl_gain)}",
         ]
+        for baseline, label in ((up_base, 'Upload'), (dl_base, 'Download')):
+            if baseline is not first_data:
+                msg.append(f"ℹ️ {label} เริ่มเทียบจาก {html.escape(str(baseline.get('raw_time', '')))} (ความละเอียดใหม่)")
 
         if bonus_gain != 0 or 'bonus' in last_data:
             sign_str = "+" if bonus_gain >= 0 else ""
