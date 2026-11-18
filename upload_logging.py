@@ -30,6 +30,7 @@ FIELDS = frozenset({
     'skip_reasons', 'elapsed_seconds', 'complete', 'pages', 'candidates_checked',
     'metainfo_bytes', 'max_file_size', 'files', 'completed', 'total', 'done',
     'progress', 'amount_left', 'listing_id', 'provider', 'piece_size',
+    'recheck_wait_seconds',
 })
 THAI_TIME = timezone(timedelta(hours=7))
 

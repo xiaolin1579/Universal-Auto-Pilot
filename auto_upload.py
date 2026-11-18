@@ -5,6 +5,7 @@ import os
 import re
 from pathlib import Path
 import tempfile
+import time
 from upload_logging import log_event
 from torrent_store import infohash, stamp, UPLOAD_STATES as STATES, UPLOAD_HOLD_STATES as HOLD_STATES
 from torrent_metainfo import (_extract_torrent_info_hash, payload_signature,
@@ -713,8 +714,11 @@ class UploadWorker:
             self.ledger.transition(key, {'published', 'verification_failed'}, 'verification_failed')
             raise
 
-    def seed(self, key, client, resume=False):
+    def seed(self, key, client, resume=False, *, wait_seconds=0, stopped=lambda: False):
+        if type(wait_seconds) is not int or not 0 <= wait_seconds <= 1800:
+            raise UploadBlocked('Recheck wait must be an integer from 0 to 1800 seconds')
         job = self.ledger.get(key)
+        if stopped(): return job
         if job['source_node'] != client.name:
             raise UploadBlocked('Cross-seed must use the verified source client and save path')
         if job['state'] == 'verified':
@@ -727,6 +731,7 @@ class UploadWorker:
             if (_extract_torrent_info_hash(content) != job['target_hash']
                     or payload_signature(content) != publication_signature(job)):
                 raise UploadBlocked('Canonical artifact changed')
+            if stopped(): return self.ledger.get(key)
             # Persist before client mutation: never blindly retry an interrupted add.
             self.ledger.transition(key, {'verified'}, 'adding')
             log_event('state_change', job, state='adding', stage='add_paused')
@@ -739,36 +744,61 @@ class UploadWorker:
                 observed = request_recheck(client, job['target_hash'])
                 self.ledger.transition(key, {'adding'}, 'rechecking', recheck_requested_at=stamp(), recheck_observed=observed)
                 log_event('state_change', job, state='rechecking', target_hash=job['target_hash'])
-                # A later pass must observe checking and then a completed paused state.
+                # Observe checking and a completed state before any resume.
             except BaseException as exc:
                 log_event('job_error', job, state='seed_uncertain', stage='add_or_recheck', error_type=type(exc).__name__)
                 self.ledger.transition(key, {'adding'}, 'seed_uncertain')
                 raise
-            return self.ledger.get(key)
+            job = self.ledger.get(key)
+            if wait_seconds == 0 or not resume: return job
         if job['state'] != 'rechecking':
             return job
-        row = client.inventory(job['target_hash'])
-        if row.get('save_path') != job['save_path']:
-            raise UploadBlocked('Target save path changed during recheck')
-        state = str(row.get('state', '')).lower()
-        log_event('recheck_wait', job, status=state, progress=row.get('progress'), amount_left=row.get('amount_left'))
-        if state.startswith('checking'):
-            return self.ledger.transition(key, {'rechecking'}, 'rechecking', recheck_observed=True)
-        if not job.get('recheck_observed') and not client.recheck_complete(job['target_hash']):
-            return job
+        deadline = time.monotonic() + wait_seconds
+
+        def wait_for_update():
+            if not resume or wait_seconds == 0: return False
+            if time.monotonic() >= deadline:
+                log_event('recheck_wait', job, status='wait_timeout', reason='continue_next_cycle')
+                return False
+            next_read = min(deadline, time.monotonic() + 5)
+            while time.monotonic() < next_read:
+                if stopped(): return False
+                time.sleep(min(1, max(0, next_read - time.monotonic())))
+            return not stopped()
+
+        while True:
+            if stopped(): return self.ledger.get(key)
+            job = self.ledger.get(key)
+            if job['state'] != 'rechecking': return job
+            row = client.inventory(job['target_hash'])
+            if row.get('save_path') != job['save_path']:
+                raise UploadBlocked('Target save path changed during recheck')
+            state = str(row.get('state', '')).lower()
+            log_event('recheck_wait', job, status=state, progress=row.get('progress'), amount_left=row.get('amount_left'))
+            if state.startswith('checking'):
+                job = self.ledger.transition(key, {'rechecking'}, 'rechecking', recheck_observed=True)
+            elif job.get('recheck_observed') or client.recheck_complete(job['target_hash']):
+                break
+            if not wait_for_update(): return self.ledger.get(key)
         verify_completed(Path(job['canonical_artifact']).read_bytes(), row, client.files(job['target_hash']))
         if not resume:
             log_event('job_skip', job, reason='resume_disabled')
             return job
+        if stopped(): return self.ledger.get(key)
         log_event('stage', job, stage='resume_seed', target_hash=job['target_hash'])
         if not client.resume(job['target_hash']):
             raise RuntimeError('Resume not confirmed')
-        confirmed = client.inventory(job['target_hash'])
-        if confirmed.get('save_path') != job['save_path']:
-            raise UploadBlocked('Target save path changed after resume')
-        verify_completed(Path(job['canonical_artifact']).read_bytes(), confirmed, client.files(job['target_hash']))
-        if str(confirmed.get('state', '')).lower() not in ('uploading', 'stalledup', 'forcedup'):
-            return self.ledger.get(key)
+        # Starting can be asynchronous. Poll confirmation without sending start again.
+        while True:
+            if stopped(): return self.ledger.get(key)
+            confirmed = client.inventory(job['target_hash'])
+            if confirmed.get('save_path') != job['save_path']:
+                raise UploadBlocked('Target save path changed after resume')
+            verify_completed(Path(job['canonical_artifact']).read_bytes(), confirmed, client.files(job['target_hash']))
+            if str(confirmed.get('state', '')).lower() in ('uploading', 'stalledup', 'forcedup'):
+                break
+            log_event('recheck_wait', job, status='await_seed_confirmation')
+            if not wait_for_update(): return self.ledger.get(key)
         def apply(data):
             current = data['upload_jobs'][key]
             if current['state'] != 'rechecking':

@@ -6,6 +6,7 @@
     "enable_resume": false,
     "artifact_dir": "upload_artifacts",
     "max_jobs_per_cycle": 1,
+    "recheck_wait_seconds": 120,
     "category_review": {
       "enable": true,
       "auto_fix": true,

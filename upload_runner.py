@@ -145,6 +145,9 @@ async def run_cycle(app, active_nodes):
     if cfg.get('enable') is not True:
         log_event('cycle_disabled')
         return []
+    recheck_wait = cfg.get('recheck_wait_seconds', 120)
+    if type(recheck_wait) is not int or not 0 <= recheck_wait <= 1800:
+        raise UploadBlocked('Recheck wait must be an integer from 0 to 1800 seconds')
     started = monotonic()
     ledger = ledger_for(app)
     notices = UploadNotifications(app, ledger)
@@ -167,7 +170,7 @@ async def run_cycle(app, active_nodes):
     limit = max(1, min(int(cfg.get('max_jobs_per_cycle', 1)), 10))
     log_event('cycle_start', nodes=len(nodes), max_jobs=limit,
               publish=cfg.get('enable_publish') is True, seed=cfg.get('enable_seed') is True,
-              resume=cfg.get('enable_resume') is True)
+              resume=cfg.get('enable_resume') is True, recheck_wait_seconds=recheck_wait)
 
     def skip(job, reason, detail=True):
         skipped[reason] += 1
@@ -179,6 +182,64 @@ async def run_cycle(app, active_nodes):
             log_event('cycle_limit', processed=len(outcomes), max_jobs=limit, remaining=max(0, queued-considered))
             return True
         return False
+
+    async def process_job(job, node, *, newly_prepared=False):
+        nonlocal status
+        job_started = monotonic()
+        if stopping():
+            status = 'stopped'
+            if newly_prepared:
+                notices.record(job)
+                outcomes.append({'id': job['id'], 'state': job['state']})
+                log_event('job_result', job, elapsed_seconds=round(monotonic()-job_started, 2))
+            return
+        try:
+            if (cfg.get('category_review', {}).get('enable') is True and job['state'] in ('draft', 'prepared')):
+                from upload_classifier import origin_requires_review
+                if origin_requires_review(job):
+                    job = await worker.review_categories(job['id'], None, None)
+                    skip(job, 'category_origin_requires_review')
+                    notices.record(job, 'Category review requires attention: origin_requires_review')
+                    if newly_prepared:
+                        outcomes.append({'id': job['id'], 'state': job['state']})
+                        log_event('job_result', job, elapsed_seconds=round(monotonic()-job_started, 2))
+                    return
+            client = client_for(app, node)
+            acted = newly_prepared
+            if job['state'] in ('draft', 'prepared') and cfg.get('enable_publish') is True and not stopping():
+                log_event('job_start', job, stage='publish')
+                adapter = await session.adapter(job['target_site'])
+                if not stopping():
+                    acted = True
+                    job = await worker.publish(job['id'], adapter, client)
+            elif job['state'] in ('published', 'verification_failed') and not stopping():
+                log_event('job_start', job, stage='verify_canonical')
+                adapter = await session.adapter(job['target_site'])
+                if not stopping():
+                    acted = True
+                    job = await worker.verify_publication(job['id'], adapter)
+            if job['state'] in ('verified', 'rechecking') and cfg.get('enable_seed') is True and not stopping():
+                log_event('job_start', job, stage='seed')
+                acted = True
+                job = await asyncio.to_thread(worker.seed, job['id'], client, cfg.get('enable_resume') is True,
+                                              wait_seconds=recheck_wait, stopped=stopping)
+            if stopping(): status = 'stopped'
+            if acted:
+                notices.record(job)
+                outcomes.append({'id': job['id'], 'state': job['state']})
+                log_event('job_result', job, elapsed_seconds=round(monotonic()-job_started, 2))
+            elif not stopping():
+                skip(job, 'seed_disabled' if job['state'] in ('verified', 'rechecking') else 'publish_disabled')
+        except Exception as exc:
+            current = ledger.get(job['id'])
+            reason = safe_error(exc, current)
+            log_event('job_error', current, reason=reason, error_type=type(exc).__name__,
+                      elapsed_seconds=round(monotonic()-job_started, 2))
+            notices.record(current, reason)
+            outcome = {'id': job['id'], 'state': current['state'], 'error': reason}
+            if current['state'] == 'publication_uncertain' and current.get('last_publication_failure'):
+                outcome['publication_failure'] = current['last_publication_failure']
+            outcomes.append(outcome)
 
     try:
         if stopping():
@@ -215,53 +276,7 @@ async def run_cycle(app, active_nodes):
             if not enabled_rule(cfg, job):
                 skip(job, 'rule_disabled_or_changed')
                 continue
-            job_started = monotonic()
-            try:
-                if (cfg.get('category_review', {}).get('enable') is True and job['state'] in ('draft','prepared')):
-                    from upload_classifier import origin_requires_review
-                    if origin_requires_review(job):
-                        job = await worker.review_categories(job['id'], None, None)
-                        skip(job, 'category_origin_requires_review')
-                        notices.record(job, 'Category review requires attention: origin_requires_review')
-                        continue
-                client = client_for(app, node)
-                acted = False
-                if job['state'] in ('draft', 'prepared') and cfg.get('enable_publish') is True:
-                    log_event('job_start', job, stage='publish')
-                    adapter = await session.adapter(job['target_site'])
-                    if stopping():
-                        status = 'stopped'
-                        return outcomes
-                    acted = True
-                    job = await worker.publish(job['id'], adapter, client)
-                elif job['state'] in ('published', 'verification_failed'):
-                    log_event('job_start', job, stage='verify_canonical')
-                    adapter = await session.adapter(job['target_site'])
-                    if stopping():
-                        status = 'stopped'
-                        return outcomes
-                    acted = True
-                    job = await worker.verify_publication(job['id'], adapter)
-                if job['state'] in ('verified', 'rechecking') and cfg.get('enable_seed') is True and not stopping():
-                    log_event('job_start', job, stage='seed')
-                    acted = True
-                    job = await asyncio.to_thread(worker.seed, job['id'], client, cfg.get('enable_resume') is True)
-                if acted:
-                    notices.record(job)
-                    outcomes.append({'id': job['id'], 'state': job['state']})
-                    log_event('job_result', job, elapsed_seconds=round(monotonic()-job_started, 2))
-                else:
-                    skip(job, 'seed_disabled' if job['state'] in ('verified', 'rechecking') else 'publish_disabled')
-            except Exception as exc:
-                current = ledger.get(job['id'])
-                reason = safe_error(exc, current)
-                log_event('job_error', current, reason=reason, error_type=type(exc).__name__,
-                          elapsed_seconds=round(monotonic()-job_started, 2))
-                notices.record(current, reason)
-                outcome = {'id': job['id'], 'state': current['state'], 'error': reason}
-                if current['state'] == 'publication_uncertain' and current.get('last_publication_failure'):
-                    outcome['publication_failure'] = current['last_publication_failure']
-                outcomes.append(outcome)
+            await process_job(job, node)
         if at_limit(): return outcomes
         if stopping():
             status = 'stopped'
@@ -330,13 +345,13 @@ async def run_cycle(app, active_nodes):
                         if pair in existing: continue
                         try:
                             job = await _prepare_destination(app, session, client, source_hash, metadata, content, rule)
-                            notices.record(job)
-                            outcomes.append({'id': job['id'], 'state': job['state']})
-                            discovered += 1
-                            existing.add(pair)
                         except Exception as exc:
                             log_event('source_error', node=node.name, source_hash=source_hash, site=rule['target_site'],
                                       stage='prepare_destination', reason=safe_error(exc), error_type=type(exc).__name__)
+                            continue
+                        discovered += 1
+                        existing.add(pair)
+                        await process_job(job, node, newly_prepared=True)
                         if at_limit(): return outcomes
                 if at_limit(): return outcomes
         return outcomes
