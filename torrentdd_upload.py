@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 from bs4 import BeautifulSoup
-from auto_upload import UploadBlocked, effective_rule, upload_title, known_payload_signatures
+from auto_upload import UploadBlocked, effective_rule, upload_title, upload_description, known_payload_signatures
 from torrent_metainfo import (payload_signature, duplicate_payload_status,
                               _extract_torrent_info_hash, valid_target_announce)
 import torrentdd_cross_seed as tdd
@@ -180,7 +180,7 @@ async def fill(adapter, job, artifact):
     poster = rule.get('fields', {}).get('poster', '')
     if not public_url(poster):
         raise UploadBlocked('TorrentDD requires a public poster image URL')
-    title = upload_title(job); description = job['metadata']['description']
+    title = upload_title(job); description = upload_description(job['metadata']['description'])
     # Do not let the website's key handler silently truncate the description.
     if len(title.encode('utf-16-le')) // 2 > 200 or len(description.encode('utf-16-le')) // 2 > 9000:
         raise UploadBlocked('TorrentDD title or description exceeds its supported limit')

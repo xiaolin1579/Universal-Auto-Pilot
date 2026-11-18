@@ -2,7 +2,7 @@
 
 HTML is content, never executable configuration. Hidden tokens stay in the live form.
 """
-from auto_upload import UploadBlocked, UploadRejected, effective_rule, upload_title, validate_metainfo_size, known_payload_signatures, publication_signature
+from auto_upload import UploadBlocked, UploadRejected, effective_rule, upload_title, upload_description, validate_metainfo_size, known_payload_signatures, publication_signature
 import asyncio
 import json
 import re
@@ -588,6 +588,7 @@ class BrowserSite:
         values = {'type': job['target_category'], 'name': upload_title(job),
                   'descr': job['metadata']['description'], 'picture': job['metadata'].get('picture', ''),
                   'description': rule.get('short_description', ''), **rule.get('fields', {})}
+        values['descr'] = upload_description(values['descr'])
         values.update({a: True for a in self.form['acknowledgements']})
         expr = '''(() => {
           const f = document.getElementById('frmupload'), values = VALUES;

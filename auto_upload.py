@@ -101,6 +101,17 @@ def upload_title(job):
         raise UploadBlocked(str(error)) from None
 
 
+def upload_description(description):
+    """Credit the source and uploader in the submitted text, without changing metadata."""
+    if not isinstance(description, str) or not description.strip():
+        raise UploadBlocked('Upload description is empty or invalid')
+    footer = ('เครดิตต้นฉบับ: เว็บเพื่อนบ้าน'
+              '\nอัปโหลดด้วยสคริปต์: [url=https://github.com/xiaolin1579/Universal-Auto-Pilot]'
+              'Universal-Auto-Pilot[/url]')
+    text = description.rstrip()
+    return text if text.endswith(footer) else text + '\n\n' + footer
+
+
 def upload_filename(job):
     from upload_titles import torrent_filename, TitleError
     try:
