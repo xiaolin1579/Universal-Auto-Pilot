@@ -12,6 +12,7 @@ from auto_upload import UploadLedger, UploadWorker, select_rule, select_rules, P
 from torrent_metainfo import verify_completed
 from upload_sites import BrowserSite
 from upload_notifications import UploadNotifications, safe_error
+from upload_schedule import UploadSchedule
 
 
 def ledger_for(app):
@@ -164,6 +165,9 @@ async def run_cycle(app, active_nodes):
     status = 'completed'
     source_cache = {}
     source_errors = set()
+    schedule = UploadSchedule(ledger.store)
+    discovery = None
+    reserved_discovery = False
     def stopping():
         event = getattr(app, 'stop_event', None)
         return event is not None and event.is_set()
@@ -241,13 +245,98 @@ async def run_cycle(app, active_nodes):
                 outcome['publication_failure'] = current['last_publication_failure']
             outcomes.append(outcome)
 
+    async def discover_jobs():
+        nonlocal discovered, status
+        # Queue only completed hashes linked to BearBit by verified site_records.
+        data = ledger.store.read()
+        existing = {(j['source_hash'], j['target_site']) for j in data['upload_jobs'].values()}
+        configured = [r for r in cfg.get('rules', []) if isinstance(r, dict) and r.get('enable') is True]
+        zones = sorted({r.get('source_zone') for r in configured if r.get('source_zone') in ('normal', 'special')})
+        for node in nodes.values():
+            if stopping():
+                status = 'stopped'
+                return
+            if app.CLIENTS.adapter_for(node).upload_factory is None:
+                log_event('inventory', node=node.name, reason='client_unsupported')
+                continue
+            log_event('inventory', node=node.name, stage='read')
+            inventory = await asyncio.to_thread(node.get_all_torrents_info)
+            if not isinstance(inventory, list):
+                log_event('inventory', node=node.name, reason='inventory_unavailable')
+                continue
+            completed = {str(t.get('hash', '')).lower() for t in inventory
+                         if t.get('progress') == 1 and t.get('amount_left') == 0}
+            log_event('inventory', node=node.name, total=len(inventory), completed=len(completed))
+            for record in data['site_records'].values():
+                if stopping():
+                    status = 'stopped'
+                    return
+                source_hash = record.get('infohash')
+                if record['site'] != 'BEARBIT' or source_hash not in completed: continue
+                url = 'https://bearbit.org/details.php?id=' + record['torrent_id']
+                for zone in zones:
+                    if stopping():
+                        status = 'stopped'
+                        return
+                    pending = {r.get('target_site') for r in configured if r.get('source_zone') == zone
+                               and (source_hash, r.get('target_site')) not in existing}
+                    if not pending: continue
+                    cache_key = (source_hash, record['torrent_id'], zone)
+                    if cache_key in source_errors:
+                        skipped['source_already_checked'] += 1
+                        continue
+                    try:
+                        log_event('stage', node=node.name, source_hash=source_hash, stage='read_source_' + zone)
+                        client = client_for(app, node)
+                        source_adapter = await session.adapter('BEARBIT')
+                        if cache_key not in source_cache:
+                            metadata, content = await source_adapter.read_source(url, source_hash, zone)
+                            source_cache[cache_key] = (deepcopy(metadata), content)
+                        metadata, content = source_cache[cache_key]
+                        metadata = deepcopy(metadata)
+                        rules = select_rules(cfg.get('rules', []), metadata)
+                    except Exception as exc:
+                        if isinstance(exc, UploadBlocked) and str(exc) in (
+                                'Source category is not present in this BearBit zone',
+                                'An explicit category rule is required for this BearBit category'):
+                            source_errors.add(cache_key)
+                        log_event('source_error', node=node.name, source_hash=source_hash,
+                                  reason=safe_error(exc), error_type=type(exc).__name__)
+                        continue
+                    for rule in rules:
+                        if stopping():
+                            status = 'stopped'
+                            return
+                        pair = (source_hash, rule['target_site'])
+                        if pair in existing: continue
+                        try:
+                            job = await _prepare_destination(app, session, client, source_hash, metadata, content, rule)
+                        except Exception as exc:
+                            log_event('source_error', node=node.name, source_hash=source_hash, site=rule['target_site'],
+                                      stage='prepare_destination', reason=safe_error(exc), error_type=type(exc).__name__)
+                            continue
+                        discovered += 1
+                        existing.add(pair)
+                        yield job, node
+
+    async def discover_one():
+        try:
+            job, node = await discovery.__anext__()
+        except StopAsyncIteration:
+            return False
+        await process_job(job, node, newly_prepared=True)
+        return True
+
     try:
         if stopping():
             status = 'stopped'
             return outcomes
-        jobs = list(ledger.store.read()['upload_jobs'].values())
+        jobs = schedule.ordered(list(ledger.store.read()['upload_jobs'].values()))
         queued = len(jobs)
         log_event('queue', queued=queued, counts=dict(Counter(job['state'] for job in jobs)))
+        discovery = discover_jobs()
+        if schedule.discovery_first and jobs:
+            reserved_discovery = await discover_one()
         # Ambiguous publication/in-flight adds stay held. Uncertain seed jobs
         # can only recover an existing verified target; they never repeat add.
         for job in jobs:
@@ -277,84 +366,14 @@ async def run_cycle(app, active_nodes):
             if not enabled_rule(cfg, job):
                 skip(job, 'rule_disabled_or_changed')
                 continue
+            schedule.attempted(job)
             await process_job(job, node)
         if at_limit(): return outcomes
         if stopping():
             status = 'stopped'
             return outcomes
-        # Queue only completed hashes linked to BearBit by verified site_records.
-        data = ledger.store.read()
-        existing = {(j['source_hash'], j['target_site']) for j in data['upload_jobs'].values()}
-        configured = [r for r in cfg.get('rules', []) if isinstance(r, dict) and r.get('enable') is True]
-        zones = sorted({r.get('source_zone') for r in configured if r.get('source_zone') in ('normal', 'special')})
-        for node in nodes.values():
-            if stopping():
-                status = 'stopped'
-                return outcomes
-            if app.CLIENTS.adapter_for(node).upload_factory is None:
-                log_event('inventory', node=node.name, reason='client_unsupported')
-                continue
-            log_event('inventory', node=node.name, stage='read')
-            inventory = await asyncio.to_thread(node.get_all_torrents_info)
-            if not isinstance(inventory, list):
-                log_event('inventory', node=node.name, reason='inventory_unavailable')
-                continue
-            completed = {str(t.get('hash', '')).lower() for t in inventory
-                         if t.get('progress') == 1 and t.get('amount_left') == 0}
-            log_event('inventory', node=node.name, total=len(inventory), completed=len(completed))
-            for record in data['site_records'].values():
-                if stopping():
-                    status = 'stopped'
-                    return outcomes
-                source_hash = record.get('infohash')
-                if record['site'] != 'BEARBIT' or source_hash not in completed: continue
-                url = 'https://bearbit.org/details.php?id=' + record['torrent_id']
-                for zone in zones:
-                    if stopping():
-                        status = 'stopped'
-                        return outcomes
-                    pending = {r.get('target_site') for r in configured if r.get('source_zone') == zone
-                               and (source_hash, r.get('target_site')) not in existing}
-                    if not pending: continue
-                    cache_key = (source_hash, record['torrent_id'], zone)
-                    if cache_key in source_errors:
-                        skipped['source_already_checked'] += 1
-                        continue
-                    try:
-                        log_event('stage', node=node.name, source_hash=source_hash, stage='read_source_' + zone)
-                        client = client_for(app, node)
-                        source_adapter = await session.adapter('BEARBIT')
-                        if cache_key not in source_cache:
-                            metadata, content = await source_adapter.read_source(url, source_hash, zone)
-                            source_cache[cache_key] = (deepcopy(metadata), content)
-                        metadata, content = source_cache[cache_key]
-                        metadata = deepcopy(metadata)
-                        rules = select_rules(cfg.get('rules', []), metadata)
-                    except Exception as exc:
-                        if isinstance(exc, UploadBlocked) and str(exc) in (
-                                'Source category is not present in this BearBit zone',
-                                'An explicit category rule is required for this BearBit category'):
-                            source_errors.add(cache_key)
-                        log_event('source_error', node=node.name, source_hash=source_hash,
-                                  reason=safe_error(exc), error_type=type(exc).__name__)
-                        continue
-                    for rule in rules:
-                        if stopping():
-                            status = 'stopped'
-                            return outcomes
-                        pair = (source_hash, rule['target_site'])
-                        if pair in existing: continue
-                        try:
-                            job = await _prepare_destination(app, session, client, source_hash, metadata, content, rule)
-                        except Exception as exc:
-                            log_event('source_error', node=node.name, source_hash=source_hash, site=rule['target_site'],
-                                      stage='prepare_destination', reason=safe_error(exc), error_type=type(exc).__name__)
-                            continue
-                        discovered += 1
-                        existing.add(pair)
-                        await process_job(job, node, newly_prepared=True)
-                        if at_limit(): return outcomes
-                if at_limit(): return outcomes
+        while not at_limit() and await discover_one():
+            pass
         return outcomes
     except BaseException as exc:
         status = 'failed'
@@ -363,9 +382,20 @@ async def run_cycle(app, active_nodes):
     finally:
         try:
             try:
+                if discovery is not None:
+                    await discovery.aclose()
                 await session.close()
+            except BaseException:
+                status = 'failed'
+                raise
             finally:
-                await notices.flush()
+                try:
+                    if status == 'completed':
+                        schedule.finish(len(outcomes) >= limit and not (limit == 1 and reserved_discovery))
+                finally:
+                    notices.record_summary(processed=len(outcomes), discovered=discovered,
+                                           skipped=dict(skipped), status=status)
+                    await notices.flush()
         except BaseException as exc:
             status = 'failed'
             log_event('cycle_error', stage='cleanup', error_type=type(exc).__name__)

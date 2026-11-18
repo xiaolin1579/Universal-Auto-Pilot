@@ -19,6 +19,7 @@ EVENTS = {
     'inventory': 'ตรวจรายการต้นทาง', 'source_error': 'ต้นทางยังไม่พร้อม',
     'prepare_result': 'ผลเตรียมงาน', 'duplicate_result': 'ผลค้นหาซ้ำ',
     'category_result': 'ผลตรวจหมวดหมู่',
+    'notice_queued': 'รอส่งแจ้งเตือน', 'notice_result': 'ผลส่งแจ้งเตือน',
     'state_change': 'สถานะงาน', 'recheck_wait': 'รอผลตรวจไฟล์',
     'repack_status': 'สถานะตัวสร้าง torrent', 'repack_start': 'สั่งสร้าง torrent ใหม่',
     'repack_ready': 'ตรวจ torrent ใหม่ผ่าน',

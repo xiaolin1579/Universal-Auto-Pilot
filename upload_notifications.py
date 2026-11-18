@@ -1,10 +1,13 @@
 """Durable, coalesced upload notices sent through the application's notifier."""
 import hashlib
+from collections import Counter
+from datetime import datetime, timedelta
 from html import escape
 import re
 
 from auto_upload import UploadBlocked
-from torrent_store import stamp
+from torrent_store import stamp, utcnow
+from upload_logging import log_event, THAI_TIME
 
 
 def safe_error(error, job=None):
@@ -102,6 +105,10 @@ class UploadNotifications:
     def __init__(self, app, ledger):
         self.app, self.ledger = app, ledger
 
+    def summary_interval(self):
+        interval = self.app.CFG.get('AUTO_UPLOAD', {}).get('summary_interval_seconds', 3600)
+        return interval if type(interval) is int and interval >= 0 else 3600
+
     def record(self, job, error=None):
         """Keep only the latest notice per job; a notice never changes job state."""
         try:
@@ -127,8 +134,56 @@ class UploadNotifications:
                 else:
                     note['pending'] = {'fingerprint': fingerprint, 'message': message, 'queued_at': stamp()}
             self.ledger.store.update(update)
+            log_event('notice_queued', job, mode='job')
         except Exception as exc:
             print('[Auto Upload Notify] Queue failed:', type(exc).__name__)
+
+    def record_summary(self, *, processed, discovered, skipped, status):
+        """Remind about a held queue at most once per interval, across restarts."""
+        try:
+            interval = self.summary_interval()
+            now = utcnow()
+            def update(data):
+                jobs = [j for j in data['upload_jobs'].values() if j['state'] not in ('seeding', 'cancelled')]
+                note = data.setdefault('auto_upload_runtime', {}).setdefault('notifications', {})
+                if not jobs or interval == 0:
+                    note.pop('pending', None)
+                    return
+                try:
+                    sent = datetime.fromisoformat(note['sent_at'])
+                    due = now - sent >= timedelta(seconds=interval)
+                except (KeyError, TypeError, ValueError):
+                    due = True
+                if not due and not note.get('pending'):
+                    return
+                counts = Counter(j['state'] for j in jobs)
+                reasons = Counter()
+                for job in jobs:
+                    readiness = job.get('readiness', {})
+                    if any(readiness.get(k) for k in ('missing_fields', 'invalid_fields', 'unknown_fields', 'missing_confirmations')):
+                        reasons['ข้อมูลฟอร์มยังไม่ครบ/ไม่ถูกต้อง'] += 1
+                    if job.get('category_review', {}).get('issues'):
+                        reasons['หมวดหมู่ต้องตรวจสอบ'] += 1
+                    if job.get('duplicate_check', {}).get('status') in ('unknown', 'duplicate', 'possible_duplicate'):
+                        reasons['การตรวจงานซ้ำยังไม่ผ่าน'] += 1
+                    if job.get('publication_retry', {}).get('manual_publish_required') is True:
+                        reasons['รอคำสั่ง publish'] += 1
+                lines = ['<b>📋 Auto Upload: สรุปคิวงาน</b>',
+                         'รอบล่าสุด: ' + now.astimezone(THAI_TIME).strftime('%d/%m/%Y %H:%M'),
+                         'ผลรอบ: ' + _text(status, 40),
+                         f'ประมวลผล {processed} งาน | พบงานใหม่ {discovered} งาน',
+                         f'ค้าง {len(jobs)} งาน: ' + ', '.join(_text(k, 40) + f' {v}' for k, v in sorted(counts.items()))]
+                lines.extend(f'• {reason}: {count} งาน' for reason, count in reasons.items())
+                unavailable = skipped.get('source_node_unavailable', 0)
+                if unavailable:
+                    lines.append(f'• โหนดต้นทางไม่พร้อมในรอบนี้: {unavailable} งาน')
+                lines.append('แต่ละงานอาจติดหลายเงื่อนไข; ยังไม่ส่งงานที่ตรวจไม่ผ่าน')
+                message = '\n'.join(lines)
+                note['pending'] = {'fingerprint': hashlib.sha256(message.encode()).hexdigest(),
+                                   'message': message, 'queued_at': stamp(now)}
+            self.ledger.store.update(update)
+        except Exception as exc:
+            print('[Auto Upload Notify] Summary failed:', type(exc).__name__)
 
     async def flush(self):
         """Retry pending notices once per cycle, including terminal/uncertain jobs."""
@@ -143,6 +198,7 @@ class UploadNotifications:
                     continue
                 try:
                     if await sender(pending['message']) is not True:
+                        log_event('notice_result', job, mode='job', status='not_delivered')
                         continue
                     def delivered(data):
                         note = data['upload_jobs'][job['id']].setdefault('notifications', {})
@@ -150,7 +206,23 @@ class UploadNotifications:
                         if note.get('pending', {}).get('fingerprint') == pending['fingerprint']:
                             note.pop('pending', None)
                     self.ledger.store.update(delivered)
+                    log_event('notice_result', job, mode='job', status='delivered')
                 except Exception as exc:
                     print('[Auto Upload Notify] Delivery failed:', type(exc).__name__)
+            pending = self.ledger.store.read().get('auto_upload_runtime', {}).get('notifications', {}).get('pending')
+            if pending and self.summary_interval() != 0:
+                try:
+                    if await sender(pending['message']) is True:
+                        def delivered_summary(data):
+                            note = data['auto_upload_runtime']['notifications']
+                            note.update(last_sent=pending['fingerprint'], sent_at=stamp())
+                            if note.get('pending', {}).get('fingerprint') == pending['fingerprint']:
+                                note.pop('pending', None)
+                        self.ledger.store.update(delivered_summary)
+                        log_event('notice_result', mode='summary', status='delivered')
+                    else:
+                        log_event('notice_result', mode='summary', status='not_delivered')
+                except Exception as exc:
+                    print('[Auto Upload Notify] Summary delivery failed:', type(exc).__name__)
         except Exception as exc:
             print('[Auto Upload Notify] Pending notices unavailable:', type(exc).__name__)
