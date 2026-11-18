@@ -218,7 +218,7 @@ async def run_cycle(app, active_nodes):
                 if not stopping():
                     acted = True
                     job = await worker.verify_publication(job['id'], adapter)
-            if job['state'] in ('verified', 'rechecking') and cfg.get('enable_seed') is True and not stopping():
+            if job['state'] in ('verified', 'rechecking', 'seed_uncertain') and cfg.get('enable_seed') is True and not stopping():
                 log_event('job_start', job, stage='seed')
                 acted = True
                 job = await asyncio.to_thread(worker.seed, job['id'], client, cfg.get('enable_resume') is True,
@@ -229,7 +229,7 @@ async def run_cycle(app, active_nodes):
                 outcomes.append({'id': job['id'], 'state': job['state']})
                 log_event('job_result', job, elapsed_seconds=round(monotonic()-job_started, 2))
             elif not stopping():
-                skip(job, 'seed_disabled' if job['state'] in ('verified', 'rechecking') else 'publish_disabled')
+                skip(job, 'seed_disabled' if job['state'] in ('verified', 'rechecking', 'seed_uncertain') else 'publish_disabled')
         except Exception as exc:
             current = ledger.get(job['id'])
             reason = safe_error(exc, current)
@@ -248,14 +248,15 @@ async def run_cycle(app, active_nodes):
         jobs = list(ledger.store.read()['upload_jobs'].values())
         queued = len(jobs)
         log_event('queue', queued=queued, counts=dict(Counter(job['state'] for job in jobs)))
-        # Continue durable jobs first. Ambiguous POST/add states never auto-retry.
+        # Ambiguous publication/in-flight adds stay held. Uncertain seed jobs
+        # can only recover an existing verified target; they never repeat add.
         for job in jobs:
             if stopping():
                 status = 'stopped'
                 return outcomes
             if at_limit(): return outcomes
             considered += 1
-            if job['state'] in ('publication_uncertain', 'submitting', 'adding', 'seed_uncertain'):
+            if job['state'] in ('publication_uncertain', 'submitting', 'adding'):
                 skip(job, 'reconciliation_required')
                 notices.record(job)
                 continue

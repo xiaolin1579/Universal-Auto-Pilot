@@ -320,7 +320,7 @@ class UploadLedger:
             'id', 'state', 'source_hash', 'source_site', 'source_zone', 'source_node',
             'target_site', 'target_zone', 'target_category', 'content_group_id', 'prepared_hash',
             'metadata', 'rule', 'readiness', 'form_schema', 'duplicate_check',
-            'source_verified_at', 'field_overrides', 'created_at', 'updated_at', 'target_hash', 'listing',
+            'source_verified_at', 'field_overrides', 'created_at', 'updated_at', 'target_hash', 'listing', 'seed_recovery',
             'notifications', 'submission_started_at', 'last_publication_failure',
             'publication_history', 'publication_retry', 'publication_retry_check',
             'submission_signature', 'metainfo_preflight', 'duplicate_resolution',
@@ -714,6 +714,22 @@ class UploadWorker:
             self.ledger.transition(key, {'published', 'verification_failed'}, 'verification_failed')
             raise
 
+    def _seed_artifacts(self, job, client):
+        if job['source_node'] != client.name:
+            raise UploadBlocked('Cross-seed must use the verified source client and save path')
+        source = Path(job['source_artifact']).read_bytes()
+        live = client.inventory(job['source_hash'])
+        if live.get('save_path') != job['save_path']:
+            raise UploadBlocked('Source save path changed')
+        verify_completed(source, live, client.files(job['source_hash']))
+        if payload_signature(source) != job['content_group_id']:
+            raise UploadBlocked('Source payload no longer matches the seed job')
+        content = Path(job['canonical_artifact']).read_bytes()
+        if (_extract_torrent_info_hash(content) != job['target_hash']
+                or payload_signature(content) != publication_signature(job)):
+            raise UploadBlocked('Canonical artifact changed')
+        return content
+
     def seed(self, key, client, resume=False, *, wait_seconds=0, stopped=lambda: False):
         if type(wait_seconds) is not int or not 0 <= wait_seconds <= 1800:
             raise UploadBlocked('Recheck wait must be an integer from 0 to 1800 seconds')
@@ -721,34 +737,32 @@ class UploadWorker:
         if stopped(): return job
         if job['source_node'] != client.name:
             raise UploadBlocked('Cross-seed must use the verified source client and save path')
+        if job['state'] == 'seed_uncertain':
+            job = self.reconcile_seed(key, client, automatic=True, stopped=stopped)
+            if wait_seconds == 0 or not resume: return job
         if job['state'] == 'verified':
             log_event('stage', job, stage='check_source_before_seed')
-            live = client.inventory(job['source_hash'])
-            if live.get('save_path') != job['save_path']:
-                raise UploadBlocked('Source save path changed')
-            verify_completed(Path(job['source_artifact']).read_bytes(), live, client.files(job['source_hash']))
-            content = Path(job['canonical_artifact']).read_bytes()
-            if (_extract_torrent_info_hash(content) != job['target_hash']
-                    or payload_signature(content) != publication_signature(job)):
-                raise UploadBlocked('Canonical artifact changed')
+            content = self._seed_artifacts(job, client)
             if stopped(): return self.ledger.get(key)
-            # Persist before client mutation: never blindly retry an interrupted add.
-            self.ledger.transition(key, {'verified'}, 'adding')
-            log_event('state_change', job, state='adding', stage='add_paused')
-            try:
-                if client.inventory(job['target_hash'], missing_ok=True) is not None:
-                    raise UploadBlocked('Target hash already exists; reconcile it explicitly')
-                if not client.add_paused(content, job):
-                    raise RuntimeError('Paused add not confirmed')
-                log_event('stage', job, stage='request_recheck', target_hash=job['target_hash'])
-                observed = request_recheck(client, job['target_hash'])
-                self.ledger.transition(key, {'adding'}, 'rechecking', recheck_requested_at=stamp(), recheck_observed=observed)
-                log_event('state_change', job, state='rechecking', target_hash=job['target_hash'])
-                # Observe checking and a completed state before any resume.
-            except BaseException as exc:
-                log_event('job_error', job, state='seed_uncertain', stage='add_or_recheck', error_type=type(exc).__name__)
-                self.ledger.transition(key, {'adding'}, 'seed_uncertain')
-                raise
+            if client.inventory(job['target_hash'], missing_ok=True) is not None:
+                job = self.reconcile_seed(key, client, automatic=True, stopped=stopped)
+            else:
+                if stopped(): return self.ledger.get(key)
+                # Persist before client mutation: never blindly retry an interrupted add.
+                self.ledger.transition(key, {'verified'}, 'adding')
+                log_event('state_change', job, state='adding', stage='add_paused')
+                try:
+                    if not client.add_paused(content, job):
+                        raise RuntimeError('Paused add not confirmed')
+                    log_event('stage', job, stage='request_recheck', target_hash=job['target_hash'])
+                    observed = request_recheck(client, job['target_hash'])
+                    self.ledger.transition(key, {'adding'}, 'rechecking', recheck_requested_at=stamp(), recheck_observed=observed)
+                    log_event('state_change', job, state='rechecking', target_hash=job['target_hash'])
+                    # Observe checking and a completed state before any resume.
+                except BaseException as exc:
+                    log_event('job_error', job, state='seed_uncertain', stage='add_or_recheck', error_type=type(exc).__name__)
+                    self.ledger.transition(key, {'adding'}, 'seed_uncertain')
+                    raise
             job = self.ledger.get(key)
             if wait_seconds == 0 or not resume: return job
         if job['state'] != 'rechecking':
@@ -816,24 +830,47 @@ class UploadWorker:
         log_event('state_change', result, target_hash=job['target_hash'])
         return result
 
-    def reconcile_seed(self, key, client):
+    def reconcile_seed(self, key, client, *, automatic=False, stopped=lambda: False):
         job = self.ledger.get(key)
-        if job['state'] in ('verified', 'rechecking'):
+        if not automatic and job['state'] in ('verified', 'rechecking'):
             raise UploadBlocked('Job is ' + job['state'] + '; use seed ' + job['id']
                                 + '. reconcile-seed only recovers adding/seed_uncertain jobs')
-        if job['state'] not in ('adding', 'seed_uncertain') or client.name != job['source_node']:
+        allowed = ('verified', 'seed_uncertain') if automatic else ('adding', 'seed_uncertain')
+        if job['state'] not in allowed or client.name != job['source_node']:
             raise UploadBlocked('Only an uncertain add on its source client can be reconciled')
+        if stopped(): return job
         log_event('stage', job, stage='reconcile_seed')
-        row = client.inventory(job['target_hash'])
+        content = self._seed_artifacts(job, client)
+        row = client.inventory(job['target_hash'], missing_ok=True)
+        if row is None:
+            raise UploadBlocked('Target hash is absent; refusing another add for an uncertain seed job')
+        if infohash(row.get('hash')) != job['target_hash']:
+            raise UploadBlocked('Existing target hash differs from the canonical torrent')
         if row.get('save_path') != job['save_path']:
             raise UploadBlocked('Existing target save path differs from the verified source')
+        is_stopped = (str(row.get('state', '')).lower() in ('pausedup', 'pauseddl', 'stoppedup', 'stoppeddl')
+                      or row.get('paused') is True
+                      or (type(row.get('rt_state')) is int and row['rt_state'] == 0
+                          and type(row.get('rt_active')) is int and row['rt_active'] == 0))
+        if automatic and not is_stopped:
+            raise UploadBlocked('Existing target is not stopped; reconcile it explicitly')
         from torrent_metainfo import _extract_torrent_manifest
-        m = _extract_torrent_manifest(Path(job['canonical_artifact']).read_bytes())
+        m = _extract_torrent_manifest(content)
         expected = [(m['root_name'] + '/' + f['path'] if m['multi_file'] else f['path'], f['size_bytes']) for f in m['files']]
         ordinary = [(m['root_name'] + '/' + f['path'] if m['multi_file'] else f['path'], f['size_bytes'])
                     for f in m['files'] if not f.get('is_padding')]
         if sorted((f['path'], f['size_bytes']) for f in client.files(job['target_hash'])) not in (sorted(expected), sorted(ordinary)):
             raise UploadBlocked('Existing target manifest differs from canonical torrent')
-        observed = request_recheck(client, job['target_hash'])
-        return self.ledger.transition(key, {'adding', 'seed_uncertain'}, 'rechecking',
-                                      recheck_requested_at=stamp(), recheck_observed=observed)
+        if stopped(): return self.ledger.get(key)
+        # Claim before rechecking an existing target. Never send another add.
+        self.ledger.transition(key, {job['state']}, 'adding',
+                               seed_recovery={'method': 'existing_client_torrent', 'checked_at': stamp()})
+        try:
+            observed = request_recheck(client, job['target_hash'])
+            result = self.ledger.transition(key, {'adding'}, 'rechecking',
+                                           recheck_requested_at=stamp(), recheck_observed=observed)
+        except BaseException:
+            self.ledger.transition(key, {'adding'}, 'seed_uncertain')
+            raise
+        log_event('state_change', result, stage='existing_target_rechecked', target_hash=result['target_hash'])
+        return result
