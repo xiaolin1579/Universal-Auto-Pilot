@@ -169,6 +169,37 @@ class MappingStore:
                     or not re.fullmatch(r'[0-9a-f]{64}', classification['job_fingerprint'])):
                 raise ValueError('Invalid classification suggestions')
             signature = job.get('submission_signature')
+            retention = job.get('retention_check')
+            if retention is not None:
+                if (not isinstance(retention, dict) or retention.get('version') != 1
+                        or retention.get('job_id') != key or retention.get('target_hash') != job.get('target_hash')
+                        or retention.get('site') != job.get('target_site')
+                        or retention.get('torrent_id') != (job.get('listing') or {}).get('torrent_id')
+                        or retention.get('status') not in ('checking', 'ready', 'held', 'failed')
+                        or retention.get('reason') not in ('checking', 'ready', 'other_seeders_required',
+                            'completed_required', 'peer_identity_unverified', 'canonical_hash_mismatch',
+                            'unsupported_site', 'page_unverified', 'fetch_failed')
+                        or retention.get('method') != 'authenticated_listing_and_peers'
+                        or not isinstance(retention.get('checked_at'), str)
+                        or not isinstance(retention.get('expires_at'), str)
+                        or type(retention.get('own_peers_excluded')) is not bool
+                        or type(retention.get('canonical_hash_verified')) is not bool
+                        or any(v is not None and (type(v) is not int or v < 0)
+                               for v in (retention.get('other_seeders'), retention.get('completed')))):
+                    raise ValueError('Invalid Auto Upload retention evidence')
+                try:
+                    duration = (datetime.fromisoformat(retention['expires_at'])
+                                - datetime.fromisoformat(retention['checked_at'])).total_seconds()
+                except (TypeError, ValueError):
+                    raise ValueError('Invalid Auto Upload retention lifetime') from None
+                if not 0 < duration <= 300:
+                    raise ValueError('Invalid Auto Upload retention lifetime')
+                if retention['status'] == 'ready' and (
+                        retention.get('own_peers_excluded') is not True
+                        or retention.get('canonical_hash_verified') is not True
+                        or type(retention.get('other_seeders')) is not int or retention['other_seeders'] < 1
+                        or type(retention.get('completed')) is not int or retention['completed'] < 1):
+                    raise ValueError('Incomplete Auto Upload retention evidence')
             resolution = job.get('duplicate_resolution')
             if resolution is not None and (not isinstance(resolution, dict)
                     or resolution.get('method') != 'existing_destination_torrent'
@@ -513,6 +544,35 @@ class MappingStore:
             record.update(manual_hold=enabled, manual_hold_reason=str(reason),
                           manual_hold_updated_at=stamp())
         self.update(apply)
+
+    def record_upload_retention(self, key, expected, observation):
+        """A peer observation never changes publication, seed state or manual holds."""
+        def apply(data):
+            current = data['upload_jobs'][key]
+            if any(current.get(k) != expected.get(k) for k in ('state', 'target_hash', 'listing', 'target_site')):
+                raise ValueError('Upload job changed during peer verification')
+            current['retention_check'] = deepcopy(observation)
+        self.update(apply)
+
+    def upload_retention_status(self, torrent_hash):
+        target = infohash(torrent_hash)
+        if not target: return False, 'AUTO_UPLOAD_PEERS_UNVERIFIED'
+        jobs = [j for j in self.read()['upload_jobs'].values() if j.get('target_hash') == target]
+        reasons = {'other_seeders_required': 'AUTO_UPLOAD_OTHER_SEEDERS_REQUIRED',
+                   'completed_required': 'AUTO_UPLOAD_COMPLETED_REQUIRED',
+                   'peer_identity_unverified': 'AUTO_UPLOAD_PEER_IDENTITY_UNVERIFIED',
+                   'canonical_hash_mismatch': 'AUTO_UPLOAD_PEERS_HASH_MISMATCH'}
+        for job in jobs:
+            proof = job.get('retention_check')
+            if not isinstance(proof, dict): return False, 'AUTO_UPLOAD_PEERS_UNVERIFIED'
+            if not fresh(proof): return False, 'AUTO_UPLOAD_PEERS_STALE'
+            if proof.get('status') != 'ready':
+                return False, reasons.get(proof.get('reason'), 'AUTO_UPLOAD_PEERS_UNVERIFIED')
+            if (proof.get('own_peers_excluded') is not True or proof.get('canonical_hash_verified') is not True
+                    or type(proof.get('other_seeders')) is not int or proof['other_seeders'] < 1
+                    or type(proof.get('completed')) is not int or proof['completed'] < 1):
+                return False, 'AUTO_UPLOAD_PEERS_UNVERIFIED'
+        return True, 'AUTO_UPLOAD_RETENTION_READY' if jobs else 'NOT_AUTO_UPLOAD'
 
     def protection_status(self, torrent_hash, required_sites=(), *, policy_sites=()):
         target = infohash(torrent_hash)

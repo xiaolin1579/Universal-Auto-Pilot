@@ -5633,6 +5633,10 @@ class NodeCleaner:
         if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", target):
             return False, "INVALID_HASH", None, []
 
+        allowed, retention_reason = _mapping_store().upload_retention_status(target)
+        if not allowed:
+            return False, retention_reason, None, []
+
         # 1. Verify fresh live inventory through the client's native API.
         adapter = CLIENTS.adapter_for(self.node)
         native_snapshot = adapter.purge_reader is not None
@@ -13397,6 +13401,10 @@ async def main():
             # including Cross-Seed cycles that skip maintenance actions.
             from cleaner_obligations import refresh_before_cleaner
             await refresh_before_cleaner(sys.modules[__name__])
+            from auto_upload_retention import refresh_upload_retention
+            await refresh_upload_retention(sys.modules[__name__])
+            if stop_event.is_set():
+                break
 
             # =================================================================
             # 1. NODE SECTION (Checking & Cleanup & Update Trackers)

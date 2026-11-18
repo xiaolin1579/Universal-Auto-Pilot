@@ -323,7 +323,7 @@ class UploadLedger:
             'notifications', 'submission_started_at', 'last_publication_failure',
             'publication_history', 'publication_retry', 'publication_retry_check',
             'submission_signature', 'metainfo_preflight', 'duplicate_resolution',
-            'category_review', 'category_corrections', 'category_auto_fields') if k in job}
+            'category_review', 'category_corrections', 'category_auto_fields', 'retention_check') if k in job}
         if job.get('repack'):
             public['repack'] = {k: deepcopy(job['repack'][k]) for k in (
                 'provider', 'source_hash', 'candidate_hash', 'candidate_signature', 'checked_at')}
