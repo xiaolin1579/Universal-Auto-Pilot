@@ -125,6 +125,9 @@ def upload_filename(job):
 ROUTES = UPLOAD_TARGETS
 PUBLISH_CONFIRMATIONS = {'DEDBIT': {'ack2', 'ack4'}, 'BITSUSE': {'ack2'},
                          'TORRENTDD': {'cf1', 'cf2'}}
+# Read-only lookups for a listing that appeared after a POST. They never rearm
+# or repeat publication; an operator must still explicitly confirm a resend.
+MAX_PUBLICATION_RECONCILIATIONS = 6
 
 
 def duplicate_block_reason(evidence, site):
@@ -303,7 +306,7 @@ class UploadLedger:
                     job['state'] = 'prepared' if job['readiness']['ready'] else 'draft'
                 job['created_at'] = old['created_at']
                 job['prepare_revision'] = old.get('prepare_revision', 1) + 1
-                for field in ('publication_history', 'publication_retry', 'publication_retry_check'):
+                for field in ('publication_history', 'publication_retry', 'publication_retry_check', 'publication_check'):
                     if field in old:
                         job[field] = deepcopy(old[field])
             if any(j['id'] != key and j['source_hash'] == job['source_hash'] and j['target_site'] == job['target_site']
@@ -333,7 +336,7 @@ class UploadLedger:
             'metadata', 'rule', 'readiness', 'form_schema', 'duplicate_check',
             'source_verified_at', 'field_overrides', 'created_at', 'updated_at', 'target_hash', 'listing', 'seed_recovery',
             'notifications', 'submission_started_at', 'last_publication_failure',
-            'publication_history', 'publication_retry', 'publication_retry_check',
+            'publication_history', 'publication_retry', 'publication_retry_check', 'publication_check',
             'submission_signature', 'metainfo_preflight', 'duplicate_resolution',
             'category_review', 'category_corrections', 'category_auto_fields', 'retention_check') if k in job}
         if job.get('repack'):
@@ -477,6 +480,23 @@ class UploadLedger:
                                        'manual_publish_required': True})
                 for field in ('submission_started_at', 'submission_signature', 'last_publication_failure', 'last_submission_failure'):
                     current.pop(field, None)
+            current['updated_at'] = checked_at
+            return deepcopy(current)
+        return self.store.update(apply)
+
+    def record_publication_check(self, key, expected, found):
+        """Count bounded, read-only attempts to find a listing from an earlier POST."""
+        def apply(data):
+            current = data['upload_jobs'][key]
+            if (current['state'] != 'publication_uncertain' or current.get('listing') or current.get('target_hash')
+                    or current.get('updated_at') != expected.get('updated_at')
+                    or not self.same_configuration(current, expected)):
+                raise UploadBlocked('Uncertain job changed while checking its publication; inspect it again')
+            checked_at = stamp()
+            previous = current.get('publication_check') or {}
+            attempts = previous.get('attempts') if type(previous.get('attempts')) is int else 0
+            current['publication_check'] = {'attempts': attempts + 1, 'found': found is True,
+                                            'checked_at': checked_at}
             current['updated_at'] = checked_at
             return deepcopy(current)
         return self.store.update(apply)
@@ -642,6 +662,23 @@ class UploadWorker:
         if evidence.get('status') != 'clear' or evidence.get('complete') is not True:
             raise UploadBlocked(duplicate_block_reason(evidence, job['target_site']))
         return result
+
+    async def reconcile_publication(self, key, adapter):
+        """Recover a late-appearing listing after an uncertain POST without posting again."""
+        job = self.ledger.get(key)
+        if (job['state'] != 'publication_uncertain' or job.get('listing') or job.get('target_hash')):
+            raise UploadBlocked('Only an uncertain publication without a recorded listing can be reconciled')
+        check = job.get('publication_check') or {}
+        attempts = check.get('attempts') if type(check.get('attempts')) is int else 0
+        if attempts >= MAX_PUBLICATION_RECONCILIATIONS:
+            raise UploadBlocked('Automatic publication checks are exhausted; inspect the destination manually')
+        listing = await adapter.resolve_publication(job)
+        self.ledger.record_publication_check(key, job, bool(listing))
+        if not listing:
+            raise UploadBlocked('Publication result is still unconfirmed; no POST was repeated')
+        log_event('state_change', job, stage='publication_reconciled', listing_id=listing.get('torrent_id'))
+        self.ledger.record_publication(key, listing)
+        return await self.verify_publication(key, adapter)
 
     async def publish(self, key, adapter, client, *, allow_manual_retry=False):
         job = self.ledger.get(key)

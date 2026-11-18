@@ -656,6 +656,11 @@ class BrowserSite:
                     # An unknown server failure does not prove the POST had no side effects.
                     # Keep the job uncertain until its destination listing is checked.
                     raise UploadBlocked('Destination returned Upload failed; inspect the destination before retrying')
+            if self.site == 'BITSUSE' and urlsplit(current).path == '/bs_browse.php':
+                # Bitsuse reports a successful POST by returning to browse. Do not
+                # spend the remaining wait budget on a page that cannot carry a
+                # listing identity; resolve it below with read-only searches.
+                break
             try:
                 listing = listing_identity(self.site, current)
                 authenticated(BeautifulSoup(await self.tab.get_content(), 'html.parser'), self.site, current)
@@ -663,7 +668,12 @@ class BrowserSite:
             except ValueError: pass
         if self.site == 'BITSUSE' and urlsplit(current).path == '/bs_browse.php':
             self._publication_context['stage'] = 'resolve_listing'
-            listing = await self.resolve_publication(job)
-            if listing:
-                return listing
+            # A freshly published listing is not always searchable immediately.
+            # Retry only authenticated reads; never repeat the POST.
+            for delay in (0, 5, 15, 30):
+                if delay:
+                    await asyncio.sleep(delay)
+                listing = await self.resolve_publication(job)
+                if listing:
+                    return listing
         raise UploadBlocked('Publication result unconfirmed; inspect the destination and reconcile without another POST')

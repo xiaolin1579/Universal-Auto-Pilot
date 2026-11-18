@@ -24,6 +24,22 @@ class UploadFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('secret', str(failure))
         self.assertNotIn('secret', str(result.exception))
 
+    async def test_bitsuse_browse_redirect_resolves_a_late_listing_without_reposting(self):
+        adapter = BrowserSite('BITSUSE', AsyncMock())
+        listing = {'torrent_id': '687121',
+                   'details_url': 'https://www.bitsuse.com/bs_details.php?id=687121'}
+        adapter.tab.evaluate.side_effect = [None, 'https://www.bitsuse.com/bs_browse.php']
+        adapter.resolve_publication = AsyncMock(side_effect=[None, listing])
+        with patch('upload_sites.asyncio.sleep', new=AsyncMock()) as sleep:
+            result = await adapter.submit({'id': 'a' * 64})
+        self.assertEqual(result, listing)
+        self.assertEqual(adapter.resolve_publication.await_count, 2)
+        self.assertEqual(adapter._publication_context['stage'], 'resolve_listing')
+        self.assertEqual(adapter._publication_context['page_path'], '/bs_browse.php')
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [1, 5])
+        adapter.tab.evaluate.assert_any_await(
+            "document.getElementById('frmupload').requestSubmit()")
+
     async def test_confirmed_title_limit_remains_explicit_rejection(self):
         error = known_upload_rejection(
             '<title>Upload failed!</title><h1>Upload failed!</h1>'

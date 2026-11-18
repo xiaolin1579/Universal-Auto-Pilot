@@ -88,7 +88,10 @@ def message_for(job, error=None):
         missing = [str(v) for key in ('missing_fields', 'invalid_fields', 'unknown_fields', 'missing_confirmations')
                    for v in readiness.get(key, [])]
         if missing:
-            field_labels = {'c100type': 'ประเภทเนื้อหา', 'c100type2': 'ประเภทย่อย', 'c100cat': 'ประเทศ/หมวด'} if job.get('target_site') == 'BITSUSE' else {}
+            field_labels = ({'c100type': 'ประเภทเนื้อหา', 'c100type2': 'ประเภทย่อย',
+                             'c100cat': 'ประเทศ/หมวด', 'c182cat': 'ประเทศ/หมวด',
+                             'c184cat': 'ประเทศ/หมวด', 'c184type': 'ประเภทภาพ'}
+                            if job.get('target_site') == 'BITSUSE' else {})
             names = [field_labels[name] + ' (' + name + ')' if name in field_labels else name for name in missing]
             lines.append('ข้อมูลที่ต้องตรวจ: ' + _text(', '.join(names)))
     url = _listing(job['target_site'], job.get('listing') or {})

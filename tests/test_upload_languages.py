@@ -90,9 +90,14 @@ class ArtistEvidenceTests(unittest.TestCase):
                 p.write_text(json.dumps({'records':[self.record(**extra)]}))
                 with self.subTest(extra=extra),self.assertRaises(ValueError):load_catalog_records(p)
 
-    def test_image_country_uses_explicit_source_category_only(self):
+    def test_image_country_uses_explicit_source_category_or_form_other_option(self):
         from test_upload_classifier import adult
         row=adult();row['form_schema']['fields']={'c184cat':{'options':['ไทย','ญี่ปุ่น','อื่นๆ']}}
         self.assertEqual(values(classify_job(row))['c184cat'],'ญี่ปุ่น')
         row['metadata']['category']='รูปภาพ'
+        report=classify_job(row)
+        self.assertEqual(values(report)['c184cat'],'อื่นๆ')
+        self.assertEqual(next(s for s in report['suggestions'] if s['field']=='c184cat')['reasons'],
+                         ['source_category_has_no_listed_country'])
+        row['rule']['fields']['c184cat']='ญี่ปุ่น'
         self.assertNotIn('c184cat',values(classify_job(row)))

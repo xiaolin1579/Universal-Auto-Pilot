@@ -8,7 +8,8 @@ from upload_logging import log_event
 import os
 from pathlib import Path
 from urllib.parse import urlsplit
-from auto_upload import UploadLedger, UploadWorker, select_rule, select_rules, PUBLISH_CONFIRMATIONS
+from auto_upload import (UploadLedger, UploadWorker, select_rule, select_rules, PUBLISH_CONFIRMATIONS,
+                         MAX_PUBLICATION_RECONCILIATIONS)
 from torrent_metainfo import verify_completed
 from upload_sites import BrowserSite
 from upload_notifications import UploadNotifications, safe_error
@@ -345,6 +346,28 @@ async def run_cycle(app, active_nodes):
                 return outcomes
             if at_limit(): return outcomes
             considered += 1
+            if (job['state'] == 'publication_uncertain' and not job.get('listing') and not job.get('target_hash')):
+                check = job.get('publication_check') or {}
+                attempts = check.get('attempts') if type(check.get('attempts')) is int else 0
+                if attempts < MAX_PUBLICATION_RECONCILIATIONS:
+                    schedule.attempted(job)
+                    reconcile_started = monotonic()
+                    acted = False
+                    try:
+                        log_event('job_start', job, stage='reconcile_publication')
+                        adapter = await session.adapter(job['target_site'])
+                        job = await worker.reconcile_publication(job['id'], adapter)
+                        acted = True
+                    except Exception as exc:
+                        reason = safe_error(exc, ledger.get(job['id']))
+                        log_event('job_error', ledger.get(job['id']), stage='reconcile_publication', reason=reason)
+                        notices.record(ledger.get(job['id']), reason)
+                        skip(job, 'reconciliation_required')
+                    if acted:
+                        notices.record(job)
+                        outcomes.append({'id': job['id'], 'state': job['state']})
+                        log_event('job_result', job, elapsed_seconds=round(monotonic() - reconcile_started, 2))
+                    continue
             if job['state'] in ('publication_uncertain', 'submitting', 'adding'):
                 skip(job, 'reconciliation_required')
                 notices.record(job)

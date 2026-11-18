@@ -302,6 +302,24 @@ def classify_job(job, *, files=None, records=None, references=None, diagnostics=
             if record.get('censorship') in ('censored','uncensored'):
                 observations.append({'kind':'censorship','value':record['censorship'],'verified':True,'evidence':proof})
 
+    if identity['kind'] == 'adult' and 'origin_requires_review' not in flags:
+        # Catch-all source categories (e.g. photo sets) name no country. When
+        # the destination offers an explicit Other choice, select it instead of
+        # inventing a country or leaving a required control indefinitely blank.
+        # A valid explicit value or catalog fact always wins over this fallback.
+        category = str(metadata.get('category', ''))
+        if not any(label in category for label in ('ญี่ปุ่น','ไทย','เกาหลี','จีน','ฝรั่ง')):
+            for field in ('c100cat', 'c184cat', 'c182cat'):
+                options = schema.get(field, {}).get('options')
+                if not isinstance(options, list) or 'อื่นๆ' not in options or candidates.get(field):
+                    continue
+                before = current.get(field)
+                if isinstance(before, str) and before.strip() and before in options:
+                    continue
+                propose(field, 'อื่นๆ', 'high', 'source_category_has_no_listed_country',
+                        [evidence('source_category', category),
+                         evidence('destination_form', 'Other is an explicit country option')])
+
     conflicts = []
     for field, values in candidates.items():
         distinct = {v['value'] for v in values}

@@ -86,6 +86,7 @@ class SingleCycleTests(unittest.IsolatedAsyncioTestCase):
             check_duplicates=AsyncMock(return_value={'status': 'clear', 'complete': True}),
             fill=AsyncMock(), submit=AsyncMock(return_value={'torrent_id': '10',
                 'details_url': 'https://www.bitsuse.com/bs_details.php?id=10'}),
+            resolve_publication=AsyncMock(return_value=None),
             download_listing=AsyncMock(return_value=self.canonical))
         self.session = SimpleNamespace(close=AsyncMock(), adapter=AsyncMock(
             side_effect=lambda site: self.reader if site == 'BEARBIT' else self.site))
@@ -158,12 +159,35 @@ class SingleCycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.calls['resume'], 0); self.assertEqual(self.events[-1]['status'], 'stopped')
         self.session.close.assert_awaited_once()
 
-    async def test_publication_uncertainty_is_not_retried_in_this_or_next_round(self):
+    async def test_publication_uncertainty_is_only_reconciled_with_reads(self):
         self.site.submit.side_effect = TimeoutError('private response')
         result = await self.run_round()
         self.assertEqual(result[0]['state'], 'publication_uncertain'); self.assertEqual(self.client.calls['add'], 0)
         self.assertNotIn('private response', self.output.getvalue())
-        self.assertEqual(await self.run_round(), []); self.site.submit.assert_awaited_once()
+        self.site.resolve_publication.assert_not_awaited()
+        self.assertEqual(await self.run_round(), [])
+        self.site.resolve_publication.assert_awaited_once()
+        self.site.submit.assert_awaited_once()
+        self.assertEqual(self.job()['publication_check']['attempts'], 1)
+
+    async def test_late_listing_is_reconciled_without_another_post(self):
+        self.site.submit.side_effect = TimeoutError('private response')
+        await self.run_round()
+        listing = {'torrent_id': '11', 'details_url': 'https://www.bitsuse.com/bs_details.php?id=11'}
+        self.site.resolve_publication.return_value = listing
+        result = await self.run_round()
+        self.assertEqual(result[0]['state'], 'verified')
+        self.assertEqual(self.job()['listing'], listing)
+        self.site.submit.assert_awaited_once(); self.site.resolve_publication.assert_awaited_once()
+
+    async def test_reconciliation_stops_after_the_attempt_budget(self):
+        self.prepare()
+        self.store.update(lambda d: d['upload_jobs'][next(iter(d['upload_jobs']))].update(
+            state='publication_uncertain',
+            publication_check={'attempts': 6, 'found': False, 'checked_at': '2026-11-18T00:00:00+00:00'}))
+        self.assertEqual(await self.run_round(), [])
+        self.site.resolve_publication.assert_not_awaited()
+        self.site.submit.assert_not_awaited()
 
     async def test_unconfirmed_add_is_not_retried_in_this_or_next_round(self):
         self.client.accept_add = False
