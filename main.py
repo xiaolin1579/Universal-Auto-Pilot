@@ -6778,7 +6778,7 @@ def format_size(size_gb):
 
 def save_hourly_snapshot(site_name, current_data):
     """
-    บันทึกข้อมูลแบบแยกระบบ Site และเก็บเป็นตัวเลข (Parsed)
+    บันทึกข้อมูลตามบัญชี (Dedbit/Bitsuse ใช้ชุดร่วมกัน) และเก็บเป็นตัวเลข (Parsed)
     - [Data Integrity] เพิ่มระบบดักจับและเปลี่ยนประเภทข้อมูล (Cast Type) เป็นตัวเลขที่แท้จริงก่อนลงดิสก์
     - [Anomaly Guard] ป้องกันสถิติลดลงหรือกระโดดผิดปกติจากเว็บต้นทางรวน (เช่น ค่าส่งมาเป็น 0 หรือดรอปฮวบ)
     - [Retention Fix] ปรับปรุงการคำนวณขอบเขตลบข้อมูล 31 วัน (744 ชั่วโมง) ป้องกันประวัติหายจากบอทรันซ้ำในชั่วโมงเดิม
@@ -6794,6 +6794,9 @@ def save_hourly_snapshot(site_name, current_data):
                 except Exception: 
                     all_history = {}
 
+        from shared_user_stats import coalesce_stats, storage_key
+        all_history = coalesce_stats(all_history, history=True)
+        site_name = storage_key(site_name, all_history, username=current_data.get('username'), history=True)
         if site_name not in all_history:
             all_history[site_name] = {}
         
@@ -6872,7 +6875,7 @@ async def async_get_stats_diff(site_name, current_data):
 
 def get_stats_diff(site_name, current_data):
     """
-    เปรียบเทียบค่าปัจจุบันกับ Cache โดยแยกตาม site_name 
+    เปรียบเทียบค่าปัจจุบันกับ Cache โดยใช้บัญชีร่วมสำหรับ Dedbit/Bitsuse
     พร้อมระบบ Anomaly Guard ป้องกัน Cache พังเมื่อเว็บรวนส่งค่า 0 หรือค่าดรอป
     """
     diff_msg = ""
@@ -6888,8 +6891,13 @@ def get_stats_diff(site_name, current_data):
         except Exception as e:
             print(f"⚠️ [{site_name}] Cache Read Error: {e}")
 
+    from shared_user_stats import coalesce_stats, storage_key, account_identity
+    all_cache = coalesce_stats(all_cache)
+    site_name = storage_key(site_name, all_cache, username=current_data.get('username'))
     # 2. ดึงข้อมูลเก่าเฉพาะของ Site นี้
     old_data = all_cache.get(site_name)
+    if old_data and account_identity(old_data.get('username')) != account_identity(current_data.get('username')):
+        old_data = None
 
     # แปลงค่าปัจจุบันเตรียมไว้เช็ค
     curr_up = parse_size(current_data.get('up', '0'))
@@ -6960,14 +6968,16 @@ def get_stats_diff(site_name, current_data):
 
     return diff_msg
 
-async def ensure_dedbit_logged_in(page):
+async def ensure_dedbit_logged_in(page, site_cfg=None):
     # 1. ดึง Config
-    site_cfg = next((s for s in CFG.get('SITE', []) if s['name'] in ["DEDBIT", "BITSUSE"]), None)
+    if site_cfg is None:
+        site_cfg = next((s for name in ('DEDBIT', 'BITSUSE') for s in CFG.get('SITE', [])
+                         if s.get('name') == name and s.get('enable') is True), None)
     if not site_cfg: return False
 
     # 2. เช็ค URL โดยใช้ page.url (nodriver เก็บเป็น property)
     target_url = "https://www.dedbit.com/index.php"
-    if "dedbit.com" not in page.url:
+    if urlsplit(page.url).hostname not in ('dedbit.com', 'www.dedbit.com'):
         print("🔗 [System] กำลังไปหน้าแรก DEDBIT...")
         await page.get(target_url)
         await asyncio.sleep(2) 
@@ -6977,14 +6987,17 @@ async def ensure_dedbit_logged_in(page):
     my_user = site_cfg.get('username')
     
     # ใช้ xpath หรือ css selector เพื่อหา element
-    logout_btn = await page.find('a[href*="logout.php"]', timeout=3)
-    user_text = await page.find(my_user, timeout=3)
+    try: logout_btn = await page.select('a[href*="logout.php"]', timeout=3)
+    except Exception: logout_btn = None
+    try: user_text = await page.find(my_user, timeout=3) if logout_btn is None and my_user else None
+    except Exception: user_text = None
     
     is_logged_in = logout_btn is not None or user_text is not None
 
     if not is_logged_in:
         print(f"🔑 [DEDBIT] พบว่า Session หลุด -> เริ่มการล็อกอินใหม่ที่หน้าแรก")
         temp_cfg = site_cfg.copy()
+        temp_cfg.update(name='DEDBIT', base_url='https://www.dedbit.com')
         temp_cfg['login_url'] = target_url
         return await universal_login(page, temp_cfg)
 
@@ -6992,12 +7005,13 @@ async def ensure_dedbit_logged_in(page):
     return True
 
 class BotContext:
-    def __init__(self, active_nodes, dl_session, seen_hashes, seen_ids, global_clean):
+    def __init__(self, active_nodes, dl_session, seen_hashes, seen_ids, global_clean, *, account_stats_seen=None):
         self.active_nodes = active_nodes
         self.dl_session = dl_session
         self.seen_hashes = seen_hashes
         self.seen_ids = seen_ids
         self.global_clean = global_clean
+        self.account_stats_seen = account_stats_seen if account_stats_seen is not None else set()
         
 async def get_site_stats(page: uc.Tab, site_cfg: dict, ctx: BotContext) -> str:
     """
@@ -7017,6 +7031,13 @@ async def get_site_stats(page: uc.Tab, site_cfg: dict, ctx: BotContext) -> str:
         if 'bearbit' not in site.lower():
             if 'reset_bot_config_to_default' in globals():
                 await asyncio.to_thread(reset_bot_config_to_default)
+
+        from shared_user_stats import shared_account_key
+        account_key = shared_account_key(site, site_cfg.get('username'))
+        seen_accounts = getattr(ctx, 'account_stats_seen', set())
+        if account_key is not None and account_key in seen_accounts:
+            print('[DED/BITS] Shared account statistics already collected in this search cycle')
+            return ''
 
         # -------------------------------------------------------------------------
         # 🎯 1. ทำภารกิจกวาดล้าง (Clear Notifications & Auto-Vote)
@@ -7056,20 +7077,24 @@ async def get_site_stats(page: uc.Tab, site_cfg: dict, ctx: BotContext) -> str:
         soup = BeautifulSoup(page_source, 'html.parser')
         index_soup = soup 
         
+        expected_user = str(site_cfg.get('username') or '').strip().casefold()
         if site in ["DEDBIT", "BITSUSE"]:
             current_url = page.url
-            user_tag = soup.find("a", href=re.compile(r"userdetails\.php\?id=\d+"))
+            user_tag = next((a for a in soup.find_all('a', href=re.compile(r'userdetails\.php\?id=\d+'))
+                             if a.get_text(strip=True).casefold() == expected_user), None)
             
-            if not user_tag or "dedbit.com" not in current_url:
+            if not user_tag or urlsplit(current_url).hostname not in ('dedbit.com', 'www.dedbit.com'):
                 print(f"🔄 [{site}] เซสชันมีปัญหา กำลังตรวจสอบสิทธิ์และเข้าสู่ระบบ DEDBIT ใหม่...")
-                await ensure_dedbit_logged_in(page) 
+                if not await ensure_dedbit_logged_in(page, site_cfg):
+                    return f'⚠️ [{site}] ไม่สามารถอ่านสถิติของบัญชีที่ตั้งไว้ได้'
                 
                 # ดึงตารางโครงสร้างใหม่หลังจากล็อกอินสำเร็จ
                 page_source = await page.get_content()
                 soup = BeautifulSoup(page_source, 'html.parser')
                 index_soup = soup
                 # ⚡ [Bug Fixed] ต้องหาตำแหน่งไอดีผู้ใช้ซ้ำอีกรอบในตารางที่โหลดมาใหม่
-                user_tag = soup.find("a", href=re.compile(r"userdetails\.php\?id=\d+"))
+                user_tag = next((a for a in soup.find_all('a', href=re.compile(r'userdetails\.php\?id=\d+'))
+                                 if a.get_text(strip=True).casefold() == expected_user), None)
         else:
             user_tag = soup.find("a", href=re.compile(r"userdetails\.php\?id=\d+"))
         
@@ -7153,6 +7178,8 @@ async def get_site_stats(page: uc.Tab, site_cfg: dict, ctx: BotContext) -> str:
         if diff_text and diff_text != "No changes":
             msg.append(f"🔄 {diff_text}")
 
+        if account_key is not None:
+            seen_accounts.add(account_key)
         return "\n".join(msg)
 
     except Exception as e:
@@ -10830,6 +10857,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
         return []
     matched_search_groups = set()
     checked_search_candidates = set()
+    account_stats_seen = set()
 
     target_sites_cfg = [s for s in CFG.get('SITE', []) if s.get('enable', True)]
     print(f"📡 Detected Sites: {[s['name'] for s in target_sites_cfg]}")
@@ -10923,7 +10951,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                 else:
                     ctx = BotContext(
                         active_nodes, dl_session, seen_hashes,
-                        seen_ids, global_clean
+                        seen_ids, global_clean, account_stats_seen=account_stats_seen
                     )
                     stats_data = await get_site_stats(
                         site_page, site_cfg, ctx

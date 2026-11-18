@@ -13,6 +13,7 @@ import psutil
 import pytz
 import html  # เพิ่มเข้ามาเพื่อใช้เคลียร์แท็กพัง
 from datetime import datetime, timedelta
+from shared_user_stats import load_history as load_account_stats_history, storage_key
 
 # --- SETUP PATH & CONFIG ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -156,8 +157,8 @@ def get_historical_report(site_name="TORRENTDD"):
         if not os.path.exists(STATS_HISTORY_FILE):
             return "⚠️ ยังไม่มีไฟล์ประวัติสถิติ"
 
-        with open(STATS_HISTORY_FILE, 'r', encoding='utf-8') as f:
-            all_history = json.load(f)
+        all_history = load_account_stats_history(STATS_HISTORY_FILE)
+        site_name = storage_key(site_name, all_history, history=True)
 
         history = all_history.get(site_name, {})
         if not history: 
@@ -312,8 +313,8 @@ def get_monthly_report(site_name="TORRENTDD"):
         if not os.path.exists(STATS_HISTORY_FILE):
             return "⚠️ ยังไม่มีไฟล์ประวัติสถิติ"
 
-        with open(STATS_HISTORY_FILE, 'r', encoding='utf-8') as f:
-            all_history = json.load(f)
+        all_history = load_account_stats_history(STATS_HISTORY_FILE)
+        site_name = storage_key(site_name, all_history, history=True)
 
         history = all_history.get(site_name, {})
         if not history: 
@@ -552,14 +553,12 @@ async def main():
                 if txt == '📊 Status Check':
                     await tg_bot.send_message(chat_id, get_status_text(), parse_mode='HTML')
                 elif txt == '📈 Stats Report':
-                    with open(STATS_HISTORY_FILE, 'r', encoding='utf-8') as f:
-                        all_history = json.load(f)
+                    all_history = load_account_stats_history(STATS_HISTORY_FILE)
                     for site in all_history.keys():
                         report = get_historical_report(site_name=site)
                         await tg_bot.send_message(chat_id, report, parse_mode='HTML')
                 elif txt == '📈 Stats Monthly Report':
-                    with open(STATS_HISTORY_FILE, 'r', encoding='utf-8') as f:
-                        all_history = json.load(f)
+                    all_history = load_account_stats_history(STATS_HISTORY_FILE)
                     for site in all_history.keys():
                         report = get_monthly_report(site_name=site)
                         await tg_bot.send_message(chat_id, report, parse_mode='HTML')
@@ -766,8 +765,7 @@ async def main():
                     report_data = get_historical_report(site_name=site.upper())
                     await ctx.send(format_report(report_data, platform='dc'))
                 else:
-                    with open(STATS_HISTORY_FILE, 'r', encoding='utf-8') as f:
-                        all_history = json.load(f)
+                    all_history = load_account_stats_history(STATS_HISTORY_FILE)
                     for site_key in all_history:
                         report_data = get_historical_report(site_name=site_key)
                         await ctx.send(format_report(report_data, platform='dc'))
@@ -778,8 +776,7 @@ async def main():
                     report_data = get_monthly_report(site_name=site.upper())
                     await ctx.send(format_report(report_data, platform='dc'))
                 else:
-                    with open(STATS_HISTORY_FILE, 'r', encoding='utf-8') as f:
-                        all_history = json.load(f)
+                    all_history = load_account_stats_history(STATS_HISTORY_FILE)
                     for site_key in all_history:
                         report_data = get_monthly_report(site_name=site_key)
                         await ctx.send(format_report(report_data, platform='dc'))
