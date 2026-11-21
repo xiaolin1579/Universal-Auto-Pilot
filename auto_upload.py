@@ -337,7 +337,7 @@ class UploadLedger:
             'source_verified_at', 'field_overrides', 'created_at', 'updated_at', 'target_hash', 'listing', 'seed_recovery',
             'notifications', 'submission_started_at', 'last_publication_failure',
             'publication_history', 'publication_retry', 'publication_retry_check', 'publication_check',
-            'submission_signature', 'metainfo_preflight', 'duplicate_resolution',
+            'submission_signature', 'metainfo_preflight', 'duplicate_resolution', 'canonical_verification',
             'category_review', 'category_corrections', 'category_auto_fields', 'retention_check') if k in job}
         if job.get('repack'):
             public['repack'] = {k: deepcopy(job['repack'][k]) for k in (
@@ -518,6 +518,47 @@ class UploadLedger:
             raise UploadBlocked('Publication has no verified listing identity')
         return self.transition(key, {'submitting', 'publication_uncertain'}, 'published', listing=listing)
 
+    @staticmethod
+    def _adoptable_canonical_row(data, job, listing, target):
+        """Find an exact destination mapping that may be adopted during verification."""
+        site = job['target_site']
+        tid = str(listing.get('torrent_id', ''))
+        url = str(listing.get('details_url', ''))
+        if not tid.isdigit() or not url:
+            return None
+        record = data['site_records'].get(site + ':' + tid)
+        if not record or infohash(record.get('infohash')) != target:
+            return None
+        evidence = record.get('binding_evidence') or {}
+        if evidence.get('method') not in ('verified_mapping_listing', 'authenticated_upload_canonical_torrent'):
+            return None
+        labels = {site.upper()}
+        if site in ('BITSUSE', 'DEDBIT'):
+            labels.update(('BITSUSE', 'DEDBIT'))
+        for row in data['torrents']:
+            if infohash(row.get('client_info', {}).get('hash')) != target:
+                continue
+            if row.get('content_group_id') not in (None, job['content_group_id']):
+                continue
+            if (row.get('source_site') != site or row.get('source_site_verified') is not True
+                    or row.get('source_zone_id') != job['target_zone']
+                    or row.get('source_zone_verified') is not True):
+                continue
+            if str(row.get('torrent_id', '')) != tid or str(row.get('details_url', '')) != url:
+                continue
+            matching = False
+            for entry in row.get('site_listings', []):
+                label = str(entry.get('site_key') or entry.get('site_group') or '').upper()
+                if (entry.get('verified') is True and label in labels
+                        and str(entry.get('torrent_id', '')) == tid
+                        and infohash(entry.get('infohash')) == target
+                        and str(entry.get('details_url', '')) == url):
+                    matching = True
+                    break
+            if matching:
+                return row
+        return None
+
     def accept_canonical(self, key, content):
         job = self.get(key); target = _extract_torrent_info_hash(content)
         if payload_signature(content) != publication_signature(job) or target == job['source_hash']:
@@ -536,28 +577,58 @@ class UploadLedger:
             if current['state'] not in {'published', 'verification_failed'}:
                 raise UploadBlocked('Canonical verification is not allowed in this state')
             group = data['content_groups'][job['content_group_id']]
-            if (target in group['hashes']
-                    or any(infohash(r['client_info'].get('hash')) == target for r in data['torrents'])):
-                raise UploadBlocked('Canonical hash already belongs to another source or variant')
-            current.update(state='verified', target_hash=target, updated_at=stamp(),
-                canonical_artifact=write_artifact(self.artifacts, key, 'canonical', content, upload_filename(job)))
-            group['hashes'].append(target)
-            listing = current['listing']; site = job['target_site']; tid = str(listing['torrent_id'])
+            listing = current.get('listing') or {}
+            site = job['target_site']; tid = str(listing.get('torrent_id', ''))
+            if not tid.isdigit() or not listing.get('details_url'):
+                raise UploadBlocked('Canonical verification has no verified listing identity')
             site_key = site + ':' + tid
+            adopted = self._adoptable_canonical_row(data, job, listing, target)
+            if adopted is None and (target in group['hashes'] or any(
+                    infohash(r.get('client_info', {}).get('hash')) == target for r in data['torrents'])):
+                raise UploadBlocked('Canonical hash already belongs to another source or variant')
+            for other_key, other in data['upload_jobs'].items():
+                if other_key == key or other.get('state') == 'cancelled':
+                    continue
+                if (infohash(other.get('target_hash')) == target
+                        or (other.get('target_site') == site
+                            and str((other.get('listing') or {}).get('torrent_id', '')) == tid)):
+                    raise UploadBlocked('Canonical hash or listing already belongs to another upload job')
             previous = data['site_records'].get(site_key)
-            if previous and previous.get('infohash') not in (None, target):
-                raise UploadBlocked('Listing already has another infohash')
-            if not previous:
-                data['site_records'][site_key] = {'site': site, 'torrent_id': tid, 'infohash': target,
+            if previous:
+                if infohash(previous.get('infohash')) not in (None, target):
+                    raise UploadBlocked('Listing already has another infohash')
+            else:
+                previous = {'site': site, 'torrent_id': tid, 'infohash': target,
                     'legacy_state': {'hash': target, 'name': job['metadata']['title'],
                                      'url': listing['details_url']},
                     'obligations': {k: {'status': 'unknown'} for k in ('hr', 'quest_seed')}}
-            if not any(infohash(r['client_info'].get('hash')) == target for r in data['torrents']):
+                data['site_records'][site_key] = previous
+            if infohash(previous.get('infohash')) is None:
+                previous['infohash'] = target
+            checked_at = stamp()
+            current.update(state='verified', target_hash=target, updated_at=checked_at,
+                canonical_artifact=write_artifact(self.artifacts, key, 'canonical', content, upload_filename(job)),
+                canonical_verification={'method': 'adopted_existing_verified_mapping' if adopted else 'new_authenticated_torrent',
+                                        'checked_at': checked_at, 'target_hash': target, 'listing': deepcopy(listing)})
+            if target not in group['hashes']:
+                group['hashes'].append(target)
+            if adopted is not None:
+                if adopted.get('content_group_id') is None:
+                    adopted['content_group_id'] = job['content_group_id']
+                variant = adopted.setdefault('variant_info', {})
+                variant.update(role='uploaded_variant', original_infohash=job['source_hash'],
+                               target_site=site, target_zone_id=job['target_zone'], verified=True)
+                for entry in adopted.get('site_listings', []):
+                    if (str(entry.get('site_key') or '').upper() == site.upper()
+                            and str(entry.get('torrent_id', '')) == tid):
+                        entry['infohash'] = target
+                        entry['verified'] = True
+            else:
                 data['torrents'].append({'client_info': {'hash': target, 'name': job['metadata']['title']},
                     'content_group_id': job['content_group_id'], 'source_site': site, 'source_site_verified': True,
                     'source_zone_id': job['target_zone'], 'source_zone_verified': True,
                     'source_zone_evidence': {'method': 'authenticated_upload_canonical_torrent',
-                        'details_url': listing['details_url'], 'verified_at': stamp()},
+                        'details_url': listing['details_url'], 'verified_at': checked_at},
                     'variant_info': {'role': 'uploaded_variant', 'original_infohash': job['source_hash'],
                         'target_site': site, 'target_zone_id': job['target_zone'], 'verified': True},
                     'site_listings': [{'site_key': site, 'torrent_id': tid, 'details_url': listing['details_url'],

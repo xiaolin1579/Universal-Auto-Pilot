@@ -287,8 +287,25 @@ python auto_upload_cli.py reconcile-seed JOB_ID
 python auto_upload_cli.py cancel JOB_ID
 ```
 
-`reconcile` รับเฉพาะงาน `submitting`/`publication_uncertain` และตรวจ canonical torrent
-ก่อนยอมรับ `cancel` รับเฉพาะงาน `draft`/`prepared` ที่ยังไม่ส่งเท่านั้น คิวอัตโนมัติจะไม่เตรียมงานที่ยกเลิกซ้ำ
+`reconcile` รับเฉพาะงาน `submitting`/`publication_uncertain` และงาน `verification_failed`
+ที่มี listing เดิมแล้ว ตรวจ canonical torrent ก่อนยอมรับ ไม่ส่งฟอร์มซ้ำ
+`cancel` รับเฉพาะงาน `draft`/`prepared` ที่ยังไม่ส่งเท่านั้น คิวอัตโนมัติจะไม่เตรียมงานที่ยกเลิกซ้ำ
+
+หาก listing ถูกต้องแต่การตรวจ canonical เคยล้มเหลว หรือ mapping เดิมมี hash นี้แล้ว ให้ใช้:
+
+```sh
+python auto_upload_cli.py verify-canonical JOB_ID
+python auto_upload_cli.py verify-canonical JOB_ID --url 'https://www.bitsuse.com/bs_details.php?id=687125'
+python auto_upload_cli.py reconcile JOB_ID --url 'https://www.bitsuse.com/bs_details.php?id=687125'
+```
+
+`verify-canonical` ใช้ listing ที่บันทึกไว้ `--url` ที่ระบุต้องตรงกับ listing นั้นเท่านั้น
+คำสั่งทั้งสองแบบดาวน์โหลด canonical ผ่านเซสชันที่ล็อกอินแล้ว ตรวจ payload/tracker
+แล้วผูกงานกับ hash เดิมโดยไม่ POST ไม่เพิ่ม torrent ไม่ recheck ไม่ resume และไม่ลบไฟล์
+การยอมรับ mapping ที่มีอยู่จะเกิดขึ้นก็ต่อเมื่อ site_record มี hash ตรงกันและมี
+`binding_evidence`, แถว torrent มี site/zone/listing/infohash ตรงกันและอยู่ใน group เดียวกัน
+หรือยังไม่ได้ผูก group และไม่มีงานอื่นถือ hash/listing นั้นอยู่ H&R/Quest, manual hold
+และ `node_locations` เดิมจะถูกเก็บไว้ ถ้าหลักฐานไม่ตรงจะปฏิเสธและคงสถานะเดิมไว้
 
 ### ผูกรายการซ้ำที่ seed อยู่แล้ว
 

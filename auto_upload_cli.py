@@ -41,10 +41,12 @@ def parser():
                                  help='Destination; required when more than one category rule matches')
     configure = sub.add_parser('configure')
     configure.add_argument('job_id'); configure.add_argument('--file', required=True)
-    for name in ('show', 'check-job', 'publish', 'seed', 'reconcile', 'reconcile-seed', 'cancel', 'retry-publication',
-                 'resolve-duplicate', 'repair-category'):
+    for name in ('show', 'check-job', 'publish', 'seed', 'reconcile', 'verify-canonical', 'reconcile-seed',
+                 'cancel', 'retry-publication', 'resolve-duplicate', 'repair-category'):
         cmd = sub.add_parser(name); cmd.add_argument('job_id')
         if name == 'reconcile': cmd.add_argument('--url', required=True)
+        if name == 'verify-canonical':
+            cmd.add_argument('--url', help='Must match the listing already recorded on the job')
         if name == 'resolve-duplicate':
             cmd.add_argument('--url', help='Existing destination listing; defaults to the recorded duplicate result')
         if name == 'repair-category':
@@ -161,6 +163,14 @@ async def execute(args, app):
     if args.command == 'reconcile-seed' and job['state'] in ('verified', 'rechecking'):
         raise UploadBlocked('Job is ' + job['state'] + '; use seed ' + job['id']
                             + '. reconcile-seed only recovers adding/seed_uncertain jobs')
+    if args.command in ('reconcile', 'verify-canonical'):
+        allowed = ('publication_uncertain', 'submitting')
+        if args.command == 'verify-canonical' or job['state'] == 'verification_failed':
+            allowed = ('published', 'verification_failed')
+        if job['state'] not in allowed:
+            raise UploadBlocked('Cannot verify canonical torrent in state ' + job['state'])
+        if job['state'] in ('published', 'verification_failed') and not job.get('listing'):
+            raise UploadBlocked('Canonical verification requires a recorded listing')
     if args.command in ('publish', 'check-job', 'repair-category') and settings.get('enable') is True:
         from upload_classifier import origin_requires_review
         if origin_requires_review(job):
@@ -171,19 +181,28 @@ async def execute(args, app):
     session = UploadSession(app, profile_name='auto_upload_cli_' + str(os.getpid())); node = None
     notices = UploadNotifications(app, ledger)
     try:
-        if args.command == 'reconcile':
-            if job['state'] not in ('publication_uncertain', 'submitting'):
-                raise UploadBlocked('Only an uncertain submission can be reconciled')
+        if args.command in ('reconcile', 'verify-canonical'):
             adapter = await session.adapter(job['target_site'])
-            listing = listing_identity(job['target_site'], args.url)
-            # Verify the authenticated canonical payload before accepting an ambiguous result.
-            from torrent_metainfo import payload_signature, _extract_torrent_info_hash
-            from auto_upload import publication_signature
-            content = await adapter.download_listing(listing['details_url'])
-            if payload_signature(content) != publication_signature(job) or _extract_torrent_info_hash(content) == job['source_hash']:
-                raise UploadBlocked('Listing does not match the uploaded payload/variant')
-            ledger.record_publication(job['id'], listing)
-            result = ledger.accept_canonical(job['id'], content)
+            if args.command == 'verify-canonical' or job['state'] == 'verification_failed':
+                if getattr(args, 'url', None):
+                    requested = listing_identity(job['target_site'], args.url)
+                    recorded = job['listing']
+                    if (str(requested['torrent_id']) != str(recorded.get('torrent_id', ''))
+                            or requested['details_url'] != recorded.get('details_url')):
+                        raise UploadBlocked('URL does not match the listing recorded on this job')
+                # Re-download the canonical metainfo over the authenticated session;
+                # no form POST and no duplicate publication are performed here.
+                result = await worker.verify_publication(job['id'], adapter)
+            else:
+                listing = listing_identity(job['target_site'], args.url)
+                # Verify the authenticated canonical payload before accepting an ambiguous result.
+                from torrent_metainfo import payload_signature, _extract_torrent_info_hash
+                from auto_upload import publication_signature
+                content = await adapter.download_listing(listing['details_url'])
+                if payload_signature(content) != publication_signature(job) or _extract_torrent_info_hash(content) == job['source_hash']:
+                    raise UploadBlocked('Listing does not match the uploaded payload/variant')
+                ledger.record_publication(job['id'], listing)
+                result = ledger.accept_canonical(job['id'], content)
         else:
             name = args.node if args.command in ('prepare', 'inspect-source') else job['source_node']
             config = next((n for n in app.CFG['NODES'] if n.get('name') == name and n.get('enable') is True), None)
@@ -228,7 +247,8 @@ async def execute(args, app):
             outcome['manual_publish_required'] = True
         return outcome
     except Exception as exc:
-        if job is not None and args.command in ('publish', 'seed', 'reconcile', 'reconcile-seed', 'retry-publication'):
+        if job is not None and args.command in ('publish', 'seed', 'reconcile', 'verify-canonical',
+                                                'reconcile-seed', 'retry-publication'):
             current = ledger.get(job['id'])
             notices.record(current, safe_error(exc, current))
         raise
@@ -237,7 +257,8 @@ async def execute(args, app):
             if node is not None: app.CLIENTS.close(node)
             await session.close()
         finally:
-            if args.command in ('prepare', 'publish', 'seed', 'reconcile', 'reconcile-seed', 'retry-publication'):
+            if args.command in ('prepare', 'publish', 'seed', 'reconcile', 'verify-canonical',
+                                'reconcile-seed', 'retry-publication'):
                 await notices.flush()
 
 
