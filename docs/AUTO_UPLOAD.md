@@ -427,6 +427,22 @@ python auto_upload_cli.py publish JOB_ID
 ถ้าผลส่งครั้งใหม่ยังไม่ชัดเจน จะกลับ `publication_uncertain` และไม่ส่งซ้ำอัตโนมัติ
 คำสั่ง `retry-publication` เองไม่ส่งฟอร์มหรือเพิ่ม/เริ่ม torrent บน seedbox
 
+### ปิดงานเก่าที่ต้นทางหายจาก client แล้ว
+
+หากตรวจปลายทางแบบอ่านอย่างเดียวแล้วแน่ใจว่าไม่มีรายการ แต่ torrent ต้นทางได้หายไปจาก
+client แล้ว `retry-publication` จะตรวจ source สดไม่ผ่าน ให้ใช้คำสั่งปิดงานแบบสมบูรณ์แทน:
+
+```sh
+python auto_upload_cli.py close-uncertain JOB_ID --confirm-not-published
+python auto_upload_cli.py show JOB_ID
+```
+
+คำสั่งนี้ตรวจเฉพาะ artifact ที่เก็บไว้ (hash/layout ของ source, prepared และ submission ต้องตรงกัน)
+แล้วเปลี่ยน `publication_uncertain` เป็น `cancelled` โดยไม่ส่ง POST และไม่เรียก add/recheck/resume/stop/delete
+หลักฐานการตรวจและการยืนยันของผู้ใช้เก็บใน `publication_history` และ `publication_resolution`
+งานที่ถูกปิดจะไม่ถูกคิวนำไปส่งซ้ำ แต่ยังดูย้อนหลังได้ด้วย `show JOB_ID`
+ใช้เฉพาะงานที่ไม่มี listing/hash ปลายทาง และห้ามใช้กับ `submitting` ที่อาจยังมี process กำลังส่งอยู่
+
 ## การแจ้งเตือน
 
 Auto Upload ส่งผ่าน `send_notify` เดียวกับระบบหลัก ใช้การตั้งค่า LINE, Telegram และ Discord เดิม

@@ -337,7 +337,8 @@ class UploadLedger:
             'source_verified_at', 'field_overrides', 'created_at', 'updated_at', 'target_hash', 'listing', 'seed_recovery',
             'notifications', 'submission_started_at', 'last_publication_failure',
             'publication_history', 'publication_retry', 'publication_retry_check', 'publication_check',
-            'submission_signature', 'metainfo_preflight', 'duplicate_resolution', 'canonical_verification',
+            'publication_resolution', 'submission_signature', 'metainfo_preflight', 'duplicate_resolution',
+            'canonical_verification',
             'category_review', 'category_corrections', 'category_auto_fields', 'retention_check') if k in job}
         if job.get('repack'):
             public['repack'] = {k: deepcopy(job['repack'][k]) for k in (
@@ -481,6 +482,38 @@ class UploadLedger:
                 for field in ('submission_started_at', 'submission_signature', 'last_publication_failure', 'last_submission_failure'):
                     current.pop(field, None)
             current['updated_at'] = checked_at
+            return deepcopy(current)
+        return self.store.update(apply)
+
+    def close_uncertain_offline(self, key, expected, *, evidence):
+        """Close an uncertain POST when the live source is gone and no listing exists.
+
+        This is an explicit terminal resolution for stale jobs. It never posts,
+        adds, resumes or deletes anything; the operator confirmation and offline
+        artifact evidence are retained in the ledger for audit.
+        """
+        if not isinstance(evidence, dict) or evidence.get('method') != 'artifact_and_read_only_site_check':
+            raise UploadBlocked('Offline closure requires artifact and read-only site evidence')
+        if evidence.get('publication_retry_attempted') is not False:
+            raise UploadBlocked('Offline closure must not repeat a publication attempt')
+
+        def apply(data):
+            current = data['upload_jobs'][key]
+            if (current['state'] != 'publication_uncertain' or current.get('listing')
+                    or current.get('target_hash') or current.get('updated_at') != expected.get('updated_at')
+                    or not self.same_configuration(current, expected)):
+                raise UploadBlocked('Uncertain job changed; inspect it again')
+            checked = stamp()
+            attempt = {field: deepcopy(current[field]) for field in (
+                'state', 'submission_started_at', 'submission_signature', 'last_publication_failure',
+                'publication_check') if field in current}
+            attempt.update(resolution='operator_confirmed_not_published_offline',
+                           resolved_at=checked, evidence=deepcopy(evidence))
+            current.setdefault('publication_history', []).append(attempt)
+            current['publication_resolution'] = {
+                'resolution': attempt['resolution'], 'resolved_at': checked,
+                'evidence': deepcopy(evidence)}
+            current.update(state='cancelled', updated_at=checked)
             return deepcopy(current)
         return self.store.update(apply)
 

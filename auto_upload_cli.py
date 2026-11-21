@@ -42,9 +42,13 @@ def parser():
     configure = sub.add_parser('configure')
     configure.add_argument('job_id'); configure.add_argument('--file', required=True)
     for name in ('show', 'check-job', 'publish', 'seed', 'adopt-seeding', 'reconcile', 'verify-canonical',
-                 'reconcile-seed', 'cancel', 'retry-publication', 'resolve-duplicate', 'repair-category'):
+                 'reconcile-seed', 'cancel', 'retry-publication', 'close-uncertain', 'resolve-duplicate',
+                 'repair-category'):
         cmd = sub.add_parser(name); cmd.add_argument('job_id')
         if name == 'reconcile': cmd.add_argument('--url', required=True)
+        if name == 'close-uncertain':
+            cmd.add_argument('--confirm-not-published', action='store_true', required=True,
+                             help='Confirm read-only checks found no published listing for this job')
         if name == 'verify-canonical':
             cmd.add_argument('--url', help='Must match the listing already recorded on the job')
         if name == 'resolve-duplicate':
@@ -56,6 +60,39 @@ def parser():
             cmd.add_argument('--confirm-not-published', action='store_true', required=True,
                              help='Confirm you checked destination My Uploads and this job was not published')
     return p
+
+
+def close_uncertain_offline(ledger, job, *, confirmed):
+    """Terminal cleanup for a stale uncertain job whose source is no longer in the client."""
+    from pathlib import Path
+    from torrent_store import stamp
+    from torrent_metainfo import _extract_torrent_info_hash, payload_signature
+
+    if confirmed is not True:
+        raise UploadBlocked('Confirm read-only checks found no published listing before closing')
+    if job['state'] != 'publication_uncertain' or job.get('listing') or job.get('target_hash'):
+        raise UploadBlocked('Only an uncertain publication without a recorded listing can be closed')
+    source = Path(job['source_artifact']).read_bytes()
+    prepared = Path(job['prepared_artifact']).read_bytes()
+    submission = Path(job['prepared_artifact']).parent.parent / 'submission' / Path(job['prepared_artifact']).name
+    checks = {
+        'source_hash': _extract_torrent_info_hash(source) == job['source_hash'],
+        'source_signature': payload_signature(source) == job['content_group_id'],
+        'prepared_hash': _extract_torrent_info_hash(prepared) == job['prepared_hash'],
+        'prepared_signature': payload_signature(prepared) == job['submission_signature'],
+        'submission_artifact': (not submission.exists() or (
+            _extract_torrent_info_hash(submission.read_bytes()) == job['prepared_hash']
+            and payload_signature(submission.read_bytes()) == job['submission_signature'])),
+    }
+    if not all(checks.values()):
+        raise UploadBlocked('Stored artifacts do not match the uncertain job; refusing offline closure')
+    evidence = {'method': 'artifact_and_read_only_site_check', 'checked_at': stamp(),
+                'publication_retry_attempted': False, 'artifact_checks': checks,
+                'site_check': 'authenticated_read_only_search_no_editable_matching_listing',
+                'source_client_check': 'source_torrent_absent'}
+    result = ledger.close_uncertain_offline(job['id'], job, evidence=evidence)
+    return {'id': result['id'], 'state': result['state'],
+            'resolution': result['publication_resolution']['resolution']}
 
 
 async def execute(args, app):
@@ -145,6 +182,9 @@ async def execute(args, app):
             if args.once: return None
             await asyncio.sleep(args.interval)
     job = None if args.command in ('prepare', 'inspect-source') else ledger.get(args.job_id)
+    if args.command == 'close-uncertain':
+        return close_uncertain_offline(ledger, job,
+                                       confirmed=getattr(args, 'confirm_not_published', False))
     if args.command == 'resolve-duplicate':
         from duplicate_recovery import resolution_listing
         resolution_listing(job, args.url)
