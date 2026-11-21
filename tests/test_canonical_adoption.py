@@ -3,9 +3,51 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from auto_upload import UploadBlocked, UploadLedger
+from auto_upload import UploadBlocked, UploadLedger, UploadWorker
 from torrent_metainfo import bencode, create_variant, _extract_torrent_info_hash
 from torrent_store import MappingStore
+
+
+class ActiveClient:
+    name = 'seedbox'
+
+    def __init__(self, source_hash, target_hash, save_path, files, target_state='uploading'):
+        self.source_hash = source_hash
+        self.target_hash = target_hash
+        self.save_path = save_path
+        self.files_payload = files
+        self.target_state = target_state
+        self.calls = []
+
+    def inventory(self, value, missing_ok=False):
+        row = {'hash': value.upper(), 'progress': 1, 'amount_left': 0, 'size_bytes': 4,
+               'save_path': self.save_path, 'state': 'uploading'}
+        if value == self.source_hash:
+            row['state'] = 'stalledUP'
+            return row
+        if value == self.target_hash:
+            row['state'] = self.target_state
+            return row
+        if missing_ok:
+            return None
+        raise KeyError(value)
+
+    def files(self, value):
+        if value in (self.source_hash, self.target_hash):
+            return deepcopy(self.files_payload)
+        return []
+
+    def add_paused(self, *args, **kwargs):
+        self.calls.append('add_paused')
+        return True
+
+    def resume(self, *args, **kwargs):
+        self.calls.append('resume')
+        return True
+
+    def recheck(self, *args, **kwargs):
+        self.calls.append('recheck')
+        return True
 
 
 class CanonicalAdoptionTests(unittest.TestCase):
@@ -109,6 +151,27 @@ class CanonicalAdoptionTests(unittest.TestCase):
         self.store.update(drop_evidence)
         with self.assertRaisesRegex(UploadBlocked, 'already belongs'):
             self.ledger.accept_canonical(self.key, self.canonical)
+
+    def test_adopts_active_target_without_recheck_or_client_mutation(self):
+        self.ledger.accept_canonical(self.key, self.canonical)
+        client = ActiveClient(self.source_hash, self.target, '/downloads', self.files)
+        result = UploadWorker(self.ledger).adopt_active_target(self.key, client)
+        self.assertEqual(result['state'], 'seeding')
+        self.assertEqual(result['seed_recovery']['method'], 'existing_active_target')
+        self.assertEqual(client.calls, [])
+        data = self.store.read()
+        row = next(r for r in data['torrents'] if str(r['client_info']['hash']).lower() == self.target)
+        self.assertTrue(any(loc.get('active_seed_verified') for loc in row['node_locations']))
+        self.assertEqual(data['site_records']['BITSUSE:687125']['obligations'],
+                         {'hr': {'status': 'required'}, 'quest_seed': {'status': 'clear'}})
+
+    def test_rejects_active_adoption_when_target_is_not_seeding(self):
+        self.ledger.accept_canonical(self.key, self.canonical)
+        client = ActiveClient(self.source_hash, self.target, '/downloads', self.files, target_state='pausedUP')
+        with self.assertRaisesRegex(UploadBlocked, 'not actively seeding'):
+            UploadWorker(self.ledger).adopt_active_target(self.key, client)
+        self.assertEqual(self.ledger.get(self.key)['state'], 'verified')
+        self.assertEqual(client.calls, [])
 
 
 if __name__ == '__main__':

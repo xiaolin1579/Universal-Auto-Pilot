@@ -41,8 +41,8 @@ def parser():
                                  help='Destination; required when more than one category rule matches')
     configure = sub.add_parser('configure')
     configure.add_argument('job_id'); configure.add_argument('--file', required=True)
-    for name in ('show', 'check-job', 'publish', 'seed', 'reconcile', 'verify-canonical', 'reconcile-seed',
-                 'cancel', 'retry-publication', 'resolve-duplicate', 'repair-category'):
+    for name in ('show', 'check-job', 'publish', 'seed', 'adopt-seeding', 'reconcile', 'verify-canonical',
+                 'reconcile-seed', 'cancel', 'retry-publication', 'resolve-duplicate', 'repair-category'):
         cmd = sub.add_parser(name); cmd.add_argument('job_id')
         if name == 'reconcile': cmd.add_argument('--url', required=True)
         if name == 'verify-canonical':
@@ -125,7 +125,8 @@ async def execute(args, app):
         return ledger.review(args.job_id)
     if args.command == 'cancel':
         return {'id': args.job_id, 'state': ledger.transition(args.job_id, {'draft', 'prepared'}, 'cancelled')['state']}
-    if args.command in ('publish', 'seed', 'reconcile-seed', 'resolve-duplicate', 'run') and cfg.get('enable') is not True:
+    if args.command in ('publish', 'seed', 'adopt-seeding', 'reconcile-seed', 'resolve-duplicate',
+                        'run') and cfg.get('enable') is not True:
         raise UploadBlocked('AUTO_UPLOAD.enable must be true for runtime actions')
     if args.command == 'run':
         if args.interval < 30: raise UploadBlocked('Minimum interval is 30 seconds')
@@ -149,7 +150,8 @@ async def execute(args, app):
         resolution_listing(job, args.url)
     if args.command == 'repair-category' and job['state'] not in ('draft', 'prepared'):
         raise UploadBlocked('Category repair only accepts unsubmitted jobs')
-    if args.command in ('publish', 'seed', 'reconcile-seed', 'retry-publication') and not enabled_rule(cfg, job):
+    if args.command in ('publish', 'seed', 'adopt-seeding', 'reconcile-seed',
+                        'retry-publication') and not enabled_rule(cfg, job):
         raise UploadBlocked('The job category rule is no longer enabled or has changed')
     if args.command == 'retry-publication':
         if getattr(args, 'confirm_not_published', False) is not True:
@@ -158,11 +160,14 @@ async def execute(args, app):
             raise UploadBlocked('Only an uncertain publication without a recorded listing can be retried')
     if args.command == 'publish' and cfg.get('enable_publish') is not True:
         raise UploadBlocked('AUTO_UPLOAD.enable_publish must be true')
-    if args.command in ('seed', 'reconcile-seed') and cfg.get('enable_seed') is not True:
+    if args.command in ('seed', 'adopt-seeding', 'reconcile-seed') and cfg.get('enable_seed') is not True:
         raise UploadBlocked('AUTO_UPLOAD.enable_seed must be true')
     if args.command == 'reconcile-seed' and job['state'] in ('verified', 'rechecking'):
         raise UploadBlocked('Job is ' + job['state'] + '; use seed ' + job['id']
                             + '. reconcile-seed only recovers adding/seed_uncertain jobs')
+    if args.command == 'adopt-seeding' and (job['state'] != 'verified' or not job.get('target_hash')
+                                            or not job.get('canonical_artifact')):
+        raise UploadBlocked('Active-target adoption requires a verified job with a canonical hash')
     if args.command in ('reconcile', 'verify-canonical'):
         allowed = ('publication_uncertain', 'submitting')
         if args.command == 'verify-canonical' or job['state'] == 'verification_failed':
@@ -237,6 +242,8 @@ async def execute(args, app):
             elif args.command == 'retry-publication':
                 result = await worker.retry_publication(job['id'], await session.adapter(job['target_site']), client,
                                                         confirmed_not_published=args.confirm_not_published)
+            elif args.command == 'adopt-seeding':
+                result = await asyncio.to_thread(worker.adopt_active_target, job['id'], client)
             elif args.command == 'reconcile-seed':
                 result = await asyncio.to_thread(worker.reconcile_seed, job['id'], client)
             else:
@@ -247,8 +254,8 @@ async def execute(args, app):
             outcome['manual_publish_required'] = True
         return outcome
     except Exception as exc:
-        if job is not None and args.command in ('publish', 'seed', 'reconcile', 'verify-canonical',
-                                                'reconcile-seed', 'retry-publication'):
+        if job is not None and args.command in ('publish', 'seed', 'adopt-seeding', 'reconcile',
+                                                'verify-canonical', 'reconcile-seed', 'retry-publication'):
             current = ledger.get(job['id'])
             notices.record(current, safe_error(exc, current))
         raise
@@ -257,8 +264,8 @@ async def execute(args, app):
             if node is not None: app.CLIENTS.close(node)
             await session.close()
         finally:
-            if args.command in ('prepare', 'publish', 'seed', 'reconcile', 'verify-canonical',
-                                'reconcile-seed', 'retry-publication'):
+            if args.command in ('prepare', 'publish', 'seed', 'adopt-seeding', 'reconcile',
+                                'verify-canonical', 'reconcile-seed', 'retry-publication'):
                 await notices.flush()
 
 

@@ -307,6 +307,18 @@ python auto_upload_cli.py reconcile JOB_ID --url 'https://www.bitsuse.com/bs_det
 หรือยังไม่ได้ผูก group และไม่มีงานอื่นถือ hash/listing นั้นอยู่ H&R/Quest, manual hold
 และ `node_locations` เดิมจะถูกเก็บไว้ ถ้าหลักฐานไม่ตรงจะปฏิเสธและคงสถานะเดิมไว้
 
+หาก torrent ปลายทางมีอยู่และกำลัง seed อยู่แล้ว (ไม่ควรหยุด/recheck) ให้ใช้:
+
+```sh
+python auto_upload_cli.py adopt-seeding JOB_ID
+```
+
+คำสั่งนี้ตรวจ source/canonical artifacts, save path, ความครบของไฟล์ และสถานะ
+`uploading`/`stalledUP`/`forcedUP` จาก client สด แล้วเปลี่ยนงาน `verified` เป็น `seeding`
+โดยไม่เรียก add/recheck/resume/delete/stop หลักฐานเดิมใน `canonical_verification`
+และ `node_locations` จะถูกเก็บไว้ พร้อมเพิ่ม `seed_recovery.method: existing_active_target`
+ถ้า torrent ไม่ได้ seed อยู่จะปฏิเสธและให้ใช้ `seed` ตามขั้นตอนปกติแทน
+
 ### ผูกรายการซ้ำที่ seed อยู่แล้ว
 
 ถ้างานเป็น `draft`/`prepared` และพบ payload ซ้ำ แต่ torrent ของรายการปลายทาง

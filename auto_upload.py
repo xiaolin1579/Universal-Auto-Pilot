@@ -993,3 +993,83 @@ class UploadWorker:
             raise
         log_event('state_change', result, stage='existing_target_rechecked', target_hash=result['target_hash'])
         return result
+
+    def adopt_active_target(self, key, client):
+        """Bind a verified job to a target that is already seeding, without recheck."""
+        job = self.ledger.get(key)
+        if (job['state'] != 'verified' or not job.get('target_hash')
+                or not job.get('canonical_artifact')):
+            raise UploadBlocked('Only a verified job with a canonical hash can adopt an active target')
+        if client.name != job['source_node']:
+            raise UploadBlocked('Cross-seed must use the verified source client')
+        content = self._seed_artifacts(job, client)
+        target_files = client.files(job['target_hash'])
+        row = client.inventory(job['target_hash'], missing_ok=True)
+        if row is None:
+            raise UploadBlocked('Target hash is absent; use seed to add and recheck it')
+        if infohash(row.get('hash')) != job['target_hash']:
+            raise UploadBlocked('Existing target hash differs from the canonical torrent')
+        if row.get('save_path') != job['save_path']:
+            raise UploadBlocked('Existing target save path differs from the verified source')
+        state = str(row.get('state', '')).lower()
+        if state not in ('uploading', 'stalledup', 'forcedup'):
+            raise UploadBlocked('Existing target is not actively seeding; this command never stops or resumes torrents')
+        from torrent_metainfo import _extract_torrent_manifest
+        manifest = _extract_torrent_manifest(content)
+        expected = [(manifest['root_name'] + '/' + f['path'] if manifest['multi_file'] else f['path'], f['size_bytes'])
+                    for f in manifest['files']]
+        ordinary = [(manifest['root_name'] + '/' + f['path'] if manifest['multi_file'] else f['path'], f['size_bytes'])
+                    for f in manifest['files'] if not f.get('is_padding')]
+        actual = sorted((f['path'], f['size_bytes']) for f in target_files)
+        if actual not in (sorted(expected), sorted(ordinary)):
+            raise UploadBlocked('Existing target manifest differs from canonical torrent')
+        verify_completed(content, row, target_files)
+
+        def apply(data):
+            current = data['upload_jobs'][key]
+            if current['state'] != 'verified' or infohash(current.get('target_hash')) != job['target_hash']:
+                raise UploadBlocked('Seed state changed during active-target adoption')
+            listing = current.get('listing') or {}
+            site = job['target_site']; tid = str(listing.get('torrent_id', ''))
+            for other_key, other in data['upload_jobs'].items():
+                if other_key == key or other.get('state') == 'cancelled':
+                    continue
+                if (infohash(other.get('target_hash')) == job['target_hash']
+                        or (other.get('target_site') == site
+                            and str((other.get('listing') or {}).get('torrent_id', '')) == tid)):
+                    raise UploadBlocked('Existing target is already linked to another upload job')
+            group = data['content_groups'][job['content_group_id']]
+            if job['target_hash'] not in group['hashes']:
+                raise UploadBlocked('Canonical hash is not linked to this content group')
+            record = data['site_records'].get(site + ':' + tid)
+            if record and infohash(record.get('infohash')) not in (None, job['target_hash']):
+                raise UploadBlocked('Listing is mapped to another hash')
+            rows = [r for r in data['torrents'] if infohash(r.get('client_info', {}).get('hash')) == job['target_hash']]
+            if not rows:
+                raise UploadBlocked('Canonical torrent row is missing; verify the listing first')
+            target_row = rows[0]
+            if target_row.get('content_group_id') not in (None, job['content_group_id']):
+                raise UploadBlocked('Canonical torrent row belongs to another content group')
+            target_row['content_group_id'] = job['content_group_id']
+            for entry in target_row.get('site_listings', []):
+                if (str(entry.get('site_key') or '').upper() == site.upper()
+                        and str(entry.get('torrent_id', '')) == tid):
+                    entry['verified'] = True
+                    entry['infohash'] = job['target_hash']
+            checked = stamp()
+            locations = target_row.setdefault('node_locations', [])
+            location = next((loc for loc in locations if loc.get('seedbox_host') == client.name), None)
+            if location is None:
+                location = {'seedbox_host': client.name, 'save_path': row['save_path']}
+                locations.append(location)
+            location.update(present=True, inventory_verified=True, active_seed_verified=True,
+                            verified_at=checked, verification_method='live_active_target_no_recheck',
+                            save_path=row['save_path'])
+            current.update(state='seeding', verified_at=checked, updated_at=checked,
+                seed_recovery={'method': 'existing_active_target', 'checked_at': checked,
+                               'target_hash': job['target_hash'], 'listing': deepcopy(listing),
+                               'client_state': state})
+            return deepcopy(current)
+        result = self.ledger.store.update(apply)
+        log_event('state_change', result, stage='active_target_adopted', target_hash=job['target_hash'])
+        return result
