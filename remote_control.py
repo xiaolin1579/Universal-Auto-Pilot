@@ -1,6 +1,9 @@
 import telebot
 from telebot import types
 from telebot.async_telebot import AsyncTeleBot
+import telebot.asyncio_helper as telebot_asyncio_helper
+import aiohttp
+import socket
 import discord
 from discord.ext import commands
 import asyncio
@@ -464,6 +467,32 @@ async def update_repository():
         return False
 
 
+def configure_telegram_transport():
+    """Pin Telegram API requests to IPv4 and enable transient-error retries.
+
+    This host can resolve api.telegram.org to an unreachable IPv6 address and
+    occasionally gets DNS/timeout blips through the Tailscale DNS stub. pyTelegramBotAPI
+    builds its aiohttp session internally, so patch its session manager and retry
+    constants before creating AsyncTeleBot.
+    """
+    telebot_asyncio_helper.RETRY_ON_ERROR = True
+    telebot_asyncio_helper.MAX_RETRIES = 3
+    telebot_asyncio_helper.RETRY_TIMEOUT = 2
+
+    manager = telebot_asyncio_helper.session_manager
+
+    async def create_ipv4_session():
+        connector = aiohttp.TCPConnector(
+            family=socket.AF_INET,
+            limit=telebot_asyncio_helper.REQUEST_LIMIT,
+            ssl=manager.ssl_context,
+        )
+        manager.session = aiohttp.ClientSession(connector=connector)
+        return manager.session
+
+    manager.create_session = create_ipv4_session
+
+
 async def start_telegram_polling(tg_bot):
     """The library retries polling errors; also recover startup/session failures."""
     skip_pending = True
@@ -483,7 +512,7 @@ async def start_telegram_polling(tg_bot):
                 await tg_bot.infinity_polling(
                     skip_pending=initial_start,
                     timeout=60,
-                    request_timeout=90,
+                    request_timeout=120,
                     allowed_updates=['message', 'callback_query'],
                 )
                 # A normal return means polling was explicitly stopped.
@@ -506,6 +535,7 @@ async def main():
     print("🚀 Initializing Hybrid Remote Control...")
 
     # --- 🔵 TELEGRAM SECTION ---
+    configure_telegram_transport()
     tg_cfg = CONF.get('TELEGRAM_CONFIG', {})
     if tg_cfg.get('remote_enable', False):
         try:
