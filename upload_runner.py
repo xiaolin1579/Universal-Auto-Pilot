@@ -36,6 +36,7 @@ class UploadSession:
         self.profile_name = profile_name
         self.browser = None
         self.adapters = {}
+        self._first_tab_used = False
 
     async def adapter(self, site):
         if site in self.adapters: return self.adapters[site]
@@ -46,7 +47,14 @@ class UploadSession:
             log_event('browser_start', site=site)
             args = ['--proxy-server=' + os.environ['HTTPS_PROXY']] if os.environ.get('HTTPS_PROXY') else []
             self.browser = await self.app.launch_any_browser(self.profile_name, args, enable_images=True)
-        tab = await self.browser.get('about:blank', new_tab=True)
+            self._first_tab_used = False
+        if self._first_tab_used:
+            tab = await self.browser.get('about:blank', new_tab=True)
+        else:
+            # nodriver starts with a chrome://newtab page; navigate it instead
+            # of leaving it open and creating another blank tab.
+            tab = await self.browser.get('about:blank')
+            self._first_tab_used = True
         log_event('site_login', site=site)
         if not await self.app.ensure_site_logged_in(tab, config):
             raise RuntimeError('Site login failed: ' + site)

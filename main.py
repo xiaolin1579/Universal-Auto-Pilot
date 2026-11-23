@@ -2140,6 +2140,11 @@ def build_browser_performance_args(enable_images=False):
     ]
 
 
+async def get_blank_page(browser):
+    """Reuse the browser's initial tab instead of opening another blank tab."""
+    return await browser.get("about:blank")
+
+
 class ScanBrowserState:
     """Mutable holder that lets cross-seed targets reuse one browser."""
 
@@ -9289,7 +9294,7 @@ async def ensure_active_page(browser, page, site_cfg):
     
     # ถ้าตัวแปร page พังไปแล้วหรือเป็น None ต้องสร้างใหม่ทันที
     if page is None:
-        return await browser.get("about:blank", new_tab=True)
+        return await get_blank_page(browser)
     
     try:
         # ใช้การทดสอบเบาที่สุด: เช็คว่า page มีการตอบสนองไหม
@@ -10971,11 +10976,11 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
             if not is_browser_healthy:
                 print(f"🌐 [{site}] Starting new Browser Instance...")
                 browser_instance = await launch_any_browser(site, stealth_args)
-                site_page = await browser_instance.get("about:blank", new_tab=True)
+                site_page = await get_blank_page(browser_instance)
                 dl_session = BrowserSessionWrapper(browser_instance)
                 sync_browser_state()
             elif site_page is None:
-                site_page = await browser_instance.get("about:blank", new_tab=True)
+                site_page = await get_blank_page(browser_instance)
                 dl_session = BrowserSessionWrapper(browser_instance)
                 sync_browser_state()
 
@@ -10987,7 +10992,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
             if login_result is True:
                 try:
                     if site_page is None:
-                        site_page = await browser_instance.get("about:blank", new_tab=True)
+                        site_page = await get_blank_page(browser_instance)
                     
                     await asyncio.sleep(1)
                     
@@ -11148,9 +11153,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                         )
 
                         if not site_page:
-                            site_page = await browser_instance.get(
-                                "about:blank", new_tab=True
-                            )
+                            site_page = await get_blank_page(browser_instance)
 
                         if isinstance(target_item, dict):
                             if not target_item.get("enable", True):
