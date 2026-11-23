@@ -14,10 +14,33 @@ from bs4 import BeautifulSoup
 from auto_upload import UploadBlocked
 from torrent_metainfo import _extract_torrent_info_hash
 from torrent_store import fresh, stamp, utcnow
-from upload_sites import authenticated, listing_identity, trusted_url
+from upload_sites import SITES, authenticated, listing_identity, trusted_url
 
 TTL_SECONDS = 300
 NUMBER = r'(?:0|[1-9][0-9]*|[1-9][0-9]{0,2}(?:,[0-9]{3})+)'
+CROSS_SITE_VERIFY = {'BITSUSE': 'DEDBIT'}
+CROSS_SITE_METHOD = 'authenticated_cross_site_listing_and_peers'
+DIRECT_METHOD = 'authenticated_listing_and_peers'
+
+
+def verification_target(job):
+    """Return (site, listing) whose authenticated peer list proves this job.
+
+    Dedbit and Bitsuse share torrent/peer rows. Bitsuse hides the peer endpoint
+    on its own listing, so published Bitsuse jobs are verified through the
+    matching Dedbit details page. The canonical infohash check still binds the
+    evidence to this job's exact target hash.
+    """
+    site = job.get('target_site')
+    verify_site = CROSS_SITE_VERIFY.get(site)
+    listing = job.get('listing')
+    if not verify_site or not isinstance(listing, dict) or not listing.get('torrent_id'):
+        return site, listing
+    tid = listing['torrent_id']
+    return verify_site, {
+        'torrent_id': tid,
+        'details_url': SITES[verify_site][0] + '/details.php?id=' + tid,
+    }
 
 
 class RetentionUnverified(UploadBlocked):
@@ -89,8 +112,7 @@ def other_seeders(fragment, site, current, own_uid, expected_total):
             recognized.append((rows, headings))
     if len(recognized) != 1: raise RetentionUnverified('peer_identity_unverified')
     rows, headings = recognized[0]
-    if len(rows) - 1 != expected_total: raise RetentionUnverified('peer_identity_unverified')
-    verified = set()
+    row_uids = []
     for row in rows[1:]:
         cells = row.find_all(['th', 'td'], recursive=False)
         if len(cells) != len(headings): raise RetentionUnverified('peer_identity_unverified')
@@ -105,26 +127,37 @@ def other_seeders(fragment, site, current, own_uid, expected_total):
             ids = parse_qs(parsed.query).get('id', [])
             if len(ids) == 1 and re.fullmatch(r'[1-9][0-9]*', ids[0]): identities.add(ids[0])
         if len(identities) != 1: raise RetentionUnverified('peer_identity_unverified')
-        uid = identities.pop()
-        if uid != own_uid: verified.add(uid)
-    return len(verified)
+        row_uids.append(identities.pop())
+    own_rows = sum(1 for uid in row_uids if uid == own_uid)
+    # Trackers differ on whether the advertised seed count includes our own
+    # connection. Accept either convention, but never a partial peer list.
+    if not (len(row_uids) == expected_total
+            or len(row_uids) - own_rows == expected_total):
+        raise RetentionUnverified('peer_identity_unverified')
+    return len({uid for uid in row_uids if uid != own_uid})
 
 
-def observation(job, status='checking', reason='checking'):
+def observation(job, status='checking', reason='checking', *, method=DIRECT_METHOD,
+                verification_site=None):
     checked = utcnow()
-    return {'version': 1, 'job_id': job['id'], 'target_hash': job['target_hash'],
-            'site': job['target_site'], 'torrent_id': job['listing']['torrent_id'],
-            'method': 'authenticated_listing_and_peers', 'status': status, 'reason': reason,
-            'checked_at': stamp(checked), 'expires_at': stamp(checked + timedelta(seconds=TTL_SECONDS)),
-            'completed': None, 'other_seeders': None, 'own_peers_excluded': False,
-            'canonical_hash_verified': False}
+    proof = {'version': 1, 'job_id': job['id'], 'target_hash': job['target_hash'],
+             'site': job['target_site'], 'torrent_id': job['listing']['torrent_id'],
+             'method': method, 'status': status, 'reason': reason,
+             'checked_at': stamp(checked), 'expires_at': stamp(checked + timedelta(seconds=TTL_SECONDS)),
+             'completed': None, 'other_seeders': None, 'own_peers_excluded': False,
+             'canonical_hash_verified': False}
+    if verification_site:
+        proof['verification_site'] = verification_site
+    return proof
 
 
-async def inspect_upload(adapter, job):
-    proof = observation(job)
+async def inspect_upload(adapter, job, listing=None, *, method=DIRECT_METHOD,
+                         verification_site=None):
+    listing = listing or job['listing']
+    proof = observation(job, method=method, verification_site=verification_site)
     try:
-        html, current = await adapter.open(job['listing']['details_url'])
-        stats = listing_stats(adapter.site, html, current, job['listing'])
+        html, current = await adapter.open(listing['details_url'])
+        stats = listing_stats(adapter.site, html, current, listing)
         proof['completed'] = stats['completed']
         if stats['seeders'] == 0:
             proof.update(other_seeders=0, own_peers_excluded=True)
@@ -142,7 +175,7 @@ async def inspect_upload(adapter, job):
         elif proof['other_seeders'] < 1:
             proof.update(status='held', reason='other_seeders_required')
         else:
-            canonical = await adapter.download_listing(job['listing']['details_url'])
+            canonical = await adapter.download_listing(listing['details_url'])
             if _extract_torrent_info_hash(canonical) != job['target_hash']:
                 raise RetentionUnverified('canonical_hash_mismatch')
             proof.update(canonical_hash_verified=True, status='ready', reason='ready')
@@ -173,20 +206,37 @@ async def refresh_upload_retention(app, *, session=None):
     try:
         groups = {}
         for job in jobs:
-            await app._store_call('record_upload_retention', job['id'], job, observation(job))
-            groups.setdefault(job['target_site'], []).append(job)
+            verify_site, listing = verification_target(job)
+            method = DIRECT_METHOD if verify_site == job['target_site'] else CROSS_SITE_METHOD
+            proof = observation(job, method=method, verification_site=verify_site)
+            if method == DIRECT_METHOD:
+                proof.pop('verification_site', None)
+            await app._store_call('record_upload_retention', job['id'], job, proof)
+            groups.setdefault(verify_site, []).append((job, listing, method, verify_site))
         for site, batch in groups.items():
             if stopping(): break
             adapter = None
             if site in ('DEDBIT', 'BITSUSE'):
                 try: adapter = await session.adapter(site)
                 except Exception: pass
-            for job in batch:
+            for job, listing, method, verify_site in batch:
                 if stopping(): break
-                proof = await inspect_upload(adapter, job) if adapter else observation(job, 'failed', 'fetch_failed')
+                if adapter:
+                    proof = await inspect_upload(
+                        adapter, job, listing,
+                        method=method,
+                        verification_site=None if method == DIRECT_METHOD else verify_site,
+                    )
+                else:
+                    proof = observation(
+                        job, 'failed', 'fetch_failed',
+                        method=method,
+                        verification_site=None if method == DIRECT_METHOD else verify_site,
+                    )
                 await app._store_call('record_upload_retention', job['id'], job, proof)
                 result.append(proof)
-                print('[Cleaner Upload] site=' + site + ' job=' + job['id'][:12]
+                cross = '' if method == DIRECT_METHOD else ' verify=' + str(verify_site)
+                print('[Cleaner Upload] site=' + job['target_site'] + cross + ' job=' + job['id'][:12]
                       + ' status=' + proof['status'] + ' reason=' + proof['reason']
                       + ' other_seeders=' + str(proof['other_seeders'])
                       + ' completed=' + str(proof['completed']), flush=True)

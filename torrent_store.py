@@ -179,7 +179,8 @@ class MappingStore:
                         or retention.get('reason') not in ('checking', 'ready', 'other_seeders_required',
                             'completed_required', 'peer_identity_unverified', 'canonical_hash_mismatch',
                             'unsupported_site', 'page_unverified', 'fetch_failed')
-                        or retention.get('method') != 'authenticated_listing_and_peers'
+                        or retention.get('method') not in ('authenticated_listing_and_peers',
+                            'authenticated_cross_site_listing_and_peers')
                         or not isinstance(retention.get('checked_at'), str)
                         or not isinstance(retention.get('expires_at'), str)
                         or type(retention.get('own_peers_excluded')) is not bool
@@ -187,6 +188,15 @@ class MappingStore:
                         or any(v is not None and (type(v) is not int or v < 0)
                                for v in (retention.get('other_seeders'), retention.get('completed')))):
                     raise ValueError('Invalid Auto Upload retention evidence')
+                verify_site = retention.get('verification_site')
+                method = retention['method']
+                if verify_site is not None and verify_site not in ('DEDBIT', 'BITSUSE'):
+                    raise ValueError('Invalid Auto Upload retention verification site')
+                if method == 'authenticated_cross_site_listing_and_peers':
+                    if not verify_site or verify_site == retention['site']:
+                        raise ValueError('Invalid Auto Upload cross-site evidence')
+                elif verify_site is not None:
+                    raise ValueError('Invalid Auto Upload retention verification site')
                 try:
                     duration = (datetime.fromisoformat(retention['expires_at'])
                                 - datetime.fromisoformat(retention['checked_at'])).total_seconds()

@@ -485,6 +485,12 @@ log `notice_queued` และ `notice_result` แสดงผลส่งโด�
 H&R แล้ว หลังยืนยันและเริ่ม seed จะปล่อย hold ของคิว ส่วน guard ไฟล์ร่วมและภาระ H&R/
 Quest ยังคงทำงานตามปกติ การค้างในสถานะไม่แน่นอนจะคง hold ไว้เพื่อรอตรวจสอบ
 
+งาน BITSUSE ที่เผยแพร่แล้วตรวจ peer ไม่ได้จากหน้า BITSUSE ที่ซ่อน endpoint ระบบจึงอ่าน
+details/ajaxpeers ของ DEDBIT ด้วย `torrent_id` เดียวกัน แล้วเทียบ canonical hash กับ
+`target_hash` ของงานก่อนยอมรับเสมอ `retention_check` ยังผูกกับงานเดิมและมี
+`verification_site='DEDBIT'` เพื่อให้ audit ได้ชัด ผู้ใช้/peer ที่เป็นของบัญชีเราถูกหออกก่อนนับ
+และจำนวน seed ที่หน้าเว็บแจ้งอาจรวมหรือไม่รวม connection ของเราได้
+
 ไฟล์ `.torrent` มี passkey จึงเก็บใน `upload_artifacts/` ที่ gitignore และใช้สิทธิ์ `0600`
 ไม่บันทึก CSRF, cookies หรือ announce ที่มี passkey ลง mapping ห้ามนำโฟลเดอร์นี้ขึ้น Git
 ไฟล์ทดสอบยังเก็บเฉพาะเครื่องตามแนวทางของโครงการ

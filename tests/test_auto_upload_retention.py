@@ -7,8 +7,9 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import test_onlyone_repack as fixtures
 import main as app
-from auto_upload_retention import (RetentionUnverified, listing_stats, other_seeders,
-                                   observation, inspect_upload, refresh_upload_retention)
+from auto_upload_retention import (CROSS_SITE_METHOD, RetentionUnverified, listing_stats,
+                                   other_seeders, observation, inspect_upload,
+                                   refresh_upload_retention, verification_target)
 from torrent_metainfo import create_variant, _extract_torrent_info_hash
 from torrent_store import stamp, utcnow
 
@@ -54,6 +55,10 @@ class PeerParserTests(unittest.TestCase):
     def test_all_our_connections_are_excluded_and_other_accounts_are_unique(self):
         self.assertEqual(other_seeders(peer_table(['10','10','20','20']),'DEDBIT',LISTING['details_url'],'10',4),1)
         self.assertEqual(other_seeders(peer_table(['10','10']),'DEDBIT',LISTING['details_url'],'10',2),0)
+
+    def test_own_connection_may_be_absent_from_advertised_seed_count(self):
+        self.assertEqual(other_seeders(peer_table(['10','20','30']),'DEDBIT',
+                                       LISTING['details_url'],'10',2),2)
 
     def test_anonymous_peer_or_unknown_current_account_never_counts_as_other(self):
         anonymous=b'success\n<table><tr><th>User/IP</th><th>Complete</th></tr><tr><td>Anonymous</td><td>100%</td></tr></table>'
@@ -114,6 +119,11 @@ class RetentionStoreTests(unittest.TestCase):
             proof=self.ready();proof[field]=value
             with self.assertRaises(ValueError): self.save(proof)
 
+    def test_direct_evidence_cannot_claim_cross_site_verification(self):
+        proof=self.ready()
+        proof['verification_site']='DEDBIT'
+        with self.assertRaises(ValueError): self.save(proof)
+
     def test_job_changed_during_inspection_does_not_accept_result(self):
         self.ledger.transition(self.job['id'],{'seeding'},'rechecking')
         with self.assertRaises(ValueError): self.save(self.ready())
@@ -144,6 +154,29 @@ class InspectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((proof['status'],proof['other_seeders'],proof['completed']),('ready',1,1))
         self.assertTrue(proof['canonical_hash_verified'])
         self.assertNotIn('uid',proof);self.assertNotIn('ip',proof)
+
+    async def test_bitsuse_job_can_be_verified_through_matching_dedbit_listing(self):
+        tid='686663'
+        listing={'torrent_id':tid,'details_url':'https://www.bitsuse.com/bs_details.php?id='+tid}
+        job={'id':'b'*64,'target_site':'BITSUSE','target_hash':_extract_torrent_info_hash(self.content),
+             'listing':listing}
+        verify_site,dedbit_listing=verification_target(job)
+        self.assertEqual(verify_site,'DEDBIT')
+        self.assertEqual(dedbit_listing['details_url'],'https://www.dedbit.com/details.php?id='+tid)
+        html=details(seeds=2).replace('ajaxpeers.php?id=1','ajaxpeers.php?id='+tid)
+        adapter=SimpleNamespace(site='DEDBIT',origin=ORIGIN,
+            open=AsyncMock(return_value=(html,dedbit_listing['details_url'])),
+            tab=SimpleNamespace(send=AsyncMock(return_value=[SimpleNamespace(name='uid',value='10')])),
+            _download_bytes=AsyncMock(return_value=peer_table(['10','20'])),
+            download_listing=AsyncMock(return_value=self.content))
+        proof=await inspect_upload(adapter,job,dedbit_listing,
+                                   method=CROSS_SITE_METHOD,verification_site='DEDBIT')
+        self.assertEqual(proof['site'],'BITSUSE')
+        self.assertEqual(proof['verification_site'],'DEDBIT')
+        self.assertEqual(proof['method'],CROSS_SITE_METHOD)
+        self.assertEqual((proof['status'],proof['other_seeders'],proof['completed']),('ready',1,1))
+        self.assertTrue(proof['canonical_hash_verified'])
+        adapter.open.assert_awaited_once_with(dedbit_listing['details_url'])
 
     async def test_own_seeder_only_is_held(self):
         self.adapter.open.return_value=(details(seeds=1),LISTING['details_url'])
@@ -207,6 +240,27 @@ class RefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[0]['status'],'failed')
         self.assertEqual(self.ledger.get(self.job['id'])['state'],'seeding')
         self.assertFalse(self.store.upload_retention_status(self.target)[0])
+        session.close.assert_awaited_once()
+
+    async def test_bitsuse_job_uses_dedbit_adapter_for_cross_site_evidence(self):
+        job=dict(self.job)
+        job['id']='c'*64
+        job['target_site']='BITSUSE'
+        job['listing']={'torrent_id':'686663',
+                        'details_url':'https://www.bitsuse.com/bs_details.php?id=686663'}
+        store=SimpleNamespace(read=lambda:{'upload_jobs':{job['id']:job}})
+        app=SimpleNamespace(CFG={'GLOBAL_CLEAN':{'enable':True},'NODES':[{'enable':True}]},
+            NodeCleaner=lambda *a:SimpleNamespace(enabled=lambda:True),
+            stop_event=SimpleNamespace(is_set=lambda:False),
+            _mapping_store=lambda:store,_store_call=AsyncMock())
+        adapter=SimpleNamespace(site='DEDBIT',open=AsyncMock(side_effect=RuntimeError('offline')))
+        session=SimpleNamespace(adapter=AsyncMock(return_value=adapter),close=AsyncMock())
+        with patch('upload_runner.UploadSession',return_value=session),contextlib.redirect_stdout(io.StringIO()):
+            result=await refresh_upload_retention(app)
+        session.adapter.assert_awaited_once_with('DEDBIT')
+        self.assertEqual(result[0]['method'],CROSS_SITE_METHOD)
+        self.assertEqual(result[0]['verification_site'],'DEDBIT')
+        self.assertEqual(result[0]['site'],'BITSUSE')
         session.close.assert_awaited_once()
 
     async def test_shutdown_does_not_start_web_work(self):
