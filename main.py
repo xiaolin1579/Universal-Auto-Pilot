@@ -2140,6 +2140,20 @@ def build_browser_performance_args(enable_images=False):
     ]
 
 
+class ScanBrowserState:
+    """Mutable holder that lets cross-seed targets reuse one browser."""
+
+    def __init__(self):
+        self.browser = None
+        self.site_page = None
+        self.dl_session = None
+
+    def update(self, browser, site_page, dl_session):
+        self.browser = browser
+        self.site_page = site_page
+        self.dl_session = dl_session
+
+
 async def launch_any_browser(sitename="default", custom_args=None, *, enable_images=False):
     global _global_display, _active_browser_instance, _current_profile_path
     
@@ -10896,14 +10910,21 @@ async def _preflight_cross_seed_candidate(
         ),
     }
 
-async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealth_args, global_clean=None, cross_seed_target=None):
+async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealth_args, global_clean=None, cross_seed_target=None, browser_state=None):
     """
     ฟังก์ชันสแกนและค้นหาทอร์เรนต์โดยใช้ nodriver (Browser Automation)
     รวมถึงการจัดการ Smart Download และคัดเลือก Node ตาม Capacity / Space
+
+    browser_state ใช้ร่วมกันได้ข้าม cross-seed targets เพื่อไม่ให้สร้าง Chrome ใหม่ทุกเป้าหมาย
     """
-    browser_instance = None
-    site_page = None
-    dl_session = None
+    if browser_state is None:
+        browser_state = ScanBrowserState()
+    browser_instance = browser_state.browser
+    site_page = browser_state.site_page
+    dl_session = browser_state.dl_session
+
+    def sync_browser_state():
+        browser_state.update(browser_instance, site_page, dl_session)
     cross_seed_matches = []  # สำหรับโหมด Cross-Seed
     cross_seed_input = cross_seed_target
     cross_seed_mode = cross_seed_target is not None
@@ -10945,15 +10966,18 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
                     browser_instance = None
                     site_page = None
                     dl_session = None
+                    sync_browser_state()
 
             if not is_browser_healthy:
                 print(f"🌐 [{site}] Starting new Browser Instance...")
                 browser_instance = await launch_any_browser(site, stealth_args)
                 site_page = await browser_instance.get("about:blank", new_tab=True)
                 dl_session = BrowserSessionWrapper(browser_instance)
+                sync_browser_state()
             elif site_page is None:
                 site_page = await browser_instance.get("about:blank", new_tab=True)
                 dl_session = BrowserSessionWrapper(browser_instance)
+                sync_browser_state()
 
             # -----------------------------------------------------------------
             # 2. SITE LOGIN & COOKIE SYNC
@@ -12198,6 +12222,7 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
     # =========================================================================
     # 🏁 สรุปผลการสแกนทั้งหมด (ทำงานเมื่อวนครบทุก Site แล้ว)
     # =========================================================================
+    sync_browser_state()
     if cross_seed_mode:
         print(f"\n🎯 [Cross-Seed Summary] พบรายการที่ตรงกันทั้งหมด {len(cross_seed_matches)} รายการ")
         return cross_seed_matches
@@ -12205,6 +12230,37 @@ async def scrape_site_search_nodriver(CFG, SET, active_nodes, stop_event, stealt
     print("\n🏁 สแกนและประมวลผลทุกเว็บไซต์เสร็จสิ้น")
     return True
 
+
+async def scan_cross_seed_targets(targets, CFG, SET, active_nodes, stop_event, stealth_args, global_clean):
+    """Scan every cross-seed target with one shared nodriver browser."""
+    browser_state = ScanBrowserState()
+    matches = []
+    for index, target in enumerate(targets, start=1):
+        if stop_event.is_set():
+            print("🛑 หยุด Cross-seed ตาม stop_event")
+            break
+
+        print(
+            f"\n[{index}/{len(targets)}] "
+            f"[TARGET] {target['source_site']} / "
+            f"{target.get('source_zone_id', 'unknown') if target.get('source_zone_verified') is True else 'zone-unknown'} | "
+            f"{target['keyword']} | "
+            f"{target['target_size_bytes']} bytes"
+        )
+
+        result = await scrape_site_search_nodriver(
+            CFG=CFG,
+            SET=SET,
+            active_nodes=active_nodes,
+            stop_event=stop_event,
+            stealth_args=stealth_args,
+            global_clean=global_clean,
+            cross_seed_target=target,
+            browser_state=browser_state,
+        )
+        if isinstance(result, list):
+            matches.extend(result)
+    return matches
 
 
 def _cross_seed_tracker_url_key(value):
@@ -13893,39 +13949,16 @@ async def main():
 
                     print("\n🎯 [Cycle Mode] CROSS-SEED")
 
-                    all_cross_seed_matches = []
-
                     if cross_seed_targets:
                         print(
                             f"\n🎯 เริ่ม Cross-seed จำนวน "
                             f"{len(cross_seed_targets)} เป้าหมาย"
                         )
 
-                        for index, target in enumerate(cross_seed_targets, start=1):
-                            if stop_event.is_set():
-                                print("🛑 หยุด Cross-seed ตาม stop_event")
-                                break
-
-                            print(
-                                f"\n[{index}/{len(cross_seed_targets)}] "
-                                f"[TARGET] {target['source_site']} / "
-                                f"{target.get('source_zone_id', 'unknown') if target.get('source_zone_verified') is True else 'zone-unknown'} | "
-                                f"{target['keyword']} | "
-                                f"{target['target_size_bytes']} bytes"
-                            )
-
-                            result = await scrape_site_search_nodriver(
-                                CFG=CFG,
-                                SET=SET,
-                                active_nodes=active_nodes,
-                                stop_event=stop_event,
-                                stealth_args=stealth_args,
-                                global_clean=global_clean,
-                                cross_seed_target=target
-                            )
-
-                            if isinstance(result, list):
-                                all_cross_seed_matches.extend(result)
+                        all_cross_seed_matches = await scan_cross_seed_targets(
+                            cross_seed_targets, CFG, SET, active_nodes,
+                            stop_event, stealth_args, global_clean
+                        )
 
                         print(
                             "\n🎯 [Cross-Seed Summary] "
