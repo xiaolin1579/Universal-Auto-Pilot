@@ -39,7 +39,6 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 from bs4 import BeautifulSoup
-import ddddocr
 import io
 from xml.sax.saxutils import escape
 import functools
@@ -65,7 +64,23 @@ from torrent_metainfo import (
 
 print = functools.partial(print, flush=True)
 
-ocr = ddddocr.DdddOcr(show_ad=False)
+class LazyOcr:
+    """สร้างโมเดล OCR ตอนแกะ captcha ครั้งแรก เพื่อไม่ให้ ONNX ค้างในแรมตั้งแต่ start"""
+
+    def __init__(self):
+        self._model = None
+        self._lock = threading.Lock()
+
+    def classification(self, image_bytes):
+        if self._model is None:
+            with self._lock:
+                if self._model is None:
+                    import ddddocr
+                    self._model = ddddocr.DdddOcr(show_ad=False)
+        return self._model.classification(image_bytes)
+
+
+ocr = LazyOcr()
 
 stop_event = asyncio.Event()
 

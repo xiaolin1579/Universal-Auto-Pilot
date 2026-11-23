@@ -2,8 +2,10 @@ import contextlib
 import io
 import os
 import shutil
+import sys
 import unittest
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import main as app
 
@@ -57,6 +59,22 @@ class BrowserMemoryTests(unittest.TestCase):
             args = app.build_browser_performance_args()
         self.assertIn('--js-flags=--max-old-space-size=384', args)
         self.assertIn('--renderer-process-limit=3', args)
+
+
+class LazyOcrTests(unittest.TestCase):
+    def test_ocr_model_is_not_created_when_main_is_imported(self):
+        self.assertIsInstance(app.ocr, app.LazyOcr)
+        self.assertIsNone(app.ocr._model)
+
+    def test_model_is_created_once_on_first_classification(self):
+        model = SimpleNamespace(classification=Mock(return_value='AB12'))
+        fake_module = SimpleNamespace(DdddOcr=Mock(return_value=model))
+        with patch.dict(sys.modules, {'ddddocr': fake_module}):
+            lazy = app.LazyOcr()
+            self.assertEqual(lazy.classification(b'first'), 'AB12')
+            self.assertEqual(lazy.classification(b'second'), 'AB12')
+        fake_module.DdddOcr.assert_called_once_with(show_ad=False)
+        self.assertEqual(model.classification.call_count, 2)
 
 
 class BrowserLaunchTests(unittest.IsolatedAsyncioTestCase):
