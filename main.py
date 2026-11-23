@@ -2077,6 +2077,69 @@ def load_xvfb_config():
         print(f"⚠️ [Config] เกิดข้อผิดพลาดในการอ่าน Xvfb_enable ({e}), ใช้ค่าเริ่มต้น: False")
         return False
 
+def build_browser_performance_args(enable_images=False):
+    """Return Chrome flags tuned for this low-memory host.
+
+    The scraper does not need images, while upload forms may. V8 heap is capped
+    and same-site renderers are shared so a single browser stack stays well
+    below the RAM available on this machine. SETTING.browser_js_heap_mb and
+    SETTING.browser_renderer_process_limit can override the conservative
+    defaults if a site needs more headroom.
+    """
+    settings = (globals().get('CFG') or {}).get('SETTING', {}) or {}
+    try:
+        heap_mb = max(128, int(settings.get('browser_js_heap_mb', 256)))
+    except (TypeError, ValueError):
+        heap_mb = 256
+    try:
+        renderer_limit = max(1, int(settings.get('browser_renderer_process_limit', 2)))
+    except (TypeError, ValueError):
+        renderer_limit = 2
+
+    disabled_features = ",".join((
+        "VizDisplayCompositor",
+        "IsolateOrigins",
+        "site-per-process",
+        "SiteIsolationTrials",
+        "CalculateNativeWinOcclusion",
+        "BackForwardCache",
+        "OptimizationHints",
+        "MediaRouter",
+        "Translate",
+    ))
+    return [
+        "--disable-dev-shm-usage",
+        "--disable-breakpad",
+        "--disable-component-update",
+        "--disable-infobars",
+        "--no-zygote",
+        "--disable-gpu",
+        "--disable-accelerated-2d-canvas",
+        "--disable-accelerated-video-decode",
+        f"--blink-settings=imagesEnabled={'true' if enable_images else 'false'}",
+        "--disable-gl-extensions",
+        "--disable-software-rasterizer",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--mute-audio",
+        f"--disable-features={disabled_features}",
+        "--process-per-site",
+        f"--renderer-process-limit={renderer_limit}",
+        "--disk-cache-dir=/dev/null",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-ipc-flooding-protection",
+        "--disable-translate",
+        "--disable-extensions-http-throttling",
+        "--disable-sync",
+        "--metrics-recording-only",
+        "--no-first-run",
+        "--disable-default-apps",
+        f"--js-flags=--max-old-space-size={heap_mb}",
+    ]
+
+
 async def launch_any_browser(sitename="default", custom_args=None, *, enable_images=False):
     global _global_display, _active_browser_instance, _current_profile_path
     
@@ -2152,42 +2215,7 @@ async def launch_any_browser(sitename="default", custom_args=None, *, enable_ima
         config.browser_executable_path = get_browser_path_or_fail()
 
     # บล็อกอาร์กิวเมนต์รีดประสิทธิภาพ
-    performance_args = [
-        # --- รีดประสิทธิภาพและการใช้งานหน่วยความจำ (Performance & Memory) ---
-        "--disable-dev-shm-usage",
-        "--disable-breakpad",
-        "--disable-component-update",
-        "--disable-infobars",
-        "--no-zygote",
-        "--disable-gpu",
-        "--blink-settings=imagesEnabled=true" if enable_images else "--blink-settings=imagesEnabled=false",
-        "--disable-gl-extensions",
-        "--disable-software-rasterizer",
-        "--disable-extensions",
-        "--disable-background-networking",
-        "--mute-audio",
-        "--disable-features=VizDisplayCompositor",
-        "--disk-cache-dir=/dev/null",
-        
-        # --- ปิดระบบ Background และการประมวลผลที่ไม่จำเป็น ---
-        "--disable-background-timer-throttling", 
-        "--disable-backgrounding-occluded-windows", 
-        "--disable-renderer-backgrounding", 
-        "--disable-ipc-flooding-protection", 
-        
-        # --- ปิดฟีเจอร์และบริการเสริมเพื่อประหยัด RAM ---
-        "--disable-translate", 
-        "--disable-extensions-http-throttling", 
-        "--disable-sync", 
-        "--metrics-recording-only", 
-        "--no-first-run", 
-        "--disable-default-apps", 
-        
-        # --- จัดการหน่วยความจำ (Memory Management) ---
-        "--js-flags=--max-old-space-size=512",
-    ]
-    
-    for arg in performance_args:
+    for arg in build_browser_performance_args(enable_images):
         config.add_argument(arg)
     
     if isinstance(custom_args, list):
