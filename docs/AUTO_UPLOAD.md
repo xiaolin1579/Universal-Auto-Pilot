@@ -489,7 +489,9 @@ Quest ยังคงทำงานตามปกติ การค้าง�
 details/ajaxpeers ของ DEDBIT ด้วย `torrent_id` เดียวกัน แล้วเทียบ canonical hash กับ
 `target_hash` ของงานก่อนยอมรับเสมอ `retention_check` ยังผูกกับงานเดิมและมี
 `verification_site='DEDBIT'` เพื่อให้ audit ได้ชัด ผู้ใช้/peer ที่เป็นของบัญชีเราถูกหออกก่อนนับ
-และจำนวน seed ที่หน้าเว็บแจ้งอาจรวมหรือไม่รวม connection ของเราได้
+และจำนวน seed ที่หน้าเว็บแจ้งอาจรวมหรือไม่รวม connection ของเราได้ ตาราง peer อาจแสดง
+connection ซ้ำของบัญชีเดียวหรือขยับไป 1 row ขณะโหลด ระบบจึงยอมรับความคลาดเคลื่อน 1 row
+เฉพาะเมื่อมีบัญชีอื่นที่ยืนยันตัวตนและ complete 100% อย่างน้อย 2 บัญชี รายการสั้นกว่านั้นยัง hold อยู่
 
 ไฟล์ `.torrent` มี passkey จึงเก็บใน `upload_artifacts/` ที่ gitignore และใช้สิทธิ์ `0600`
 ไม่บันทึก CSRF, cookies หรือ announce ที่มี passkey ลง mapping ห้ามนำโฟลเดอร์นี้ขึ้น Git

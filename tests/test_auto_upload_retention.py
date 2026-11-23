@@ -60,6 +60,12 @@ class PeerParserTests(unittest.TestCase):
         self.assertEqual(other_seeders(peer_table(['10','20','30']),'DEDBIT',
                                        LISTING['details_url'],'10',2),2)
 
+    def test_duplicate_connections_and_one_row_drift_keep_verified_other_accounts(self):
+        self.assertEqual(other_seeders(peer_table(['20','20','30','40']),'DEDBIT',
+                                       LISTING['details_url'],'10',3),3)
+        self.assertEqual(other_seeders(peer_table([str(n) for n in range(20,29)]),'DEDBIT',
+                                       LISTING['details_url'],'10',10),9)
+
     def test_anonymous_peer_or_unknown_current_account_never_counts_as_other(self):
         anonymous=b'success\n<table><tr><th>User/IP</th><th>Complete</th></tr><tr><td>Anonymous</td><td>100%</td></tr></table>'
         for fragment,own in [(anonymous,'10'),(peer_table(['20']),None),(peer_table(['20']),'0')]:

@@ -129,12 +129,17 @@ def other_seeders(fragment, site, current, own_uid, expected_total):
         if len(identities) != 1: raise RetentionUnverified('peer_identity_unverified')
         row_uids.append(identities.pop())
     own_rows = sum(1 for uid in row_uids if uid == own_uid)
+    others = {uid for uid in row_uids if uid != own_uid}
     # Trackers differ on whether the advertised seed count includes our own
-    # connection. Accept either convention, but never a partial peer list.
-    if not (len(row_uids) == expected_total
-            or len(row_uids) - own_rows == expected_total):
+    # connection, and the AJAX list can drift by one row while the page loads.
+    # A one-row drift is only trusted when at least two other accounts are
+    # fully identified; a short list with one other account stays held.
+    exact = (len(row_uids) == expected_total
+             or len(row_uids) - own_rows == expected_total)
+    drift = abs(len(row_uids) - expected_total) == 1 and len(others) >= 2
+    if not (exact or drift):
         raise RetentionUnverified('peer_identity_unverified')
-    return len({uid for uid in row_uids if uid != own_uid})
+    return len(others)
 
 
 def observation(job, status='checking', reason='checking', *, method=DIRECT_METHOD,
