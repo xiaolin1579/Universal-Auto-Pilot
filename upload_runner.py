@@ -16,6 +16,17 @@ from upload_notifications import UploadNotifications, safe_error
 from upload_schedule import UploadSchedule
 
 
+def upload_browser_needs_images(app):
+    """ภาพใน browser อัปโหลดจำเป็นเฉพาะไซต์ที่ใช้ captcha OCR เท่านั้น"""
+    setting = (app.CFG.get('SETTING') or {}).get('browser_upload_images')
+    if setting is not None:
+        return bool(setting)
+    return any(
+        str(site.get('name', '')).upper() == 'UNLIMITZ' and site.get('enable') is True
+        for site in app.CFG.get('SITE', [])
+    )
+
+
 def ledger_for(app):
     cfg = app.CFG.get('AUTO_UPLOAD', {})
     directory = Path(cfg.get('artifact_dir') or Path(app.BASE_DIR) / 'upload_artifacts')
@@ -46,7 +57,10 @@ class UploadSession:
         if self.browser is None:
             log_event('browser_start', site=site)
             args = ['--proxy-server=' + os.environ['HTTPS_PROXY']] if os.environ.get('HTTPS_PROXY') else []
-            self.browser = await self.app.launch_any_browser(self.profile_name, args, enable_images=True)
+            self.browser = await self.app.launch_any_browser(
+                self.profile_name, args,
+                enable_images=upload_browser_needs_images(self.app),
+            )
             self._first_tab_used = False
         if self._first_tab_used:
             tab = await self.browser.get('about:blank', new_tab=True)

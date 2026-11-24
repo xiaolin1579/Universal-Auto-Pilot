@@ -35,7 +35,7 @@ class BrowserMemoryTests(unittest.TestCase):
     def test_default_args_are_tuned_for_low_memory_and_no_images(self):
         args = app.build_browser_performance_args()
         self.assertIn('--blink-settings=imagesEnabled=false', args)
-        self.assertIn('--js-flags=--max-old-space-size=256', args)
+        self.assertIn('--js-flags=--max-old-space-size=192', args)
         self.assertIn('--process-per-site', args)
         self.assertIn('--renderer-process-limit=2', args)
         self.assertIn('--disable-accelerated-2d-canvas', args)
@@ -59,6 +59,9 @@ class BrowserMemoryTests(unittest.TestCase):
             args = app.build_browser_performance_args()
         self.assertIn('--js-flags=--max-old-space-size=384', args)
         self.assertIn('--renderer-process-limit=3', args)
+
+    def test_cycle_cleanup_releases_free_memory_safely(self):
+        self.assertIsInstance(app.release_free_memory(), int)
 
 
 class LazyOcrTests(unittest.TestCase):
@@ -104,7 +107,7 @@ class BrowserLaunchTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(browser.started)
         args = browser.config.args
         self.assertEqual(args[-1], '--custom=1')
-        self.assertIn('--js-flags=--max-old-space-size=256', args)
+        self.assertIn('--js-flags=--max-old-space-size=192', args)
         self.assertIn('--process-per-site', args)
         self.assertIn('--renderer-process-limit=2', args)
 

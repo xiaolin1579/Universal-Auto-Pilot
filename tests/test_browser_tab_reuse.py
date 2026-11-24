@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
 
 import main as app
-from upload_runner import UploadSession
+from upload_runner import UploadSession, upload_browser_needs_images
 
 
 class BlankPageTests(unittest.TestCase):
@@ -13,6 +13,19 @@ class BlankPageTests(unittest.TestCase):
         page = asyncio.run(app.get_blank_page(browser))
         self.assertEqual(page, 'page')
         browser.get.assert_awaited_once_with('about:blank')
+
+
+class UploadBrowserImageTests(unittest.TestCase):
+    def test_images_are_off_without_an_ocr_site(self):
+        target = SimpleNamespace(CFG={'SITE': [{'name': 'BEARBIT', 'enable': True}]})
+        self.assertFalse(upload_browser_needs_images(target))
+
+    def test_unlimitz_or_explicit_setting_enables_images(self):
+        target = SimpleNamespace(CFG={'SITE': [{'name': 'UNLIMITZ', 'enable': True}]})
+        self.assertTrue(upload_browser_needs_images(target))
+        target.CFG = {'SITE': [{'name': 'BEARBIT', 'enable': True}],
+                      'SETTING': {'browser_upload_images': True}}
+        self.assertTrue(upload_browser_needs_images(target))
 
 
 class UploadSessionTabTests(unittest.IsolatedAsyncioTestCase):
@@ -48,6 +61,15 @@ class UploadSessionTabTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIs(first.tab, pages[0])
         self.assertIs(second.tab, pages[1])
+
+    async def test_browser_launch_disables_images_for_normal_sites(self):
+        browser = SimpleNamespace(get=AsyncMock(return_value=object()))
+        target = self.make_app(browser)
+        session = UploadSession(target, 'test_profile')
+        with patch('upload_runner.BrowserSite', side_effect=lambda site, tab, **kw:
+                   SimpleNamespace(site=site, tab=tab)):
+            await session.adapter('BEARBIT')
+        self.assertIs(target.launch_any_browser.await_args.kwargs['enable_images'], False)
 
     async def test_relaunching_browser_reuses_initial_tab_again(self):
         pages = [object(), object(), object()]

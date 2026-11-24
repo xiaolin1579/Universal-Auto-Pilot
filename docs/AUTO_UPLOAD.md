@@ -613,3 +613,12 @@ tail -f script_run.log | grep --line-buffered '\[Auto Upload\]'
 Logger รับเฉพาะฟิลด์ความคืบหน้าที่กำหนดไว้ ไม่พิมพ์ config, HTML, artifact path,
 exception body ทั่วไป หรือ announce URL และกรอง URL/ค่าความลับจากข้อความ
 ข้อผิดพลาดที่รองรับ การเพิ่ม log ไม่เปลี่ยนเงื่อนไขเผยแพร่หรือ retry งาน
+
+### การใช้แรมของ Browser
+
+ค่าเริ่มต้นคือ V8 heap 192 MB ต่อ renderer และ renderer สูงสุด 2 ตัวต่อ browser
+ปรับได้ด้วย `SETTING.browser_js_heap_mb` และ `SETTING.browser_renderer_process_limit`
+ browser ของ Auto Upload ปิด images อัตโนมัติเมื่อไม่มีไซต์ UNLIMITZ ที่เปิดใช้งาน
+เพราะไม่มี captcha ที่ต้องใช้ OCR ถ้าต้องการบังคับเปิด images ให้ตั้ง
+`SETTING.browser_upload_images=true` หลังจบแต่ละรอบระบบเรียก `gc.collect()` และ
+`malloc_trim(0)` เพื่อคืน arena ที่ว่างกลับระบบ โดยไม่เปลี่ยนข้อมูลใน ledger

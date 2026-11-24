@@ -31,6 +31,7 @@ from urllib3.poolmanager import PoolManager
 from pyvirtualdisplay import Display
 import asyncio
 import gc
+import ctypes
 import nodriver as uc
 from nodriver import cdp, Config
 import pytz
@@ -2092,6 +2093,18 @@ def load_xvfb_config():
         print(f"⚠️ [Config] เกิดข้อผิดพลาดในการอ่าน Xvfb_enable ({e}), ใช้ค่าเริ่มต้น: False")
         return False
 
+def release_free_memory():
+    """คืน arena ที่ว่างกลับ OS หลังจบรอบ เพื่อไม่ให้ RSS โตสะสม"""
+    collected = gc.collect()
+    try:
+        libc = ctypes.CDLL('libc.so.6')
+        if hasattr(libc, 'malloc_trim'):
+            libc.malloc_trim(0)
+    except Exception:
+        pass
+    return collected
+
+
 def build_browser_performance_args(enable_images=False):
     """Return Chrome flags tuned for this low-memory host.
 
@@ -2099,13 +2112,13 @@ def build_browser_performance_args(enable_images=False):
     and same-site renderers are shared so a single browser stack stays well
     below the RAM available on this machine. SETTING.browser_js_heap_mb and
     SETTING.browser_renderer_process_limit can override the conservative
-    defaults if a site needs more headroom.
+    defaults (192 MB heap, 2 renderers) if a site needs more headroom.
     """
     settings = (globals().get('CFG') or {}).get('SETTING', {}) or {}
     try:
-        heap_mb = max(128, int(settings.get('browser_js_heap_mb', 256)))
+        heap_mb = max(128, int(settings.get('browser_js_heap_mb', 192)))
     except (TypeError, ValueError):
-        heap_mb = 256
+        heap_mb = 192
     try:
         renderer_limit = max(1, int(settings.get('browser_renderer_process_limit', 2)))
     except (TypeError, ValueError):
@@ -14062,6 +14075,7 @@ async def main():
                 await send_notify(stats_report) # แนะนำให้ใช้ await ถ้าเป็นไปได้
             
             #Cycle complete (เข้าสู่ช่วงพัก)
+            release_free_memory()
             wait_sec = random.randint(SET.get('MIN_WAIT_MINUTES', 2)*60, SET.get('MAX_WAIT_MINUTES', 10)*60)
             wait_msg = f"\n💤 Cycle finished. Waiting {wait_sec//60} minutes for next scan..."
             print(wait_msg)
