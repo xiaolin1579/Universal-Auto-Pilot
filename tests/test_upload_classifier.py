@@ -37,6 +37,12 @@ def values(report): return {s['field']:s['value'] for s in report['suggestions']
 
 
 class ClassifierTests(unittest.TestCase):
+    def test_empty_stored_schema_is_flagged_but_verified_live_form_is_not(self):
+        row=music();row['form_schema']['fields']={}
+        self.assertIn('destination_schema_unavailable',classify_job(row)['review_flags'])
+        self.assertNotIn('destination_schema_unavailable',
+                         classify_job(row,live_schema_verified=True)['review_flags'])
+
     def test_ambiguous_year_and_volume_are_not_release_year(self):
         identity=extract_identity(music('[MP3]-Albums Singles Vol 1974'))
         self.assertIsNone(identity['year']);self.assertEqual(identity['release_codes'],[])

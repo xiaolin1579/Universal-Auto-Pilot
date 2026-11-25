@@ -60,6 +60,14 @@ class CategoryReviewTests(RecoveryFixture, unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('c41type',result.get('field_overrides',{}).get('fields',{}))
         self.assertEqual(result['state'],'draft')
 
+    async def test_verified_live_form_without_subfields_is_accepted(self):
+        self.schema['fields']={}
+        self.store.update(lambda d:d['upload_jobs'][self.key]['rule'].update(fields={}))
+        result=await self.review()
+        self.assertEqual(result['state'],'prepared')
+        self.assertEqual(result['category_review']['issues'],[])
+        self.assertNotIn('destination_schema_unavailable',result['classification']['review_flags'])
+
     async def test_unknown_schema_options_are_not_invented(self):
         self.schema['fields']['c41sub']['options']=['AAC']
         result=await self.review()

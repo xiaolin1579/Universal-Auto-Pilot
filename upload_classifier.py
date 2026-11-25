@@ -146,7 +146,8 @@ def eligible_records(identity, records):
     return matches
 
 
-def classify_job(job, *, files=None, records=None, references=None, diagnostics=None):
+def classify_job(job, *, files=None, records=None, references=None, diagnostics=None,
+                 live_schema_verified=False):
     schema = job.get('form_schema', {}).get('fields', {})
     identity = extract_identity(job)
     metadata = job.get('metadata', {})
@@ -159,7 +160,9 @@ def classify_job(job, *, files=None, records=None, references=None, diagnostics=
     candidates = {}
     if origin_requires_review(job, identity):
         flags.append('origin_requires_review')
-    if not schema: flags.append('destination_schema_unavailable')
+    # An empty stored schema may mean a failed form read. Only a live, verified
+    # form with acknowledgements proves that the category truly has no subfields.
+    if not schema and not live_schema_verified: flags.append('destination_schema_unavailable')
     if len(identity['release_codes']) > 1: flags.append('multiple_release_codes')
 
     def evidence(kind, detail, url=None):

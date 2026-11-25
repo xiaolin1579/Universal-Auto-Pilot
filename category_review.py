@@ -89,7 +89,10 @@ async def review_categories(ledger, key, spec, source, settings, cache_dir):
             lookup = await asyncio.to_thread(lookup_metadata, extract_identity(snapshot), musicbrainz=True,
                                              cache_dir=cache_dir)
             records += lookup['records']; diagnostics += lookup['diagnostics']; providers = lookup['providers']
-    report = classify_job(snapshot, files=files, records=records, diagnostics=diagnostics)
+    # spec came from a live load_form() and was validated above, so an empty
+    # fields dict is a real field-less form rather than an unreadable stored schema.
+    report = classify_job(snapshot, files=files, records=records, diagnostics=diagnostics,
+                          live_schema_verified=True)
     changes, issues = correction_plan(snapshot, report, settings.get('auto_fix') is True)
 
     def apply(data):
@@ -117,7 +120,8 @@ async def review_categories(ledger, key, spec, source, settings, cache_dir):
         current.update(readiness=readiness, state='prepared' if readiness['ready'] else 'draft', updated_at=checked)
         # A verified source export can replace an inaccessible pointer from another checkout.
         current['source_artifact'] = write_artifact(ledger.artifacts, key, 'source', source, upload_filename(current))
-        updated = classify_job(current, files=files, records=records, diagnostics=diagnostics)
+        updated = classify_job(current, files=files, records=records, diagnostics=diagnostics,
+                               live_schema_verified=True)
         current['classification'] = {**updated,'saved':True,'checked_at':checked,'providers':providers}
         current['category_review'] = {'version':1,'checked_at':checked,'job_fingerprint':input_fingerprint(current),
             'status':'ready' if readiness['ready'] else 'review_required','issues':issues,
