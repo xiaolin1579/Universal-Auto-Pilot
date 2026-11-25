@@ -518,7 +518,7 @@ class BrowserSite:
             raise UploadBlocked('Destination form is incomplete: ' + ', '.join(names))
         return self.form
 
-    async def check_duplicates(self, job, max_pages=10, max_candidates=80):
+    async def check_duplicates(self, job, max_pages=100, max_candidates=200):
         if self.site == 'TORRENTDD':
             from torrentdd_upload import check_duplicates
             return await check_duplicates(self, job, max_pages, max_candidates)
