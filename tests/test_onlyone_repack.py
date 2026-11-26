@@ -2,11 +2,13 @@ import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 from auto_upload import (UploadBlocked, UploadLedger, create_job_variant, repacked_source,
                          publication_signature, UploadWorker)
-from onlyone_repack import rebuild_onlyone
+from onlyone_repack import OnlyOneMaker, rebuild_onlyone
 from torrent_metainfo import bencode, create_variant, payload_signature, _extract_torrent_info_hash
 from torrent_store import MappingStore
 
@@ -49,7 +51,7 @@ class RepackTests(unittest.TestCase):
         self.calls=[]
         calls=self.calls
         class Maker:
-            base = "https://onlyoneseedbox.opik.net/account"
+            base = "https://onlyoneseedbox.com/account"
             def __init__(self, client): pass
             def location(self, job, source): return {'root':'files','path':'payload.bin'}
             def request(self, route, body=None, binary=False):
@@ -243,6 +245,23 @@ class RepackTests(unittest.TestCase):
             result['rule'],self.spec['announce'],readiness={'ready':True},form_schema=self.spec)
         self.assertEqual(again['repack'],result['repack'])
         self.assertEqual(again['prepared_hash'],result['prepared_hash'])
+
+
+class OnlyOneMakerHostTests(unittest.TestCase):
+    def client(self, url):
+        node = SimpleNamespace(url=url, provider_sso=True)
+        return SimpleNamespace(node=node)
+
+    def test_new_hub_and_node_domains_are_accepted(self):
+        for url in ('https://onlyoneseedbox.com/account/qbittorrent',
+                    'https://s2.onlyoneseedbox.com/account/qbittorrent'):
+            with self.subTest(url=url):
+                maker = OnlyOneMaker(self.client(url))
+                self.assertTrue(urlsplit(maker.base).hostname.endswith('onlyoneseedbox.com'))
+
+    def test_unrelated_domain_is_rejected(self):
+        with self.assertRaises(UploadBlocked):
+            OnlyOneMaker(self.client('https://onlyoneseedbox.example/qbittorrent'))
 
 
 if __name__=='__main__': unittest.main()

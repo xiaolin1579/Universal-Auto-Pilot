@@ -2823,12 +2823,10 @@ class QbitNode:
             )
 
             # OnlyOne authenticates at the central hub, then returns to this node.
+            from onlyone_hosts import ONLYONE_HOST, is_onlyone_host
             trusted_origins = {origin}
-            if parsed.scheme == "https" and (
-                parsed.hostname == "onlyoneseedbox.opik.net"
-                or parsed.hostname.endswith(".onlyoneseedbox.opik.net")
-            ):
-                trusted_origins.add("https://onlyoneseedbox.opik.net")
+            if parsed.scheme == "https" and is_onlyone_host(parsed.hostname):
+                trusted_origins.add("https://" + ONLYONE_HOST)
 
             if self.provider_auth_origin and self.provider_auth_origin not in trusted_origins:
                 return fail("Configured Provider origin is not trusted for this node")

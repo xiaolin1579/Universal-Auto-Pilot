@@ -14,6 +14,7 @@ from torrent_metainfo import (create_variant, verify_completed, payload_signatur
                               _extract_torrent_manifest, _extract_torrent_info_hash)
 from torrent_store import MappingStore, stamp
 from upload_logging import log_event
+from onlyone_hosts import is_onlyone_host
 
 
 class OnlyOneMaker:
@@ -23,7 +24,7 @@ class OnlyOneMaker:
         parsed = urlsplit(self.node.url)
         host = parsed.hostname or ''
         if (getattr(self.node, 'provider_sso', False) is not True or parsed.scheme != 'https'
-                or not (host == 'onlyoneseedbox.opik.net' or host.endswith('.onlyoneseedbox.opik.net'))
+                or not is_onlyone_host(host)
                 or not parsed.path.endswith('/qbittorrent') or parsed.username or parsed.password):
             raise UploadBlocked('Metainfo rebuilding currently requires a verified OnlyOne SSO node')
         self.base = self.node.url.rsplit('/qbittorrent', 1)[0]
