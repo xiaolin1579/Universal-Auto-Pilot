@@ -2945,10 +2945,14 @@ class QbitNode:
             final_provider = urllib.parse.urlsplit(
                 provider_response.url
             )
+            final_host = (final_provider.hostname or "").casefold()
+            hub_account = (
+                final_host == ONLYONE_HOST.casefold()
+                and final_provider.path.rstrip("/") == "/account.php"
+            )
 
-            if (
-                final_provider.hostname.casefold()
-                != parsed.hostname.casefold()
+            if not hub_account and (
+                final_host != (parsed.hostname or "").casefold()
                 or not (
                     final_provider.path == account_path
                     or final_provider.path.startswith(account_path + "/")
@@ -2962,9 +2966,43 @@ class QbitNode:
             ):
                 return fail("Provider oos_sid not established")
 
-            print(
-                f"✅ [{self.name}] Provider Dashboard session established"
-            )
+            if hub_account:
+                # The new central hub authenticates once, then issues a
+                # node-scoped SSO token when the dashboard is opened.
+                node_response = sso_request(
+                    "GET",
+                    origin + account_path + "/",
+                    timeout=20
+                )
+
+                if node_response is None:
+                    return fail("Provider node hand-off unavailable")
+
+                final_node = urllib.parse.urlsplit(
+                    node_response.url
+                )
+
+                if (
+                    node_response.status_code != 200
+                    or (final_node.hostname or "").casefold()
+                    != (parsed.hostname or "").casefold()
+                    or final_node.path.rstrip("/") != account_path
+                ):
+                    return fail("Unexpected Provider node redirect")
+
+                if not any(
+                    c.name == "oos_node"
+                    for c in self.s.cookies
+                ):
+                    return fail("Provider oos_node not established")
+
+                print(
+                    f"✅ [{self.name}] Provider hub and node sessions established"
+                )
+            else:
+                print(
+                    f"✅ [{self.name}] Provider Dashboard session established"
+                )
 
             # Stage 2: Dashboard SSO hand-off.
             go_url = origin + account_path + "/go/qbittorrent"
